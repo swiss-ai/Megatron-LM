@@ -15,6 +15,7 @@ _GLOBAL_ARGS = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_WANDB_WRITER = None
+_GLOBAL_SLACK_BOT = None
 _GLOBAL_ONE_LOGGER = None
 _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
@@ -42,6 +43,11 @@ def get_wandb_writer():
     """Return tensorboard writer. It can be None so no need
     to check if it is initialized."""
     return _GLOBAL_WANDB_WRITER
+
+def get_slack_bot():
+    """Return slack bot. It can be None so no need
+    to check if it is initialized."""
+    return _GLOBAL_SLACK_BOT
 
 
 def get_one_logger():
@@ -93,6 +99,7 @@ def set_global_variables(args, build_tokenizer=True):
         _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
     _set_wandb_writer(args)
+    _set_slack_bot(args)
     _set_one_logger(args)
     _set_adlr_autoresume(args)
     _set_timers(args)
@@ -112,6 +119,7 @@ def unset_global_variables():
     global _GLOBAL_TOKENIZER
     global _GLOBAL_TENSORBOARD_WRITER
     global _GLOBAL_WANDB_WRITER
+    global _GLOBAL_SLACK_BOT
     global _GLOBAL_ONE_LOGGER
     global _GLOBAL_ADLR_AUTORESUME
     global _GLOBAL_TIMERS
@@ -122,6 +130,7 @@ def unset_global_variables():
     _GLOBAL_TOKENIZER = None
     _GLOBAL_TENSORBOARD_WRITER = None
     _GLOBAL_WANDB_WRITER = None
+    _GLOBAL_SLACK_BOT = None
     _GLOBAL_ONE_LOGGER = None
     _GLOBAL_ADLR_AUTORESUME = None
     _GLOBAL_TIMERS = None
@@ -192,6 +201,18 @@ def _set_wandb_writer(args):
         wandb.init(**wandb_kwargs)
         _GLOBAL_WANDB_WRITER = wandb
 
+def _set_slack_bot():
+    global _GLOBAL_SLACK_BOT
+    _ensure_var_is_not_initialized(_GLOBAL_SLACK_BOT, 'slack bot')
+
+    # if SLACK_BOT_TOKEN is empty or None, then do not set the slack bot
+    if os.getenv("SLACK_BOT_TOKEN") is None or os.getenv("SLACK_BOT_TOKEN") == "":
+        return  
+    from megatron.training.slackbot import SlackBot
+    _GLOBAL_SLACK_BOT = SlackBot(
+    slack_token=os.getenv("SLACK_BOT_TOKEN"),
+    channel_id=os.getenv("SLACK_CHANNEL_ID"),
+)
 
 def _set_one_logger(args):
     global _GLOBAL_ONE_LOGGER
@@ -263,6 +284,9 @@ def destroy_global_vars():
 
     global _GLOBAL_WANDB_WRITER
     _GLOBAL_WANDB_WRITER = None
+
+    global _GLOBAL_SLACK_BOT
+    _GLOBAL_SLACK_BOT = None
 
     global _GLOBAL_ONE_LOGGER
     _GLOBAL_ONE_LOGGER = None

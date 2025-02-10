@@ -14,6 +14,7 @@ from typing import List
 
 import torch.distributed
 from .log_handler import CustomHandler
+from slackbot import SlackBot
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 from .theoretical_memory_usage import report_theoretical_memory
@@ -21,6 +22,7 @@ import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 import torch
+import numpy as np
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import (
@@ -92,6 +94,7 @@ from .global_vars import (
     get_tensorboard_writer,
     get_wandb_writer,
     get_one_logger,
+    get_slack_bot,
 )
 from . import one_logger_utils
 
@@ -875,6 +878,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
     timers = get_timers()
     writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
+    slack_bot = get_slack_bot()
     one_logger = get_one_logger()
 
     # Advanced, skipped, and Nan iterations.
@@ -957,6 +961,14 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             from pickle import dump
             with open(args.memory_snapshot_path , 'wb') as f:
                 dump(snapshot, f)
+
+        if slack_bot:
+            metrics = {
+                "loss": loss_dict['lm loss'] if 'lm loss' in loss_dict else 0., # Needs improvement
+                "gradient_norm": grad_norm,
+                "throughput": throughput,
+                }
+            slack_bot.update(metrics)
 
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples},
