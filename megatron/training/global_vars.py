@@ -99,7 +99,7 @@ def set_global_variables(args, build_tokenizer=True):
         _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
     _set_wandb_writer(args)
-    _set_slack_bot(args)
+    _set_slack_bot()
     _set_one_logger(args)
     _set_adlr_autoresume(args)
     _set_timers(args)
