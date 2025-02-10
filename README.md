@@ -16,7 +16,7 @@ This is the codebase to run megatron efficiently at scale using Clariden. The co
   ```
 
 3. To enable the slack bot during training, you need to set the following environment variables, in a similar way:
-```
+  ```
   export SLACK_BOT_TOKEN=xoxb-60756381....
   export SLACK_CHANNEL_ID=C08....
   ```
