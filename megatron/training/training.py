@@ -14,7 +14,6 @@ from typing import List
 
 import torch.distributed
 from .log_handler import CustomHandler
-from slackbot import SlackBot
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 from .theoretical_memory_usage import report_theoretical_memory
@@ -965,7 +964,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         if slack_bot:
             metrics = {
                 "loss": loss_dict['lm loss'] if 'lm loss' in loss_dict else 0., # Needs improvement
-                "gradient_norm": grad_norm,
+                "gradient_norm": grad_norm if grad_norm is not None else 0.,
                 "throughput": throughput,
                 }
             slack_bot.update(metrics)

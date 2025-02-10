@@ -26,14 +26,12 @@ class SlackBot:
         self.status_interval = status_interval
         self.last_status_time = datetime.now()
         
-        # Default thresholds if none provided
+        # Default thresholds
         self.urgent_thresholds = urgent_thresholds or {
             "loss": 3.0,            # Alert if above
             "gradient_norm": 5.0,   # Alert if above
-            "throughput": 1000.0,   # Alert if below (modify value depending on the unit)
+            "throughput": 1000.0,   # Alert if below (modify value depending on your setup)
         }
-        
-        # Keep track of metrics history
         self.metrics_history = {
             "loss": [],
             "gradient_norm": [],
@@ -66,7 +64,7 @@ class SlackBot:
                 else:
                     trend_arrow = ""
                 message += f"{metric_name}: {value:.4f} {trend_arrow}\n"
-        message += "```"  # End code block
+        message += "```"
         return message
 
     def check_urgent_conditions(self, metrics: Dict[str, float]) -> List[str]:
@@ -79,7 +77,7 @@ class SlackBot:
             if metric_name == "throughput":
                 if value < threshold:
                     urgent_messages.append(
-                        f"🚨 *ALERT* Low throughput: `{value:.2f}` tok/sec (threshold: {threshold}) 🚨"
+                        f"🚨 *ALERT* Low throughput: `{value:.2f}` (TFLOP/s/GPU) (threshold: {threshold}) 🚨"
                     )
             else:
                 if value > threshold:
