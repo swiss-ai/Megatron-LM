@@ -13,7 +13,7 @@ class SlackBot:
         urgent_thresholds: Optional[Dict[str, float]] = None
     ):
         """
-        Initialize the Slack Monitoring Bot.
+        Initialize the Slack Monitoring Bot
         Args:
             slack_token: Slack Bot User OAuth Token
             channel_id: Slack channel ID to post messages to
