@@ -40,6 +40,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
        generates masks by itself.
     """
 
+    token_self_attending: bool = True
+    """Option to enable the token attend to itself (diagonal line) in the attention mask"""
+
     drop_last_partial_validation_sequence: bool = True
     """Option to drop the last partial validation sequence"""
 
@@ -192,6 +195,7 @@ class GPTDataset(MegatronDataset):
                 self.config.reset_attention_mask,
                 self.config.eod_mask_loss,
                 self.config.create_attention_mask,
+                self.config.token_self_attending,
             )
             if self.masks_and_position_ids_are_cacheable:
                 self.cached_attention_mask = attention_mask
@@ -624,6 +628,7 @@ def _get_ltor_masks_and_position_ids(
     reset_attention_mask: bool,
     eod_mask_loss: bool,
     create_attention_mask: bool,
+    token_self_attending: bool,
 ):
     """Build masks and position id for left to right model.
 
@@ -654,6 +659,9 @@ def _get_ltor_masks_and_position_ids(
         attention_mask = torch.tril(
             torch.ones((seq_length, seq_length), device=data.device)
         ).unsqueeze(0)
+
+        if not token_self_attending:
+            attention_mask[0].fill_diagonal_(0)
     else:
         attention_mask = None
 

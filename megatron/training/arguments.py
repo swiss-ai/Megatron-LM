@@ -2007,6 +2007,10 @@ def _add_data_args(parser):
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')
+    group.add_argument('--no-token-self-attending', action='store_false',
+                       help='If set, token does not attend to itself in attention mask. ' 
+                       'Currently only works if create_attention_mask_in_dataloader=True.',
+                       dest='token_self_attending')
     group.add_argument('--num-dataset-builder-threads', type=int, default=1,
                        help='Number of parallel threads per rank for dataset builder')
     group.add_argument('--s3-cache-path', type=str, default=None,
