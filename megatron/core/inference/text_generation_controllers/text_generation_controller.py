@@ -16,7 +16,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
-from megatron.core.utils import get_attr_wrapped_model, get_model_config
+from megatron.core.utils import get_model_config
 
 
 class TextGenerationController:
@@ -66,7 +66,7 @@ class TextGenerationController:
         """Detokenize the generated tokens.
 
         Args:
-            tokens_gpu_tensor (torch.Tensor): Tensor containing the generated tokens
+            tokens_gpu_tensor (torch.Tensor): Tensor containing the tokens
             lengths_gpu_tensor (torch.Tensor): Tensor containing the lengths of each sequence
             detokenize_segments (bool): If True, returns individually detokenized tokens. If False,
             returns None as second element. Helpful for understanding per-token boundaries in
@@ -295,9 +295,14 @@ class TextGenerationController:
         Returns:
             OrderedDict[str, InferenceRequest]: The result for each of the incoming requests
         """
+        assert all(request.prompt_tokens is not None for request in active_requests.values())
+
         # Perform a deep copy so that the request prompt tokens do not get modified.
-        batch_prompt_tokens_list = list(
-            map(lambda request: copy.deepcopy(request.prompt_tokens), active_requests.values())
+        batch_prompt_tokens_list: List[List[int]] = list(
+            map(
+                lambda request: copy.deepcopy(request.prompt_tokens),  # type: ignore[arg-type]
+                active_requests.values(),
+            )
         )
         prompt_lengths_in_batch = torch.tensor(
             [len(prompt_tokens) for prompt_tokens in batch_prompt_tokens_list],
@@ -336,9 +341,9 @@ class TextGenerationController:
             batch_size, device=torch.cuda.current_device()
         ).cuda()
 
-        # Use model vocab size since tokenizer vocab size might not include padding
+        # Use padded vocab size because tokenizer vocab size might not include padding
         # to nearest power of 2
-        vocab_size = get_attr_wrapped_model(self.inference_wrapped_model.model, "vocab_size")
+        vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
 
         # Check whether CUDA graphs are enabled
         enable_cuda_graph = get_model_config(self.inference_wrapped_model.model).enable_cuda_graph
@@ -360,8 +365,6 @@ class TextGenerationController:
             streaming_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             stream_tokens = functools.partial(self.stream_tokens, sampling_params)
 
-        use_attention_mask = True
-
         with torch.no_grad():
 
             self.inference_wrapped_model.prep_model_for_inference(
@@ -371,6 +374,10 @@ class TextGenerationController:
             inference_input: Dict[str, Any] = self.prep_inference_input(
                 prompts_tokens=batch_prompt_tokens, active_requests=active_requests
             )
+
+            assert (
+                not self.inference_wrapped_model.inference_params.decode_mode
+            ), f"Generation must start in prefill mode"
 
             context_start_position = 0
             # Pick the context window that we need to pass through the network.
@@ -382,8 +389,10 @@ class TextGenerationController:
                     )
                 )
 
+                # Disable attention mask when using CUDA graphs for decode
                 if (
-                    not use_attention_mask
+                    enable_cuda_graph
+                    and self.inference_wrapped_model.inference_params.decode_mode
                     and "attention_mask" in inference_input_for_context_window
                 ):
                     inference_input_for_context_window["attention_mask"] = None
@@ -472,9 +481,9 @@ class TextGenerationController:
                 if all_prompts_done:
                     break
 
-                # Disable attention mask for CUDA graphs (decode only)
-                if use_attention_mask and enable_cuda_graph and torch.all(generation_started):
-                    use_attention_mask = False
+                # Change to decode mode if all prefill is complete
+                if torch.all(generation_started):
+                    self.inference_wrapped_model.inference_params.enable_decode_mode()
 
         # Close all streams
         if streaming_enabled:
@@ -525,12 +534,16 @@ class TextGenerationController:
                 .tolist()
             )
             request.status = Status.COMPLETED
-            request.generated_text, request.generated_segments = self.detokenize_generations(
-                required_result_tokens,
+
+            text, segments = self.detokenize_generations(
+                batch_prompt_tokens_with_generations[idx],
                 input_prompt_length + generated_sequence_lengths,
                 sampling_params.return_segments,
             )
-
+            request.text = text  # Inference server returns prompts & generations together
+            if sampling_params.return_segments:
+                request.segments = segments[0]
+            request.generated_text = text[len(request.prompt) :]
         return active_requests
 
     def prep_inference_input(

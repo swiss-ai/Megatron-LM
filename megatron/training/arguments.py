@@ -22,7 +22,7 @@ from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import is_torch_min_version
 from megatron.training.activations import squared_relu
-from megatron.training.utils import update_use_dist_ckpt
+from megatron.training.utils import update_use_dist_ckpt, get_device_arch_version
 
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
@@ -405,7 +405,7 @@ def validate_args(args, defaults={}):
             '--overlap-param-gather only supported with MCore models'
 
     if getattr(args, "use_torch_fsdp2", False):
-        assert get_torch_version() >= PkgVersion("2.4"), \
+        assert is_torch_min_version("2.4.0"), \
             'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
         assert args.pipeline_model_parallel_size == 1, \
             '--use-torch-fsdp2 is not supported with pipeline parallelism'
@@ -657,7 +657,8 @@ def validate_args(args, defaults={}):
                 "environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 while FSDP2 "
                 "requires not setting CUDA_DEVICE_MAX_CONNECTIONS=1 for better parallelization.")
 
-    if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+    if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1" and get_device_arch_version() < 10:
+        # CUDA_DEVICE_MAX_CONNECTIONS requirement no longer exists since the Blackwell architecture
         if args.sequence_parallel:
             raise RuntimeError(
                 "Using sequence parallelism requires setting the environment variable "
@@ -1505,6 +1506,9 @@ def _add_training_args(parser):
     group.add_argument('--disable-tp-comm-split-rs', action='store_false',
                        help='Disables the Reduce-Scatter overlap with fprop GEMM.',
                        dest='tp_comm_split_rs')
+    group.add_argument('--pipeline-model-parallel-comm-backend', type=str, default='nccl',
+                       choices=['nccl', 'ucc'],
+                       help='Select a communicator backend for pipeline parallel communication.')
 
     return parser
 
@@ -2197,8 +2201,11 @@ def _add_moe_args(parser):
                        help='Number of experts to route to for each token. The default is 2.')
     group.add_argument('--moe-router-pre-softmax', action='store_true',
                        help='Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k.')
-    group.add_argument('--moe-router-topk-limited-devices', type=int, default=None,
-                       help='Number of expert parallel ranks to consider for each token during routing. Perform top-k routing on a subset of expert parallel ranks by first selecting N ranks for each token, then conducting top-k selection among experts on these devices. Default is None, which means no limited devices.')
+    group.add_argument('--moe-router-num-groups', type=int, default=None,
+                       help='Number of groups to divide experts into for group-limited routing. When using group-limited routing: 1) Experts are divided into equal-sized groups, 2) For each token, a subset of groups are selected based on routing scores (sum of top-2 expert scores within each group), 3) From these selected groups, moe_router_topk experts are chosen.'
+                       'Two common use cases: 1) Device-limited routing: Set equal to expert parallel size (EP) to limit each token to experts on a subset of devices (See DeepSeek-V2: https://arxiv.org/pdf/2405.04434) 2) Node-limited routing: Set equal to number of nodes in EP group to limit each token to experts on a subset of nodes (See DeepSeek-V3: https://arxiv.org/pdf/2412.19437)')
+    group.add_argument('--moe-router-group-topk', type=int, default=None,
+                       help='Number of selected groups for group-limited routing.')
     group.add_argument('--moe-router-topk-scaling-factor', type=float, default=None,
                        help='Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling.')
     group.add_argument('--moe-router-enable-expert-bias', action='store_true',
@@ -2238,6 +2245,8 @@ def _add_moe_args(parser):
     group.add_argument('--moe-use-upcycling', action='store_true',
                        help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
                        'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
+    group.add_argument('--moe-permute-fusion', action='store_true',
+                       help='Fuse token rearrangement ops during token dispatching.')
 
     return parser
 
@@ -2255,6 +2264,10 @@ def _add_mla_args(parser):
                        help="Dimension of the head in the V projection.")
     group.add_argument('--rotary-scaling-factor', type=float, default=1.0,
                        help="Rotary scaling factor for the rotary embeddings.")
+    group.add_argument('--mscale', type=float, default=1.0,
+                       help="Mscale for YaRN RoPE in multi-latent attention.")
+    group.add_argument('--mscale-all-dim', type=float, default=1.0,
+                       help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
 
     return parser
 

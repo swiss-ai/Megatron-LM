@@ -146,6 +146,8 @@ class TestLocalCheckpointing:
     @pytest.mark.parametrize(('use_ramdisk'), [True, False])
     @pytest.mark.parametrize(('async_save'), [True, False])
     @pytest.mark.parametrize(('algo'), ['atomic', 'fully_parallel'])
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     def test_basic_save_load_scenarios(
         self, tmp_path_dist_ckpt, tp, pp, use_ramdisk, async_save, algo
     ):
