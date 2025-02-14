@@ -28,7 +28,7 @@ MBS=3
 GBS=504
 SEQ_LEN=4096
 TRAINING_STEPS=48441
-CHECKPOINT_STEPS=5000
+CHECKPOINT_STEPS=1000
 
 #### Debugging ####
 LOG_NCCL=false # Log NCCL_DEBUG=info. Every process will dump the logging into separate files, check `NCCL_DEBUG_FILE`
@@ -37,12 +37,12 @@ MOCK_DATA=false # Set to `true` to use mock data
 ###################
 
 # Megatron source and dataset cache WARNING (!) MUST BE ON IOPSSTOR (!)
-MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
+MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/experiments/sai_vocab_data_ablation/Megatron-LM
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache
 
 # Logging directories & artifacts
 PROJECT_NAME=snai_vocab_and_data_ablation
-EXP_NAME=llama3-1b-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz-saiVocab-saiFW-keeprobots
+EXP_NAME=llama3-1b-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz-saiVocab-saiFW-filterrobots
 PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
 
 #########################################
@@ -245,13 +245,6 @@ if [ "$NSYS_PROFILER" = true ]; then
     TRAINING_CMD="$NSYS_LAUNCHER $TRAINING_CMD --profile"
 fi
 
-PRE_CMD="
-  orig_dir=\$(pwd)
-  cd \"$MEGATRON_LM_DIR\"
-  git switch sai-vocab-ablation
-  cd \"$orig_dir\"
-  "
-
 cp $0 $DEBUG_DIR
 
 # Checkpoint Compute Environment
@@ -278,6 +271,6 @@ printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR
 echo -e "\nEnvironment Variables:\n\n$(printenv)" >> $COMPUTE_ENVIRONMENT_DIR
 printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR 
 
-srun -lu --cpus-per-task $SLURM_CPUS_PER_TASK --wait 60 bash -c "$PRE_CMD $CMD_PREFIX $TRAINING_CMD"
+srun -lu --cpus-per-task $SLURM_CPUS_PER_TASK --wait 60 bash -c "$CMD_PREFIX $TRAINING_CMD"
 
 echo "END TIME: $(date)"
