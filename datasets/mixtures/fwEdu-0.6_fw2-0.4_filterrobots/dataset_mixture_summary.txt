@@ -1,0 +1,1 @@
+Dataset mixture created in datasets/mixtures/fwEdu-0.6_fw2-0.4_filterrobots | 34 files ([17, 17]) | 9.3 TB | 2324.87 Billion Tokens (x2 if Vocab < 65536) | Resulting mixture is {'datasets/mixtures/fwEdu-0.6_fw2-0.4_filterrobots/dataset_mixture_summary.txt': 0.6115, 'datasets/mixtures/fwEdu-0.6_fw2-0.4_filterrobots/swissai-fineweb-edu-filterrobots-merge': 0.3885}
