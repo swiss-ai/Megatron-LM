@@ -82,6 +82,8 @@ def launch_and_wait_for_completion(
                                     "RUN_NAME": run_name or "",
                                     "WANDB_API_KEY": os.getenv("WANDB_API_KEY") or "",
                                     "WANDB_EXPERIMENT": wandb_experiment or "",
+                                    "SLACK_BOT_TOKEN": os.getenv("SLACK_BOT_TOKEN") or "",
+                                    "SLACK_CHANNEL_ID": os.getenv("SLACK_CHANNEL_ID") or "",
                                 }
                             }
                         }

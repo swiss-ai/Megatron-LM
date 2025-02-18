@@ -10,11 +10,17 @@ This is the codebase to run megatron efficiently at scale using Clariden. The co
   git clone https://github.com/swiss-ai/Megatron-LM.git
   ```
 
-2. You need to have to set the weights & biases environment variable with your key. Ideally you add it `~/.bashrc`.
+2. You need to set the weights & biases environment variable with your key. Ideally you add it in `~/.bashrc`.
   ```
   export WANDB_API_KEY=57b215a80f....
   ```
-  Now re-login or run `source ~/.bashrc` to make sure it is set. 
+
+3. To enable the slack bot during training, you need to set the following environment variables, in a similar way:
+  ```
+  export SLACK_BOT_TOKEN=xoxb-60756381....
+  export SLACK_CHANNEL_ID=C08....
+  ```
+  Now re-login or run `source ~/.bashrc` to make sure varibales are set. 
 
 ## Submit a run
 
@@ -22,9 +28,7 @@ This is the codebase to run megatron efficiently at scale using Clariden. The co
   ```
   sbatch submit-llama3-8B.sh
   ```
-
   You can find all available arguments here: [https://github.com/swiss-ai/Megatron-LM/blob/main/megatron/training/arguments.py](https://github.com/swiss-ai/Megatron-LM/blob/main/megatron/training/arguments.py)
-
   (We will add 1.5B, 3B, and 70B baseline runs using the llama3 architecture very soon.)
 
 2. The main logs will be visible ~2min after launching the script in the `TheMeg-Clariden` Project on your personal weights and biases page.
@@ -53,11 +57,11 @@ You can submit issues and create branches on `https://github.com/swiss-ai/Megatr
   ```
 
 5. Push your commit to your branch
-```
-git push origin my-contribution-branch
-```
+  ```
+  git push origin my-contribution-branch
+  ```
 
-6. Go to `https://github.com/swiss-ai/Megatron-LM` and create a new issue that references your branch and explains what you did. Add ischlag or TJ-Solergibert for now. 
+6. Go to `https://github.com/swiss-ai/Megatron-LM` and create a new issue that references your branch and explains what you did. Add `ischlag` or `TJ-Solergibert` for now. 
 
 7. Use this command to return to main branch.
   ```
