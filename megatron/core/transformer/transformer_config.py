@@ -116,6 +116,10 @@ class TransformerConfig(ModelParallelConfig):
     """If not None, then will use sliding window attention. The size of the window is specified by
     the numbers inside the tuple; -1 is special value meaning "infinite window size"."""
 
+    is_local_attention: Optional[Callable[[int], bool]] = None
+    """If not None, then it should be a lambda function taking layer_id as input and returning
+    True if local attention should be applied at that layer."""
+
     normalization: bool = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
