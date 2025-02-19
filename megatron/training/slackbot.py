@@ -9,7 +9,7 @@ class SlackBot:
         self,
         slack_token: str,
         channel_id: str,
-        status_interval: int = 4,  # hours between regular updates
+        status_interval: int = 0.1,  # hours between regular updates
         urgent_thresholds: Optional[Dict[str, float]] = None
     ):
         """
@@ -30,7 +30,7 @@ class SlackBot:
         self.urgent_thresholds = urgent_thresholds or {
             "loss": 3.0,            # Alert if above
             "gradient_norm": 5.0,   # Alert if above
-            "throughput": 1000.0,   # Alert if below (modify value depending on your setup)
+            "throughput": 140.0,   # Alert if below (modify value depending on your setup)
         }
         self.metrics_history = {
             "loss": [],

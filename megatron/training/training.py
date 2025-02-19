@@ -99,6 +99,8 @@ from . import one_logger_utils
 
 from . import ft_integration
 
+# os.system('pip install slack_sdk')
+
 stimer = StragglerDetector()
 
 
@@ -1059,13 +1061,13 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
-        if slack_bot:
+        if slack_bot and torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             metrics = {
                 "loss": loss_dict['lm loss'] if 'lm loss' in loss_dict else 0., # Needs improvement
                 "gradient_norm": grad_norm if grad_norm is not None else 0.,
                 "throughput": throughput,
                 }
-            slack_bot.update(metrics)
+            slack_bot.update(metrics) # may add some condition to avoid early training (wrong) alerts
 
         if args.log_timers_to_tensorboard:
             if writer:
