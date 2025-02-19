@@ -1450,6 +1450,8 @@ def _add_training_args(parser):
     group.add_argument('--cross-entropy-loss-fusion', action='store_true',
                        help='Enabled fusion of cross entropy loss calculation.',
                        dest='cross_entropy_loss_fusion')
+    group.add_argument('--z-loss-weight', type=float, default=0.0,
+                       help='Weight of the z-loss in the total loss.')
     group.add_argument('--use-flash-attn', action='store_true',
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')

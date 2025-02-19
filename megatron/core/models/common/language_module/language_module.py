@@ -80,6 +80,11 @@ class LanguageModule(MegatronModule):
         else:
             loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
 
+        # z loss
+        from megatron.core.tensor_parallel.z_loss import vocab_parallel_max_z
+        if self.config.z_loss_weight > 0:
+            loss += vocab_parallel_max_z(logits, self.config.z_loss_weight)
+        
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()
         return loss
