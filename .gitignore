@@ -14,3 +14,4 @@ onelogger.log
 onelogger.err
 core_nid*
 datasets/
+submit-llama3-300m.sh
