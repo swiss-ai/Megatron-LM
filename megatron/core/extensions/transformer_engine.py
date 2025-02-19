@@ -754,7 +754,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 f"Transformer-Engine v{get_te_version()} must be >= 1.2.0 to support"
                 "sliding window attention."
             )
-            extra_kwargs['window_size'] = config.window_size
+            # extra_kwargs['window_size'] = config.window_size
+            apply_local_attention = config.is_local_attention(layer_number)
+            extra_kwargs['window_size'] = config.window_size if apply_local_attention else (-1, 0)
 
         if is_te_min_version("1.10.0"):
             # TE 1.10.0 introduces the ability to set the different k and v channels
