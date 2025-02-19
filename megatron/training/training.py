@@ -961,13 +961,13 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             with open(args.memory_snapshot_path , 'wb') as f:
                 dump(snapshot, f)
 
-        if slack_bot:
-            metrics = {
-                "loss": loss_dict['lm loss'] if 'lm loss' in loss_dict else 0., # Needs improvement
-                "gradient_norm": grad_norm if grad_norm is not None else 0.,
-                "throughput": throughput,
-                }
-            slack_bot.update(metrics)
+        # if slack_bot:
+        #     metrics = {
+        #         "loss": loss_dict['lm loss'] if 'lm loss' in loss_dict else 0., # Needs improvement
+        #         "gradient_norm": grad_norm if grad_norm is not None else 0.,
+        #         "throughput": throughput,
+        #         }
+        #     slack_bot.update(metrics)
 
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples},
@@ -1058,6 +1058,14 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             elapsed_time_per_iteration * 10**12 * args.world_size)
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
+
+        if slack_bot:
+            metrics = {
+                "loss": loss_dict['lm loss'] if 'lm loss' in loss_dict else 0., # Needs improvement
+                "gradient_norm": grad_norm if grad_norm is not None else 0.,
+                "throughput": throughput,
+                }
+            slack_bot.update(metrics)
 
         if args.log_timers_to_tensorboard:
             if writer:
