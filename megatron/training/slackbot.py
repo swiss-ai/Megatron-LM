@@ -9,7 +9,7 @@ class SlackBot:
         self,
         slack_token: str,
         channel_id: str,
-        status_interval: int = 0.1,  # hours between regular updates
+        status_interval: int = 0.05,  # hours between regular updates
         urgent_thresholds: Optional[Dict[str, float]] = None
     ):
         """
@@ -77,7 +77,7 @@ class SlackBot:
             if metric_name == "throughput":
                 if value < threshold:
                     urgent_messages.append(
-                        f"🚨 *ALERT* Low throughput: `{value:.2f}` (TFLOP/s/GPU) (threshold: {threshold}) 🚨"
+                        f"🚨 *ALERT* Low throughput: `{value:.2f}` tflop/gpu/sec (threshold: {threshold}) 🚨"
                     )
             else:
                 if value > threshold:

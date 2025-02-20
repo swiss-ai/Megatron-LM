@@ -99,7 +99,6 @@ from . import one_logger_utils
 
 from . import ft_integration
 
-# os.system('pip install slack_sdk')
 
 stimer = StragglerDetector()
 
@@ -962,14 +961,6 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             from pickle import dump
             with open(args.memory_snapshot_path , 'wb') as f:
                 dump(snapshot, f)
-
-        # if slack_bot:
-        #     metrics = {
-        #         "loss": loss_dict['lm loss'] if 'lm loss' in loss_dict else 0., # Needs improvement
-        #         "gradient_norm": grad_norm if grad_norm is not None else 0.,
-        #         "throughput": throughput,
-        #         }
-        #     slack_bot.update(metrics)
 
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples},
