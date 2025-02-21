@@ -66,6 +66,7 @@ class _get_data_on_this_cp_rank(torch.autograd.Function):
                 ctx.decoder_emb_index = index
                 ctx.decoder_emb_seqlen = data.size(1)
             batch[key] = data.index_select(1, index)
+            batch[key].requires_grad = data.requires_grad
 
         return batch
 
@@ -200,28 +201,40 @@ class LLaVAModel(MegatronModule):
         # on the word embeddings inside `finalize_model_grads._allreduce_word_embedding_grads`.
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         if self.add_decoder:
-            self.language_model = GPTModel(
-                config=language_transformer_config,
-                transformer_layer_spec=language_transformer_layer_spec,
-                vocab_size=language_vocab_size,
-                max_sequence_length=language_max_sequence_length,
-                parallel_output=parallel_output,
-                share_embeddings_and_output_weights=share_embeddings_and_output_weights,
-                position_embedding_type=language_position_embedding_type,
-                rotary_percent=language_rotary_percent,
-                pre_process=self.pre_process,
-                post_process=self.post_process,
-                rotary_base=language_rotary_base,
-                rope_scaling=language_rope_scaling,
-                rope_scaling_factor=language_rope_scaling_factor,
-                scatter_embedding_sequence_parallel=False,
-            )
-            self.share_embeddings_and_output_weights = (
-                self.language_model.share_embeddings_and_output_weights
-            )
+            if hasattr(
+                language_transformer_config, "language_model_type"
+            ) and language_transformer_config.language_model_type.startswith("huggingface"):
+                from megatron.core.models.huggingface.module import build_hf_model
+
+                self.language_model = build_hf_model(language_transformer_config)
+            else:
+                self.language_model = GPTModel(
+                    config=language_transformer_config,
+                    transformer_layer_spec=language_transformer_layer_spec,
+                    vocab_size=language_vocab_size,
+                    max_sequence_length=language_max_sequence_length,
+                    parallel_output=parallel_output,
+                    position_embedding_type=language_position_embedding_type,
+                    rotary_percent=language_rotary_percent,
+                    pre_process=self.pre_process,
+                    post_process=self.post_process,
+                    rotary_base=language_rotary_base,
+                    rope_scaling=language_rope_scaling,
+                    scatter_embedding_sequence_parallel=False,
+                )
+
+                self.share_embeddings_and_output_weights = (
+                    self.language_model.share_embeddings_and_output_weights
+                )
             self._language_max_sequence_length = language_max_sequence_length
             self._language_is_pipeline_parallel = (
                 language_transformer_config.pipeline_model_parallel_size > 1
+            )
+
+            # Newer Transformer Engine versions add _extra_state keys in state_dict when using FP8.
+            # Older models may not have _extra_state and can be ignored.
+            self.language_model.register_load_state_dict_post_hook(
+                _load_state_dict_hook_ignore_extra_state
             )
 
         class_token_len = 1
@@ -269,12 +282,20 @@ class LLaVAModel(MegatronModule):
                     embedder_bias=embedder_bias,
                     use_mask_token=use_mask_token,
                 )
+            elif vision_transformer_config.vision_model_type.startswith("huggingface"):
+                from megatron.core.models.huggingface.module import build_hf_model
+
+                self.vision_model = build_hf_model(vision_transformer_config)
             else:
                 raise ValueError(
                     "Vision model "
                     f"{vision_transformer_config.vision_model_type} is not "
                     "supported."
                 )
+
+            self.vision_model.register_load_state_dict_post_hook(
+                _load_state_dict_hook_ignore_extra_state
+            )
 
             vision_projection_input_size = vision_transformer_config.hidden_size
             vision_projection_input_size *= 4 if pixel_shuffle else 1
@@ -299,7 +320,7 @@ class LLaVAModel(MegatronModule):
                     partial(_load_state_dict_hook_ignore_param_names, vision_projection_param_names)
                 )
 
-        self._img_seq_len = get_num_image_embeddings(
+        self.img_seq_len = get_num_image_embeddings(
             img_h,
             img_w,
             patch_dim,
@@ -420,7 +441,7 @@ class LLaVAModel(MegatronModule):
         if use_inference_kv_cache:
             return language_embeddings, loss_mask, labels
 
-        img_seq_len = self._img_seq_len
+        img_seq_len = self.img_seq_len
         batch_size, text_seq_len = input_ids.shape
 
         has_labels = labels is not None
@@ -513,9 +534,17 @@ class LLaVAModel(MegatronModule):
             ]
 
             # Put image embeddings to image positions.
-            final_embedding[images_mask] = (
-                image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous()
-            )
+            # NOTE: FSDP can hang with text-only samples so we use a workaround to run a dummy image
+            # through the vision model and then zero-out the impact of the output here.
+            if num_image_tiles.shape[0] == 0 and image_embeddings.shape[0] > 0:
+                assert images_mask.sum() == 0 and getattr(
+                    self.vision_model, "_is_fsdp_managed_module", False
+                ), "expected FSDP and dummy image"
+                final_embedding[:1, :1, :1] += 0 * image_embeddings[:1, :1, :1]
+            else:
+                final_embedding[images_mask] = (
+                    image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous()
+                )
 
         # Create the final labels and loss mask (if this is the last language model stage).
         final_labels, final_loss_mask = None, None
@@ -871,6 +900,28 @@ def _load_state_dict_hook_ignore_param_names(
                 f"{param_name} being removed from incompatible_keys.missing_keys in LlavaModel"
             )
             incompatible_keys.missing_keys.remove(param_name)
+
+
+def _load_state_dict_hook_ignore_extra_state(
+    module: torch.nn.Module, incompatible_keys: namedtuple
+):
+    """Hook to ignore Transformer Engine _extra_state used for FP8.
+
+    This is for backwards-compatibility. Newer TE versions add _extra_state keys to the state dict,
+    while older models might not have those keys. Those keys can be ignored when not using FP8.
+
+    Args:
+        module (torch.nn.Module): The torch module this hook applies to. Required by the torch API.
+        incompatible_keys (namedtuple): Namedtuple with fields missing_keys and unexpected_keys,
+            which collect the missing and unexpected keys, respectively.
+    """
+    for name, keys in incompatible_keys._asdict().items():
+        for key in keys[::-1]:
+            if "extra_state" in key:
+                logging.getLogger(__name__).warning(
+                    f"_extra_state key {key} being removed from {name}"
+                )
+                keys.remove(key)
 
 
 # pylint: disable-next=line-too-long

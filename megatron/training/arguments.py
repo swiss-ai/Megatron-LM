@@ -18,11 +18,15 @@ from megatron.core.models.retro.utils import (
     get_config_path as get_retro_config_path,
     get_gpt_data_dir as get_retro_data_dir,
 )
+from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.utils import is_torch_min_version
+from megatron.core.utils import (
+    is_torch_min_version,
+    get_torch_version,
+)
 from megatron.training.activations import squared_relu
-from megatron.training.utils import update_use_dist_ckpt
+from megatron.training.utils import update_use_dist_ckpt, get_device_arch_version
 
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
@@ -405,7 +409,7 @@ def validate_args(args, defaults={}):
             '--overlap-param-gather only supported with MCore models'
 
     if getattr(args, "use_torch_fsdp2", False):
-        assert get_torch_version() >= PkgVersion("2.4"), \
+        assert is_torch_min_version("2.4.0"), \
             'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
         assert args.pipeline_model_parallel_size == 1, \
             '--use-torch-fsdp2 is not supported with pipeline parallelism'
@@ -657,7 +661,8 @@ def validate_args(args, defaults={}):
                 "environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 while FSDP2 "
                 "requires not setting CUDA_DEVICE_MAX_CONNECTIONS=1 for better parallelization.")
 
-    if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+    if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1" and get_device_arch_version() < 10:
+        # CUDA_DEVICE_MAX_CONNECTIONS requirement no longer exists since the Blackwell architecture
         if args.sequence_parallel:
             raise RuntimeError(
                 "Using sequence parallelism requires setting the environment variable "
@@ -761,6 +766,14 @@ def validate_args(args, defaults={}):
     if args.apply_query_key_layer_scaling:
         args.attention_softmax_in_fp32 = True
 
+    if args.result_rejected_tracker_filename is not None:
+        # Append to passed-in args.iterations_to_slip.
+        iterations_to_skip_from_file = RerunStateMachine.get_skipped_iterations_from_tracker_file(
+            args.result_rejected_tracker_filename
+        )
+        args.iterations_to_skip.extend(iterations_to_skip_from_file)
+
+
     # Checkpointing
     if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
         print('--ckpt-fully-parallel-save flag is deprecated and has no effect.'
@@ -795,6 +808,13 @@ def validate_args(args, defaults={}):
         if not args.no_load_rng:
             args.no_load_rng = True
             print('Warning: disabling --no-load-rng for upcycling.')
+
+    # Optimizer CPU offload check
+    if args.optimizer_cpu_offload:
+        assert args.use_precision_aware_optimizer, (
+            "The optimizer cpu offload must be used in conjunction with `--use-precision-aware-optimizer`, "
+            "as the hybrid device optimizer reuses the code path of this flag."
+        )
 
     # MoE loss and include embedding and loss layer check
     if args.num_experts is not None:
@@ -971,8 +991,11 @@ def _add_inference_args(parser):
                        help='Whether to use the flash decoding kernel.')
     group.add_argument('--enable-cuda-graph', default=False, action="store_true",
                        help='Use CUDA graph capture and replay.')
-    group.add_argument("--cuda-graph-warmup-steps", type=int, default=2,
+    group.add_argument("--cuda-graph-warmup-steps", type=int, default=3,
                        help="Number of CUDA graph warmup steps")
+    group.add_argument('--inference-max-requests', type=int, default=8,
+                       help='Maximum number of requests for inference.',
+                       dest='inference_max_batch_size')
     group.add_argument('--inference-max-seq-length', type=int, default=2560,
                        help='Maximum sequence length allocated for prefill during inference.',
                        dest='inference_max_seq_length')
@@ -1336,6 +1359,9 @@ def _add_training_args(parser):
     group.add_argument('--check-for-spiky-loss', action='store_true',
                        help='Check for spiky loss',
                        dest='check_for_spiky_loss')
+    group.add_argument('--check-for-large-grads', action='store_true',
+                       help='Check for unexpectedly large grads',
+                       dest='check_for_large_grads')
     group.add_argument('--distribute-saved-activations',
                        action='store_true',
                        help='If set, distribute recomputed activations '
@@ -1368,6 +1394,10 @@ def _add_training_args(parser):
                        help='Global step to start profiling.')
     group.add_argument('--profile-step-end', type=int, default=12,
                        help='Global step to stop profiling.')
+    group.add_argument('--iterations-to-skip', nargs='+', type=int, default=[],
+                       help='List of iterations to skip, empty by default.')
+    group.add_argument('--result-rejected-tracker-filename', type=str, default=None,
+                       help='Optional name of file tracking `result_rejected` events.')
     group.add_argument('--use-pytorch-profiler', action='store_true',
                        help='Use the built-in pytorch profiler. '
                        'Useful if you wish to view profiles in tensorboard.',
@@ -1479,6 +1509,18 @@ def _add_training_args(parser):
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
+    group.add_argument('--optimizer-cpu-offload', action='store_true',
+                       help='Offload optimizer state to CPU')
+    group.add_argument('--optimizer-offload-fraction', type=float, default=1.0,
+                          help='Ratio of optimizer state to offload to CPU')
+    group.add_argument('--use-torch-optimizer-for-cpu-offload', action='store_true',
+                       help="Use torch.optim.Optimizer instead of Megatron's optimizer in optimizer cpu offload mode.")
+    group.add_argument('--overlap-cpu-optimizer-d2h-h2d', action='store_true', default=False,
+                       help='Overlap CPU optimizer step, gradients D2H and updated parameters H2D.')
+    group.add_argument('--no-pin-cpu-grads', action='store_false', dest='pin_cpu_grads',
+                       help='Disable pinning of CPU memory for gradients.')
+    group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
+                       help='Disable pinning of CPU memory for parameters.')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')
@@ -1527,6 +1569,10 @@ def _add_training_args(parser):
     group.add_argument('--disable-tp-comm-split-rs', action='store_false',
                        help='Disables the Reduce-Scatter overlap with fprop GEMM.',
                        dest='tp_comm_split_rs')
+    group.add_argument('--pipeline-model-parallel-comm-backend', type=str, default=None,
+                       choices=['nccl', 'ucc'],
+                       help='Select a communicator backend for pipeline parallel communication. '
+                       'If None, the default backend will be used.')
 
     return parser
 
@@ -1687,6 +1733,9 @@ def _add_checkpointing_args(parser):
     group.add_argument('--use-dist-ckpt', action='store_true',
                        dest='use_dist_ckpt_deprecated',
                        help='Deprecated: see --ckpt-format.')
+    group.add_argument('--use-persistent-ckpt-worker', action='store_true',
+                       help='Enables a persitent checkpoint worker for async save')
+
     group.add_argument('--auto-detect-ckpt-format', action='store_true',
                        help='Determine if the checkpoint format is in legacy or distributed format.'
                             ' If False, expects distributed checkpoint iff args.ckpt_format != "torch".'
@@ -1829,8 +1878,15 @@ def _add_distributed_args(parser):
                        help='If not set, all PP stages will launch gradient reduces simultaneously. '
                        'Otherwise, each PP stage will independently launch as needed.',
                        dest='align_grad_reduce')
+    group.add_argument('--ddp-num-buckets', type=int, default=None,
+                       help='Number of buckets for data-parallel communication')
     group.add_argument('--ddp-bucket-size', type=int, default=None,
                        help='Bucket size for data-parallel communication')
+    group.add_argument('--ddp-pad-buckets-for-high-nccl-busbw', action='store_true',
+                       default=False, help='If set, make sure the bucket size is divisible by a large power '
+                       'of 2 (2^16) to ensure NCCL collectives have high bus bandwidth at large DP counts, '
+                       'since NCCL message size (which for ring algorithms is bucket_size / dp_size) '
+                       'apparently needs to be divisible by a power of 2 for high busbw.')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
@@ -2229,8 +2285,11 @@ def _add_moe_args(parser):
                        help='Number of experts to route to for each token. The default is 2.')
     group.add_argument('--moe-router-pre-softmax', action='store_true',
                        help='Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k.')
-    group.add_argument('--moe-router-topk-limited-devices', type=int, default=None,
-                       help='Number of expert parallel ranks to consider for each token during routing. Perform top-k routing on a subset of expert parallel ranks by first selecting N ranks for each token, then conducting top-k selection among experts on these devices. Default is None, which means no limited devices.')
+    group.add_argument('--moe-router-num-groups', type=int, default=None,
+                       help='Number of groups to divide experts into for group-limited routing. When using group-limited routing: 1) Experts are divided into equal-sized groups, 2) For each token, a subset of groups are selected based on routing scores (sum of top-2 expert scores within each group), 3) From these selected groups, moe_router_topk experts are chosen.'
+                       'Two common use cases: 1) Device-limited routing: Set equal to expert parallel size (EP) to limit each token to experts on a subset of devices (See DeepSeek-V2: https://arxiv.org/pdf/2405.04434) 2) Node-limited routing: Set equal to number of nodes in EP group to limit each token to experts on a subset of nodes (See DeepSeek-V3: https://arxiv.org/pdf/2412.19437)')
+    group.add_argument('--moe-router-group-topk', type=int, default=None,
+                       help='Number of selected groups for group-limited routing.')
     group.add_argument('--moe-router-topk-scaling-factor', type=float, default=None,
                        help='Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling.')
     group.add_argument('--moe-router-enable-expert-bias', action='store_true',
@@ -2270,6 +2329,8 @@ def _add_moe_args(parser):
     group.add_argument('--moe-use-upcycling', action='store_true',
                        help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
                        'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
+    group.add_argument('--moe-permute-fusion', action='store_true',
+                       help='Fuse token rearrangement ops during token dispatching.')
 
     return parser
 
@@ -2287,6 +2348,10 @@ def _add_mla_args(parser):
                        help="Dimension of the head in the V projection.")
     group.add_argument('--rotary-scaling-factor', type=float, default=1.0,
                        help="Rotary scaling factor for the rotary embeddings.")
+    group.add_argument('--mscale', type=float, default=1.0,
+                       help="Mscale for YaRN RoPE in multi-latent attention.")
+    group.add_argument('--mscale-all-dim', type=float, default=1.0,
+                       help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
 
     return parser
 

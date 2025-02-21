@@ -8,12 +8,13 @@ import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
-from image_processing import get_visual_transform
+from image_processing import find_closest_aspect_ratio, find_closest_area_weighted_aspect_ratio, get_visual_transform
 from PIL import Image
 from torchvision.transforms import ToPILImage
 import numpy as np
 import torch
 
+from energon_util import OfflineTargetAspectRatioSample, SampleListSample
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, IMAGE_TOKEN, VIDEO_TOKEN
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.energon import (
@@ -182,6 +183,10 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         # larger than the decoder_seq_length.
         self.num_tiles_degradation_map = {12:8, 8:6, 6:4, 4:2, 2:1, 1:1}
 
+        self.find_closest_aspect_ratio_fn = (
+            find_closest_area_weighted_aspect_ratio if self.args.use_area_weighted_aspect_ratio
+            else find_closest_aspect_ratio)
+
     def _get_total_seq_length(self, input_ids, num_tiles):
         """Calculate expected sequence length given text tokens length and number of tiles."""
         total_num_images = len(num_tiles)
@@ -227,6 +232,10 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             yield self.encode_llava_sft(sample)
         elif isinstance(sample, MultiChoiceVQASample):
             yield self.encode_any_single_turn_vqa(sample)
+        # Because the SampleListSample is defined in the Megatron module but loaded by the Energon
+        # library, we need to resort to the more brittle check:
+        elif type(sample).__name__ == "SampleListSample":
+            yield self.encode_sample_list(sample)
         else:
             raise NotImplementedError("Sample format not supported", sample)
 
@@ -236,7 +245,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
         imgs = get_visual_transform(
             sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
-            self.args.vision_model_type,
+            self.args.vision_model_type, find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
         )
         num_tiles = [len(imgs)]
 
@@ -282,7 +291,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
         imgs = get_visual_transform(
             sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
-            self.args.vision_model_type,
+            self.args.vision_model_type, find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
         )
         num_tiles = [len(imgs)]
 
@@ -310,10 +319,35 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             total_len=self._get_total_seq_length(input_ids, num_tiles),
         )
 
-    def encode_llava_sft(self, sample: SimilarityInterleavedSample):
+    def encode_sample_list(self, samples: SampleListSample):
+        """We encode the list of samples using encode_llava_sft on each sample."""
+        error_msg = ("You probably don't want to use online packing since SampleListSample is "
+                     "usually used along offline packing.")
+        assert not self.is_packing_enabled, error_msg
+        encoded_samples = []
+        current_length = 0
+        for sample in samples.samples:
+            encoded_sample = self.encode_llava_sft(sample, truncate_for_sample_list_packing=True)
+            if current_length + encoded_sample.total_len > self.packing_seq_length:
+                break
+            else:
+                encoded_samples.append(encoded_sample)
+                current_length += encoded_sample.total_len
+        return self.pack_selected_samples(encoded_samples)
+
+    def encode_llava_sft(self, sample: Union[SimilarityInterleavedSample, OfflineTargetAspectRatioSample], truncate_for_sample_list_packing=False):
         """Encode SFT sample."""
         augment = sample.__subflavors__['augmentation'] if 'augmentation' in sample.__subflavors__ else False
         has_video = sample.__subflavors__['has_video'] if 'has_video' in sample.__subflavors__ else False
+
+        # If the target aspect ratio are provided by the dataset, we use them instead of computing
+        # them with the self.find_closest_aspect_ratio_fn function.
+        local_find_closest_aspect_ratio_fn = self.find_closest_aspect_ratio_fn
+        if type(sample).__name__ == "OfflineTargetAspectRatioSample":
+            target_aspect_ratio = tuple(sample.target_aspect_ratio[0])
+            assert target_aspect_ratio is not None, "Sample of type OfflineTargetAspectRatioSample needs to define the target aspect ratio."
+            local_find_closest_aspect_ratio_fn = lambda *args, **kwargs: target_aspect_ratio
+
         has_image = False
         # We infer whether the sample has image or not.
         if hasattr(sample, "images") and not has_video:
@@ -389,7 +423,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 for img in sample.images:
                     img_tiles = get_visual_transform(
                         img, self.img_h, self.img_w, self.args.use_tiling, max_num_tiles,
-                        self.args.use_thumbnail, augment, self.args.vision_model_type)
+                        self.args.use_thumbnail, augment, self.args.vision_model_type,
+                        find_closest_aspect_ratio_fn=local_find_closest_aspect_ratio_fn)
                     imgs += img_tiles
                     num_tiles += [len(img_tiles)]
                 if max_num_tiles == 1:
@@ -420,12 +455,13 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 video_chw = to_pil(video_chw)
                 imgs += get_visual_transform(
                     video_chw, self.img_h, self.img_w, use_tiling, self.args.max_num_tiles,
-                    self.args.use_thumbnail, augment, self.args.vision_model_type)
+                    self.args.use_thumbnail, augment, self.args.vision_model_type,
+                    find_closest_aspect_ratio_fn=local_find_closest_aspect_ratio_fn)
             num_tiles = [len(imgs)]
         else:
             imgs = num_tiles = []
 
-        if self.is_packing_enabled:
+        if self.is_packing_enabled or truncate_for_sample_list_packing:
             input_ids, target = self._truncate_for_packing(input_ids, target, num_tiles)
 
         # Some final checks with respect to the number of image tokens and images on the tokenized
@@ -440,6 +476,9 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             f"Found sum({num_tiles}) = {np.sum(num_tiles)} tiles for {len(imgs)} images in {conversation}.")
         assert np.sum(num_tiles) == len(imgs), error_msg
 
+        # We need to ensure that there are at least some trainable tokens in the sample.
+        assert self.target_has_trainable_tokens(input_ids, num_tiles, target), "Sample has no trainable tokens."
+
         return ImageTaskSample(
             __key__=sample.__key__,
             __restore_key__=sample.__restore_key__,
@@ -451,6 +490,54 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             labels=torch.tensor(target),
             total_len=self._get_total_seq_length(input_ids, num_tiles),
         )
+    
+    def target_has_trainable_tokens(self, input_ids, num_tiles, target):
+        # Compute the loss mask based on extending the image tags with the proper
+        # number of image tokens, extracting the first self.args.decoder_seq_length tokens, and
+        # ensuring that some of these tokens have a loss mask > 0.
+        # Note that this is a bit hacky because we reproduce here parts of the logics which are in
+        # the model itself. Ideally, the data sampler would return the already processed inputs
+        # and targets to avoid this duplication.
+        expanded_target = target.copy()
+        expanded_target[input_ids==self.img_token_id] = self.img_token_id
+        expanded_target = self.replace_value_with_repetition(
+            expanded_target, self.img_token_id,
+            self.num_image_embeddings_per_tile * np.array(num_tiles), IGNORE_INDEX)
+        loss_mask = torch.ones(torch.tensor(expanded_target).size(), dtype=torch.float)
+        loss_mask[expanded_target == self.tokenizer.pad] = 0.0 # mask paddings
+        loss_mask[expanded_target == IGNORE_INDEX] = 0.0 # mask prompts
+        loss_mask = torch.cat((loss_mask[1:], torch.zeros((1,))))
+        loss_mask = loss_mask[:self.args.decoder_seq_length]
+        return torch.sum(loss_mask) > 0
+
+    def replace_value_with_repetition(self, arr, token_to_replace, num_repetition, new_token):
+        """
+        Replace every occurrence of value V in the input array with R repetitions of W.
+
+        Args:
+            arr (Array): Input array to be modified
+            token_to_replace: token to be replaced
+            new_token: new token
+            num_repetition (Array): number of repetition of new token.
+
+        Returns:
+            Array: New array with token_to_replace replaced by num_repetition repetitions of
+             new_token
+        """
+        error_msg = "The number of image tokens must match the length of the tile tensor."
+        assert np.sum(arr==token_to_replace) == len(num_repetition), error_msg
+        result = []
+        idx = 0
+        for item in arr:
+            if item == token_to_replace:
+                # If the current item matches token_to_replace, add R copies of W
+                result.extend([new_token] * num_repetition[idx])
+                idx += 1
+            else:
+                # Otherwise, keep the original item
+                result.append(item)
+
+        return np.array(result)
 
     def encode_any_single_turn_vqa(self, sample):
         """Encode MultiChoiceVQA or VQA sample."""
@@ -469,11 +556,13 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 imgs += get_visual_transform(
                     video_frame_hwc, self.img_h, self.img_w,
                     self.args.use_tiling, self.args.max_num_tiles,
-                    self.args.use_thumbnail, augment, self.args.vision_model_type)
+                    self.args.use_thumbnail, augment, self.args.vision_model_type,
+                    find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn)
         else:
             imgs = get_visual_transform(
                 sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles,
                 self.args.use_thumbnail, augment, self.args.vision_model_type,
+                find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
             )
 
         num_tiles = [len(imgs)]
@@ -547,6 +636,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         imgs = get_visual_transform(
                 sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles,
                 self.args.use_thumbnail, augment, self.args.vision_model_type,
+                find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
             )
         num_tiles = [len(imgs)]
 

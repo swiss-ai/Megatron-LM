@@ -33,6 +33,8 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
+RECORD_CHECKPOINTS=${RECORD_CHECKPOINTS:-"false"}
+
 TEST_TYPES=("regular" "ckpt-resume" "frozen-resume" "release")
 
 mkdir -p $CHECKPOINT_SAVE_PATH
@@ -65,6 +67,11 @@ for i in $(seq 1 $N_REPEAT); do
     export REPEAT=$i
     export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
     export CHECKPOINT_LOAD_PATH=/tmp/checkpoints/
+
+    if [[ "$TEST_TYPE" = "release" ]]; then
+        export CHECKPOINT_LOAD_PATH=$_CHECKPOINT_LOAD_PATH
+        export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
+    fi
 
     bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
 
@@ -114,6 +121,15 @@ for i in $(seq 1 $N_REPEAT); do
         --train-iters $TRAIN_ITERS \
         --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
         "${EXTRACT_ARGS[@]}"
+
+    if [[ "$TEST_TYPE" == "release" ]]; then
+        SKIP_PYTEST=0
+    fi
+
+    if [[ ${RECORD_CHECKPOINTS} == "true" ]]; then
+        echo "Skipping Pytest during checkpoint recording."
+        SKIP_PYTEST=1
+    fi
 
     # Maybe run tests
     if [[ ${SKIP_PYTEST:-0} != 1 ]]; then
