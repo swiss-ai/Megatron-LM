@@ -290,4 +290,20 @@ printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR
 
 srun -lu --cpus-per-task $SLURM_CPUS_PER_TASK --wait 60 bash -c "$CMD_PREFIX $TRAINING_CMD"
 
+# Run the error analysis if the job failed
+JOB_EXIT_CODE=$?
+if [ $JOB_EXIT_CODE -ne 0 ]; then
+    echo "[$(date)] Job failed with exit code $JOB_EXIT_CODE. Running error analysis..."
+    ERROR_FILE="/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-$SLURM_JOB_ID.err"
+	# ERROR_FILE=$SLURM_JOB_ERR
+    ERROR_ANALYZER=$MEGATRON_LM_DIR/megatron/training/tools/slurm_utils.py
+    if [ -f "$ERROR_ANALYZER" ]; then
+        python3 "$ERROR_ANALYZER" "$ERROR_FILE"
+        mv "${ERROR_FILE}.analysis.txt" "$DEBUG_DIR/error_analysis.txt" # move output to DEBUG_DIR
+        echo "[$(date)] Error analysis saved to: $DEBUG_DIR/error_analysis.txt"
+    else
+        echo "[$(date)] Error analyzer script not found at: $ERROR_ANALYZER"
+    fi
+fi
+
 echo "END TIME: $(date)"
