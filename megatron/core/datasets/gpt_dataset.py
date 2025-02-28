@@ -743,16 +743,21 @@ def _get_ltor_masks_and_position_ids(
             for i in bod_indices: 
                     
                 if reset_attention_mask and attention_mask is not None:
-                    # Block cross document attention
-                    # If bod_hiding is true:
-                    # No tokens can attend to BOD
-                    # BOD can't attend to any token (include itself)
-                    attention_mask[0, i:, :i+bod_hiding] = 0
 
-                    # Functions the same as loss_mask[data == eod_token] = 1.0 - eod_mask_loss 
-                    # Each token before BOD (except the first BOD) is the last token of a document.
-                    if i > 0:  # Skip first BOD as there's no previous document
-                        loss_mask[i-1] = float(cross_document_attention)
+                    if bod_hiding:
+                        # No tokens can attend to BOD token
+                        attention_mask[0, :, i] = 0
+                        # BOD can't attend to any token
+                        attention_mask[0, i, :] = 0
+                    
+                    if not cross_document_attention:
+                        # Skip first BOD as there's no previous document
+                        if i > 0:  
+                            # Block attention to previous document
+                            attention_mask[0, i:, :i] = 0 
+
+                            # Each token before BOD (except the first BOD) is the last token of a document.
+                            loss_mask[i-1] = 0.0
                     
                 # Reset positions.
                 if reset_position_ids:
