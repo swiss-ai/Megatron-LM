@@ -144,43 +144,72 @@ class ErrorAnalyzer:
         """
         Split error file content by MPI rank to analyze specific ranks.
         Returns a dictionary mapping rank number to content chunks.
+        Only includes default0 logs for the specified global ranks.
         """
-        # Expanded pattern to identify rank/gpu markers in various formats
-        rank_patterns = [
-            r'(?:^|\n)(?:Rank|RANK|rank)[:\s]+(\d+)',  # Original pattern
-            r'(?:^|\n)\[default(\d+)\]',               # [defaultN] pattern
-            r'(?:^|\n)(\d+):\s+\[default'              # N: [default pattern
-        ]
-
+        # Dictionary to store content by global rank
         rank_contents = {}
-        # Try each pattern
-        for pattern in rank_patterns:
-            rank_markers = list(re.finditer(pattern, content, re.MULTILINE))
-            if rank_markers:
-                # Process each rank section
-                for i, marker in enumerate(rank_markers):
-                    rank = int(marker.group(1))
-                    # If we're only interested in specific ranks, skip others
-                    if self.ranks_to_analyze is not None and rank not in self.ranks_to_analyze:
-                        continue           
-                    start_pos = marker.start()      
-                    # End position is either the start of next rank or end of file
-                    if i < len(rank_markers) - 1:
-                        end_pos = rank_markers[i+1].start()
-                    else:
-                        end_pos = len(content)      
-                    # Add this content to the rank (might be multiple chunks)
-                    if rank in rank_contents:
-                        rank_contents[rank] += content[start_pos:end_pos]
-                    else:
-                        rank_contents[rank] = content[start_pos:end_pos]
-                # If we found ranks with this pattern, no need to try others
-                if rank_contents:
-                    break     
-        # If no valid ranks were found but ranks were specified
+        
+        # Pattern to identify global rank markers with local rank 0
+        local0_global_pattern = r'(?:^|\n)\[default0\](?:\[(?:Rank|RANK|rank)[:\s]+(\d+)\]|\[(\d+)\])'
+        
+        # Find all matches for default0 with a global rank
+        local0_global_matches = list(re.finditer(local0_global_pattern, content, re.MULTILINE))
+        
+        if local0_global_matches:
+            # Process each global rank section (with local rank 0)
+            for i, marker in enumerate(local0_global_matches):
+                # Extract the global rank - might be in group 1 or 2 depending on format
+                global_rank = int(marker.group(1) if marker.group(1) is not None else marker.group(2))
+                
+                # If we're only interested in specific ranks, skip others
+                if self.ranks_to_analyze is not None and global_rank not in self.ranks_to_analyze:
+                    continue
+                    
+                start_pos = marker.start()
+                
+                # End position is either the start of next match or end of file
+                if i < len(local0_global_matches) - 1:
+                    end_pos = local0_global_matches[i+1].start()
+                else:
+                    end_pos = len(content)
+                    
+                # Add this content to the rank
+                if global_rank in rank_contents:
+                    rank_contents[global_rank] += content[start_pos:end_pos]
+                else:
+                    rank_contents[global_rank] = content[start_pos:end_pos]
+        
+        # If no valid default0+global rank sections were found, fall back to global rank matching
         if not rank_contents:
-            # Look for rank-agnostic global errors (e.g., SLURM cancellations)
+            # Pattern to match global ranks
+            global_rank_pattern = r'(?:^|\n)(?:Rank|RANK|rank)[:\s]+(\d+)'
+            global_rank_matches = list(re.finditer(global_rank_pattern, content, re.MULTILINE))
+            
+            if global_rank_matches:
+                for i, marker in enumerate(global_rank_matches):
+                    global_rank = int(marker.group(1))
+                    
+                    # Filter by requested ranks
+                    if self.ranks_to_analyze is not None and global_rank not in self.ranks_to_analyze:
+                        continue
+                        
+                    start_pos = marker.start()
+                    
+                    if i < len(global_rank_matches) - 1:
+                        end_pos = global_rank_matches[i+1].start()
+                    else:
+                        end_pos = len(content)
+                        
+                    if global_rank in rank_contents:
+                        rank_contents[global_rank] += content[start_pos:end_pos]
+                    else:
+                        rank_contents[global_rank] = content[start_pos:end_pos]
+        
+        # If still no valid ranks were found but ranks were specified, look for rank-agnostic global errors
+        if not rank_contents and self.ranks_to_analyze:
+            # Add global errors that don't have rank specifiers
             rank_contents[-1] = content
+        
         return rank_contents
 
 
