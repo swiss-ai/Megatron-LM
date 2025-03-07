@@ -5,6 +5,8 @@ import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
+
+from megatron.inference.text_generation import generate_and_post_process, beam_search_and_post_process
 from megatron.training import print_rank_0
 from megatron.core.models.gpt import GPTModel
 from megatron.training.arguments import core_transformer_config_from_args
@@ -21,6 +23,7 @@ from typing import Union
 import megatron
 
 import os
+import torch
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
 import sys
 from argparse import Namespace
@@ -78,7 +81,16 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             transformer_layer_spec = import_module(args.spec)
         else:
             if use_te:
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm)
+                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                        num_experts=args.num_experts, 
+                        moe_grouped_gemm=args.moe_grouped_gemm,
+                        qk_layernorm=args.qk_layernorm, 
+                        multi_latent_attention=args.multi_latent_attention,
+                        attn_layernorm=args.attn_layernorm,
+                        mlp_layernorm=args.mlp_layernorm,
+                        qknorm_impl=args.qknorm_impl,
+                        post_layer_norm=args.post_layer_norm,
+                        moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm)
             else:
                 transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm)
 
@@ -97,6 +109,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             rotary_base=args.rotary_base,
             rope_scaling=args.use_rope_scaling,
             rope_scaling_factor=args.rope_scaling_factor,
+            final_layernorm=args.final_layernorm,
         )
 
     return model
@@ -184,5 +197,21 @@ if __name__ == "__main__":
     inference_engine = get_inference_engine(args, model)
 
     if mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
-        server = MegatronServer(inference_engine, args)
+        server = MegatronServer(model, inference_engine, args)
         server.run("0.0.0.0",port=args.port)
+
+    while True:
+        choice = torch.tensor(1, dtype=torch.long, device="cuda")
+        torch.distributed.broadcast(choice, 0)
+        #print(f"I am rank {torch.distributed.get_rank()} and I got broadcasted")
+        if choice.item() == 0:
+            try:
+                generate_and_post_process(model)
+            except ValueError as ve:
+                pass
+        elif choice.item() == 1:
+            try:
+                beam_search_and_post_process(model)
+            except ValueError as ve:
+                pass
+
