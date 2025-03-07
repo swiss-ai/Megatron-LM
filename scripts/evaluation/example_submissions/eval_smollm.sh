@@ -3,7 +3,7 @@ export LOGS_ROOT=$SCRATCH/eval-logs/main-v1
 export MODEL=HuggingFaceTB/SmolLM2-1.7B-intermediate-checkpoints
 export TOKENIZER=$MODEL
 export NAME=SmolLM2-1.7B
-export ARGS="--size 1 --wandb-entity epflmlo-epfl --wandb-project swissai-eval-mainv1 --wandb-id $NAME --bs 64 --tokens-per-iter 2097152 --tasks scripts/evaluation/swissai_eval"
+export ARGS="--size 1 --wandb-entity epflmlo-epfl --wandb-project swissai-eval-main-v1 --wandb-id $NAME --bs auto --tokens-per-iter 2097152 --tasks swissai_eval"
 
 ITS="125000,1000000,2000000,3000000,4000000,5000000"
 REVS=$(echo "$ITS" | sed 's/\([^,]*\)/step-\1/g')
