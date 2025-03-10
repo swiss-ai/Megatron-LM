@@ -75,6 +75,9 @@ class ModelParallelConfig:
     ###################
     # Training
     ###################
+    deepgemm_fp8: bool = False
+    """If true, use deepgemm fpa mma for linear layers."""
+
     fp16: bool = False
     """If true, train with fp16 mixed precision training."""
 

@@ -36,6 +36,7 @@ from .mappings import (
 )
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility, divide
+from deep_gemm import gemm_fp8_fp8_bf16_nt, per_token_quantize, per_block_quantize, per_token_dequantize_transpose_quantize
 
 _grad_accum_fusion_available = True
 try:
@@ -555,6 +556,198 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         return grad_input, grad_weight, grad_bias, None, None, None, None, None
 
+class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
+    """LinearWithGradAccumulationAndAsyncCommunication with DPSK V3 FP8 layers."""
+
+    @staticmethod
+    @custom_fwd
+    def forward(
+        ctx,
+        input,
+        weight,
+        bias,
+        gradient_accumulation_fusion,
+        allreduce_dgrad,
+        sequence_parallel,
+        grad_output_buffer,
+        wgrad_deferral_limit,
+    ):
+        """Forward."""
+        # TODO: Is weight in FP32?
+        # ctx.save_for_backward(input, weight)
+        ctx.use_bias = bias is not None
+        assert not ctx.use_bias, 'Bias is not supported yet.'
+        ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
+        ctx.allreduce_dgrad = allreduce_dgrad
+        ctx.sequence_parallel = sequence_parallel
+        ctx.wgrad_deferral_limit = wgrad_deferral_limit
+        ctx.grad_output_buffer = grad_output_buffer
+        # TODO: wgrad deferral is not supported yet.
+        ctx.wgrad_compute = True
+
+        if sequence_parallel:
+            world_size = get_tensor_model_parallel_world_size()
+            dim_size = list(input.size())
+            dim_size[0] = dim_size[0] * world_size
+
+            all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
+            dist_all_gather_func(all_gather_buffer, input, group=get_tensor_model_parallel_group())
+            total_input = all_gather_buffer
+        else:
+            total_input = input
+
+        if input.dim() == 3:
+            total_input = total_input.view(-1, total_input.size(-1))
+        
+        m, k = total_input.shape
+        n = weight.shape[0]
+        assert k == weight.shape[1], f'Input and weight dimensions do not match: {k} != {weight.shape[1]}'
+        
+        total_input_fp8 = per_token_quantize(total_input)
+        if sequence_parallel and wgrad_compute:
+            total_input_transpose_fp8 = None
+        else:
+            total_input_transpose_fp8 = per_block_quantize(total_input.t().contiguous())
+        weight_fp8 = per_block_quantize(weight)
+        weight_transpose_fp8 = (weight_fp8[0].t().contiguous(), weight_fp8[1].t().contiguous())
+        output = torch.empty((m, n), dtype=torch.bfloat16, device=total_input.device)
+        gemm_fp8_fp8_bf16_nt(total_input_fp8, weight_fp8, output)
+        
+        ctx.save_for_backward(total_input_transpose_fp8, weight_transpose_fp8)
+        # if bias is not None:
+        #     output = output + bias
+        return output.view(input.size(0), input.size(1), -1) if input.dim() == 3 else output
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_output):
+        """Backward."""
+        input_transpose_fp8, weight_transpose_fp8 = ctx.saved_tensors
+        use_bias = ctx.use_bias
+        grad_output_buffer = ctx.grad_output_buffer
+        wgrad_deferral_limit = ctx.wgrad_deferral_limit
+        wgrad_compute = ctx.wgrad_compute
+
+        if wgrad_compute:
+            if ctx.sequence_parallel:
+                world_size = get_tensor_model_parallel_world_size()
+                dim_size = list(input.size())
+                dim_size[0] = dim_size[0] * world_size
+
+                all_gather_buffer = get_global_memory_buffer().get_tensor(
+                    dim_size, input.dtype, "mpu"
+                )
+                handle = dist_all_gather_func(
+                    all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
+                )
+
+                # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
+                # gather is scheduled before the input gradient computation
+                total_input = all_gather_buffer
+                total_input_transpose_fp8 = None
+            else:
+                total_input_transpose_fp8 = input_transpose_fp8
+        
+        if grad_output.dim() == 3:
+            mb_size = grad_output.size(0)
+            grad_output = grad_output.view(-1, grad_output.size(-1))
+        else:
+            mb_size = 1
+        grad_output_fp8 = per_token_quantize(grad_output.contiguous())
+        grad_output_transpose_fp8 = per_token_quantize(grad_output.t().contiguous())
+        grad_input = torch.empty((grad_output.size(0), weight_transpose_fp8[0].size(0)), dtype=torch.bfloat16, device=grad_output.device)
+        
+        gemm_fp8_fp8_bf16_nt(grad_output_fp8, weight_transpose_fp8, grad_input)
+
+        if ctx.sequence_parallel and wgrad_compute:
+            handle.wait()
+            
+            assert total_input_transpose_fp8 is None
+            if total_input.dim() == 3:
+                total_input = total_input.view(-1, total_input.size(-1))
+            total_input_transpose_fp8 = per_block_quantize(total_input.t().contiguous())
+
+        if wgrad_compute:
+            # grad_output, total_input = prepare_input_tensors_for_wgrad_compute(
+            #     grad_output, total_input
+            # )
+            pass
+
+        if ctx.allreduce_dgrad:
+            # Asynchronous all-reduce
+            handle = torch.distributed.all_reduce(
+                grad_input, group=get_tensor_model_parallel_group(), async_op=True
+            )
+            # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
+            # all-reduce is scheduled before the weight gradient computation
+
+        if ctx.sequence_parallel:
+            assert not ctx.allreduce_dgrad
+            dim_size = list(input.size())
+            sub_grad_input = torch.empty(
+                dim_size, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False
+            )
+            # reduce_scatter
+            handle = dist_reduce_scatter_func(
+                sub_grad_input, grad_input, group=get_tensor_model_parallel_group(), async_op=True
+            )
+            # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
+            # reduce scatter is scheduled before the weight gradient computation
+
+        if ctx.gradient_accumulation_fusion:
+            raise NotImplementedError
+            if wgrad_compute:
+                if weight.main_grad.dtype == torch.float32:
+                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+                        total_input, grad_output, weight.main_grad
+                    )
+                elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
+                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
+                        total_input, grad_output, weight.main_grad
+                    )
+                else:
+                    raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
+
+            if hasattr(weight, 'grad_added_to_main_grad'):
+                # When overlap_grad_reduce is True, need to ensure that backward hooks
+                # are all run on the main backprop thread to prevent deadlocks. Setup
+                # dummy grad_weight tensor to prevent backward hooks from being run
+                # in a background thread.
+                if getattr(weight, 'zero_out_wgrad', False):
+                    grad_weight = torch.zeros(
+                        weight.main_grad.shape,
+                        dtype=input.dtype,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
+                    )
+                else:
+                    grad_weight = torch.empty(
+                        weight.main_grad.shape,
+                        dtype=input.dtype,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
+                    )
+                weight.grad_added_to_main_grad = True
+            else:
+                grad_weight = None
+        else:
+            grad_weight = torch.empty_like((weight_transpose_fp8[0].size(1), weight_transpose_fp8[0].size(0)), dtype=torch.bfloat16, device=weight_transpose_fp8[0].device)
+            # grad_weight = grad_output.t().matmul(total_input)
+            gemm_fp8_fp8_bf16_nt(grad_output_transpose_fp8, total_input_transpose_fp8, grad_weight)
+        
+        grad_bias = grad_output.sum(dim=0) if use_bias else None
+
+        if ctx.sequence_parallel:
+            handle.wait()
+            # Need to return None's as gradient has to flow for all the input arguments
+            # provided during forward
+            return sub_grad_input, grad_weight, grad_bias, None, None, None, None, None
+
+        if ctx.allreduce_dgrad:
+            handle.wait()
+
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None
+
 
 def linear_with_grad_accumulation_and_async_allreduce(
     input: torch.Tensor,
@@ -566,6 +759,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: Optional[int] = 0,
     async_grad_allreduce: Optional[bool] = None,
+    deepgemm_fp8: Optional[bool] = False,
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
     gradient accumulation fusion in backprop.
@@ -665,7 +859,10 @@ def linear_with_grad_accumulation_and_async_allreduce(
                 )
                 linear_with_grad_accumulation_and_async_allreduce.warned = True
 
-    return LinearWithGradAccumulationAndAsyncCommunication.apply(*args)
+    if deepgemm_fp8:
+        return DGFP8LinearWithGradAccumulationAndAsyncCommunication.apply(*args)
+    else:
+        return LinearWithGradAccumulationAndAsyncCommunication.apply(*args)
 
 
 linear_with_grad_accumulation_and_async_allreduce.warned = False
@@ -954,7 +1151,8 @@ class ColumnParallelLinear(torch.nn.Module):
                 self.config.wgrad_deferral_limit
                 if self.config.defer_embedding_wgrad_compute
                 else None
-            ),
+            ),            
+            deepgemm_fp8=self.config.deepgemm_fp8,
         )
 
         gather_output = self.gather_output
@@ -1183,6 +1381,7 @@ class RowParallelLinear(torch.nn.Module):
             allreduce_dgrad=allreduce_dgrad,
             sequence_parallel=False,
             grad_output_buffer=None,
+            deepgemm_fp8=self.config.deepgemm_fp8,
         )
 
         # All-reduce across all the partitions.

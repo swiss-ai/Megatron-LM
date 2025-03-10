@@ -910,6 +910,7 @@ def core_transformer_config_from_args(args, config_class=None):
     if len(args.cp_comm_type) == 1:
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
 
+    kw_args['deepgemm_fp8'] = args.deepgemm_fp8
     # Return config.
     return config_class(**kw_args)
 
@@ -1790,6 +1791,9 @@ def _add_mixed_precision_args(parser):
     group.add_argument('--fp16-lm-cross-entropy', action='store_true',
                        help='Move the cross entropy unreduced loss calculation'
                        'for lm head to fp16.')
+    group.add_argument('--deepgemm-fp8', action='store_true',
+                       help='Perform block-wise quantized linear layers in fp8, '
+                       'using MMA kernels in DeepGEMM.')
 
     return parser
 
