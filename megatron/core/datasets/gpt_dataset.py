@@ -9,8 +9,6 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-from megatron.core.datasets.blended_dataset import BlendedDataset
-from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 import numpy
 import torch
 
