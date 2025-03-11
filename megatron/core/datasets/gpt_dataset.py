@@ -19,7 +19,6 @@ from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from megatron.core.datasets.utils import Split
 from megatron.core.datasets.utils_s3 import S3Config, is_s3_path
 from megatron.core.utils import log_single_rank
-from megatron.core import mpu
 
 logger = logging.getLogger(__name__)
 
@@ -590,11 +589,6 @@ class GPTDataset(MegatronDataset):
                 num_epochs += 1
                 num_tokens += num_tokens_per_epoch
         return num_epochs
-
-def is_dataset_built_on_rank():
-    return (
-        mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()
-    ) and mpu.get_tensor_model_parallel_rank() == 0
 
 class GPTDatasetFolder(MegatronDataset):
     """Dataset representing a folder of bin files.
