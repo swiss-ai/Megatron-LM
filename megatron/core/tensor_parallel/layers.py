@@ -36,7 +36,7 @@ from .mappings import (
 )
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility, divide
-from deep_gemm import gemm_fp8_fp8_bf16_nt, per_token_quantize, per_block_quantize, per_token_dequantize_transpose_quantize
+from deep_gemm import gemm_fp8_fp8_bf16_nt, per_token_quantize, transpose_per_token_quantize, per_block_quantize, transpose_per_block_quantize
 
 _grad_accum_fusion_available = True
 try:
@@ -583,7 +583,8 @@ class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Functi
         ctx.wgrad_deferral_limit = wgrad_deferral_limit
         ctx.grad_output_buffer = grad_output_buffer
         # TODO: wgrad deferral is not supported yet.
-        ctx.wgrad_compute = True
+        wgrad_compute = True
+        ctx.wgrad_compute = wgrad_compute
 
         if sequence_parallel:
             world_size = get_tensor_model_parallel_world_size()
@@ -607,7 +608,8 @@ class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Functi
         if sequence_parallel and wgrad_compute:
             total_input_transpose_fp8 = None
         else:
-            total_input_transpose_fp8 = per_block_quantize(total_input.t().contiguous())
+            # TODO: fuse kernel
+            total_input_transpose_fp8 = transpose_per_block_quantize(total_input)
         weight_fp8 = per_block_quantize(weight)
         weight_transpose_fp8 = (weight_fp8[0].t().contiguous(), weight_fp8[1].t().contiguous())
         output = torch.empty((m, n), dtype=torch.bfloat16, device=total_input.device)
@@ -654,7 +656,7 @@ class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Functi
         else:
             mb_size = 1
         grad_output_fp8 = per_token_quantize(grad_output.contiguous())
-        grad_output_transpose_fp8 = per_token_quantize(grad_output.t().contiguous())
+        grad_output_transpose_fp8 = transpose_per_token_quantize(grad_output)
         grad_input = torch.empty((grad_output.size(0), weight_transpose_fp8[0].size(0)), dtype=torch.bfloat16, device=grad_output.device)
         
         gemm_fp8_fp8_bf16_nt(grad_output_fp8, weight_transpose_fp8, grad_input)
@@ -665,7 +667,7 @@ class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Functi
             assert total_input_transpose_fp8 is None
             if total_input.dim() == 3:
                 total_input = total_input.view(-1, total_input.size(-1))
-            total_input_transpose_fp8 = per_block_quantize(total_input.t().contiguous())
+            total_input_transpose_fp8 = transpose_per_block_quantize(total_input)
 
         if wgrad_compute:
             # grad_output, total_input = prepare_input_tensors_for_wgrad_compute(
