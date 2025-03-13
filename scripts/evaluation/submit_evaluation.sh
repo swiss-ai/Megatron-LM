@@ -13,6 +13,7 @@ LIMIT=null
 BS=auto
 CONVERT_TO_HF=false
 ATTN_IMPL=flash_attention_2
+DTYPE=bfloat16
 
 TASK_GROUPS="mmlu_continuation global_mmlu"
 
@@ -220,12 +221,12 @@ if [ ! -z ${WANDB_ENTITY+x} ] || [ ! -z ${WANDB_PROJECT+x} ] || [ ! -z ${WANDB_I
 
 	# Update eval_table.
 	cd $MEGATRON_PATH
-	WANDB_RESUME=allow python scripts/evaluation/update_wandb_eval_table.py --entity=$WANDB_ENTITY --project=$WANDB_PROJECT --runid=$WANDB_ID --groups $TASK_GROUPS
+	WANDB_RESUME=allow python scripts/evaluation/update_wandb_eval_table.py --entity=$WANDB_ENTITY --project=$WANDB_PROJECT --runid=$WANDB_ID --update-aggregates --create-table
 	EOM
 fi
 
 # Some useful variables.
-JOBNAME=evaluate_$NAME
+JOBNAME=ev_$NAME
 ENDPOINT_PORT=5000
 
 COMMON_EVAL_ARGS="--trust_remote_code --batch_size=$BS --tasks=$TASKS --output=$EVAL_DIR/eval_\$SLURM_JOBID $LIMIT_ARGS $WANDB_ARGS"
@@ -270,7 +271,7 @@ else
 			MAYBE_GRAB_REVISION="REVISION=\\\${REVISIONS[\\\$i]}"
 		fi
 	fi
-	CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL $COMMON_EVAL_ARGS"
+	CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL,dtype=$DTYPE $COMMON_EVAL_ARGS"
 fi
 
 # The big loop.
