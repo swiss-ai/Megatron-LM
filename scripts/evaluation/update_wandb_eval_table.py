@@ -155,7 +155,9 @@ def calculate_aggregates_for_group(metrics, group_name, group_metric_names, grou
 
 def process_metrics_for_step(step_metrics):
     new_metrics = {}
-    if ("m_hellaswag/acc" not in step_metrics or "m_arc/acc" not in step_metrics) or step_metrics["m_arc/acc"] is None:
+    if ("m_hellaswag/acc" not in step_metrics or "m_arc/acc" not in step_metrics) or step_metrics[
+        "m_arc/acc"
+    ] is None:
         # first runs did not include these metrics, compute again
         # Extract benchmark-specific metrics
         hellaswag_metrics = extract_metrics_by_prefix(step_metrics, "hellaswag_", extract_type=True)
@@ -178,7 +180,6 @@ def process_metrics_for_step(step_metrics):
             metric_key = f"{task}/{metric}"
             if metric_key in step_metrics:
                 if step_metrics[metric_key] is None:
-                    print(f"{step_metrics['_step']}, {step_metrics['ConsumedTokens']}, {task} has None value for {metric_key}")
                     return None
 
     # Calculate multilingual aggregates
@@ -201,7 +202,8 @@ def process_metrics_for_step(step_metrics):
     new_metrics["ConsumedTokens"] = step_metrics["ConsumedTokens"]
     new_metrics["OptimizerStep"] = step_metrics["OptimizerStep"]
 
-    return step_metrics.update(new_metrics)
+    step_metrics.update(new_metrics)
+    return step_metrics
 
 
 def update_aggregate_metrics(entity: str, project: str, run: wandb.run, iteration: int = None):
