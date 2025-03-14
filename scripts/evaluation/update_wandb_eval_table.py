@@ -18,7 +18,6 @@ ENGLISH_TASKS = [
     "winogrande",
     "piqa",
     "openbookqa",
-    "ai2_arc",
     "commonsense_qa",
     "mmlu",
     "mmlu_continuation",
@@ -156,9 +155,8 @@ def calculate_aggregates_for_group(metrics, group_name, group_metric_names, grou
 
 def process_metrics_for_step(step_metrics):
     new_metrics = {}
-    if "m_hellaswag" not in step_metrics and "m_arc" not in step_metrics:
+    if ("m_hellaswag/acc" not in step_metrics or "m_arc/acc" not in step_metrics) or step_metrics["m_arc/acc"] is None:
         # first runs did not include these metrics, compute again
-        print("Computing m_hellaswag and m_arc because they are not in the step metrics")
         # Extract benchmark-specific metrics
         hellaswag_metrics = extract_metrics_by_prefix(step_metrics, "hellaswag_", extract_type=True)
         arc_metrics = extract_metrics_by_prefix(
@@ -169,6 +167,19 @@ def process_metrics_for_step(step_metrics):
         new_metrics.update(calculate_aggregates(hellaswag_metrics, "m_hellaswag"))
         new_metrics.update(calculate_aggregates(arc_metrics, "m_arc"))
         step_metrics.update(new_metrics)
+
+    # some run steps do not have all tasks, so we skip them
+    for task in MULTILINGUAL_TASKS + ENGLISH_TASKS:
+        if not any(k.startswith(task) for k in step_metrics.keys()):
+            # not all tasks are in step_metrics, skip this run step
+            return None
+        for metric in MULTILINGUAL_METRICS + ENGLISH_METRICS:
+            # check if there is a None value for any task+metric combination
+            metric_key = f"{task}/{metric}"
+            if metric_key in step_metrics:
+                if step_metrics[metric_key] is None:
+                    print(f"{step_metrics['_step']}, {step_metrics['ConsumedTokens']}, {task} has None value for {metric_key}")
+                    return None
 
     # Calculate multilingual aggregates
     multilingual_agg = calculate_aggregates_for_group(
@@ -190,7 +201,7 @@ def process_metrics_for_step(step_metrics):
     new_metrics["ConsumedTokens"] = step_metrics["ConsumedTokens"]
     new_metrics["OptimizerStep"] = step_metrics["OptimizerStep"]
 
-    return new_metrics
+    return step_metrics.update(new_metrics)
 
 
 def update_aggregate_metrics(entity: str, project: str, run: wandb.run, iteration: int = None):
