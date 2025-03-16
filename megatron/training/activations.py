@@ -42,7 +42,6 @@ class XIELU(MegatronModule):
         self.eps = torch.tensor(eps, dtype=torch.bfloat16, device='cuda')
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
-        num_layers = self.config.num_layers
         layer_idx = 0
         if 'layers.' in prefix:
             layer_idx = int(prefix.split('layers.')[1].split('.')[0])
@@ -88,7 +87,6 @@ class XIPReLU(MegatronModule):
         self.beta = beta
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
-        num_layers = self.config.num_layers
         layer_idx = 0
         if 'layers.' in prefix:
             layer_idx = int(prefix.split('layers.')[1].split('.')[0])
@@ -135,7 +133,6 @@ class XIPReLUP(MegatronModule):
         self.eps = torch.tensor(eps, dtype=torch.bfloat16, device='cuda')
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
-        num_layers = self.config.num_layers
         layer_idx = 0
         if 'layers.' in prefix:
             layer_idx = int(prefix.split('layers.')[1].split('.')[0])
