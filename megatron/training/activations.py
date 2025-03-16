@@ -50,8 +50,8 @@ class XIELU(MegatronModule):
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         dp_rank = parallel_state.get_data_parallel_rank()
         return {
-            f'{prefix}alpha_p': ShardedTensor(
-                key=f'{prefix}alpha_p',
+            f'{prefix}alpha_p{layer_idx}': ShardedTensor(
+                key=f'{prefix}alpha_p{layer_idx}',
                 data=self.alpha_p,
                 global_shape=(1,),
                 global_offset=(0,),
@@ -60,8 +60,8 @@ class XIELU(MegatronModule):
                 replica_id=(tp_rank, pp_rank, dp_rank),
                 dtype=self.alpha_p.dtype,
             ),
-            f'{prefix}alpha_n': ShardedTensor(
-                key=f'{prefix}alpha_n',
+            f'{prefix}alpha_n{layer_idx}': ShardedTensor(
+                key=f'{prefix}alpha_n{layer_idx}',
                 data=self.alpha_n,
                 global_shape=(1,),
                 global_offset=(0,),
