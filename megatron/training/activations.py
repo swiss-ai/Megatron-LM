@@ -162,8 +162,8 @@ class XIPReLUP(MegatronModule):
                 axis_fragmentations=(1,),
                 replica_id=(tp_rank, pp_rank, dp_rank),
                 dtype=self.alpha_n.dtype,
-            )
-             f'{prefix}power': ShardedTensor(
+            ),
+            f'{prefix}power': ShardedTensor(
                 key=f'{prefix}power{layer_idx}',
                 data=self.power,
                 global_shape=(1,),
