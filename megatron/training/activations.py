@@ -51,6 +51,7 @@ class XIELU(MegatronModule):
         dp_rank = parallel_state.get_data_parallel_rank()
         return {
             f'{prefix}alpha_p': ShardedTensor(
+                # you need {layer_idx} here even though it is extracted from the prefix. The prefix here doesnt include layer_idx somehow.
                 key=f'{prefix}alpha_p{layer_idx}',
                 data=self.alpha_p,
                 global_shape=(1,),
@@ -96,22 +97,22 @@ class XIPReLU(MegatronModule):
         dp_rank = parallel_state.get_data_parallel_rank()
         return {
             f'{prefix}alpha_p': ShardedTensor(
-                key=f'{prefix}alpha_p',
+                key=f'{prefix}alpha_p{layer_idx}',
                 data=self.alpha_p,
-                global_shape=(num_layers,),
-                global_offset=(layer_idx,),
+                global_shape=(1,),
+                global_offset=(0,),
                 local_shape=(1,),
-                axis_fragmentations=(num_layers,),
+                axis_fragmentations=(1,),
                 replica_id=(tp_rank, pp_rank, dp_rank),
                 dtype=self.alpha_p.dtype,
             ),
             f'{prefix}alpha_n': ShardedTensor(
-                key=f'{prefix}alpha_n',
+                key=f'{prefix}alpha_n{layer_idx}',
                 data=self.alpha_n,
-                global_shape=(num_layers,),
-                global_offset=(layer_idx,),
+                global_shape=(1,),
+                global_offset=(0,),
                 local_shape=(1,),
-                axis_fragmentations=(num_layers,),
+                axis_fragmentations=(1,),
                 replica_id=(tp_rank, pp_rank, dp_rank),
                 dtype=self.alpha_n.dtype,
             )
@@ -143,32 +144,32 @@ class XIPReLUP(MegatronModule):
         dp_rank = parallel_state.get_data_parallel_rank()
         return {
             f'{prefix}alpha_p': ShardedTensor(
-                key=f'{prefix}alpha_p',
+                key=f'{prefix}alpha_p{layer_idx}',
                 data=self.alpha_p,
-                global_shape=(num_layers,),
-                global_offset=(layer_idx,),
+                global_shape=(1,),
+                global_offset=(0,),
                 local_shape=(1,),
-                axis_fragmentations=(num_layers,),
+                axis_fragmentations=(1,),
                 replica_id=(tp_rank, pp_rank, dp_rank),
                 dtype=self.alpha_p.dtype,
             ),
             f'{prefix}alpha_n': ShardedTensor(
-                key=f'{prefix}alpha_n',
+                key=f'{prefix}alpha_n{layer_idx}',
                 data=self.alpha_n,
-                global_shape=(num_layers,),
-                global_offset=(layer_idx,),
+                global_shape=(1,),
+                global_offset=(0,),
                 local_shape=(1,),
-                axis_fragmentations=(num_layers,),
+                axis_fragmentations=(1,),
                 replica_id=(tp_rank, pp_rank, dp_rank),
                 dtype=self.alpha_n.dtype,
-            ),
+            )
              f'{prefix}power': ShardedTensor(
-                key=f'{prefix}power',
+                key=f'{prefix}power{layer_idx}',
                 data=self.power,
-                global_shape=(num_layers,),
-                global_offset=(layer_idx,),
+                global_shape=(1,),
+                global_offset=(0,),
                 local_shape=(1,),
-                axis_fragmentations=(num_layers,),
+                axis_fragmentations=(1,),
                 replica_id=(tp_rank, pp_rank, dp_rank),
                 dtype=self.power.dtype,
             )
