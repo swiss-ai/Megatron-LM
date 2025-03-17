@@ -597,8 +597,7 @@ class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Functi
         else:
             total_input = input
 
-        if input.dim() == 3:
-            total_input = total_input.view(-1, total_input.size(-1))
+        assert input.dim() == 2, f'Input dimension must be 2: {input.dim()}'
         
         m, k = total_input.shape
         n = weight.shape[0]
@@ -611,14 +610,14 @@ class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Functi
             # TODO: fuse kernel
             total_input_transpose_fp8 = transpose_per_block_quantize(total_input)
         weight_fp8 = per_block_quantize(weight)
-        weight_transpose_fp8 = (weight_fp8[0].t().contiguous(), weight_fp8[1].t().contiguous())
+        weight_transpose_fp8 = transpose_per_block_quantize(weight)
         output = torch.empty((m, n), dtype=torch.bfloat16, device=total_input.device)
         gemm_fp8_fp8_bf16_nt(total_input_fp8, weight_fp8, output)
         
         ctx.save_for_backward(total_input_transpose_fp8, weight_transpose_fp8)
         # if bias is not None:
         #     output = output + bias
-        return output.view(input.size(0), input.size(1), -1) if input.dim() == 3 else output
+        return output
 
     @staticmethod
     @custom_bwd
@@ -650,12 +649,9 @@ class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Functi
             else:
                 total_input_transpose_fp8 = input_transpose_fp8
         
-        if grad_output.dim() == 3:
-            mb_size = grad_output.size(0)
-            grad_output = grad_output.view(-1, grad_output.size(-1))
-        else:
-            mb_size = 1
-        grad_output_fp8 = per_token_quantize(grad_output.contiguous())
+        assert grad_output.dim() == 2, f'Grad output dimension must be 2: {grad_output.dim()}'
+        assert grad_output.is_contiguous(), 'Grad output must be contiguous'
+        grad_output_fp8 = per_token_quantize(grad_output)
         grad_output_transpose_fp8 = transpose_per_token_quantize(grad_output)
         grad_input = torch.empty((grad_output.size(0), weight_transpose_fp8[0].size(0)), dtype=torch.bfloat16, device=grad_output.device)
         
@@ -665,8 +661,6 @@ class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Functi
             handle.wait()
             
             assert total_input_transpose_fp8 is None
-            if total_input.dim() == 3:
-                total_input = total_input.view(-1, total_input.size(-1))
             total_input_transpose_fp8 = transpose_per_block_quantize(total_input)
 
         if wgrad_compute:
@@ -733,7 +727,7 @@ class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Functi
             else:
                 grad_weight = None
         else:
-            grad_weight = torch.empty_like((weight_transpose_fp8[0].size(1), weight_transpose_fp8[0].size(0)), dtype=torch.bfloat16, device=weight_transpose_fp8[0].device)
+            grad_weight = torch.empty((weight_transpose_fp8[0].size(1), weight_transpose_fp8[0].size(0)), dtype=torch.bfloat16, device=weight_transpose_fp8[0].device)
             # grad_weight = grad_output.t().matmul(total_input)
             gemm_fp8_fp8_bf16_nt(grad_output_transpose_fp8, total_input_transpose_fp8, grad_weight)
         
