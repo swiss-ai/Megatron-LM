@@ -153,12 +153,32 @@ def calculate_aggregates_for_group(metrics, group_name, group_metric_names, grou
     return group_agg
 
 
+def check_if_metrics_available(step_metrics, list_of_tasks):
+    for task in list_of_tasks:
+        if not any(k.startswith(task) for k in step_metrics.keys()):
+            # not all tasks are in step_metrics, skip this run step
+            return False
+        for metric in MULTILINGUAL_METRICS + ENGLISH_METRICS:
+            # check if there is a None value for any task+metric combination
+            metric_key = f"{task}/{metric}"
+            if metric_key in step_metrics:
+                if step_metrics[metric_key] is None:
+                    return False
+    return True
+
+
+
 def process_metrics_for_step(step_metrics):
     new_metrics = {}
+
+    # first runs did not include these metrics, compute again
     if ("m_hellaswag/acc" not in step_metrics or "m_arc/acc" not in step_metrics) or step_metrics[
         "m_arc/acc"
     ] is None:
-        # first runs did not include these metrics, compute again
+        # the 'de' tasks are just exemplary, but we need to check if hellaswa_{lang} and arc_{lang} are available
+        if not check_if_metrics_available(step_metrics, ["hellaswag_de", "arc_de"]):
+            return None
+        
         # Extract benchmark-specific metrics
         hellaswag_metrics = extract_metrics_by_prefix(step_metrics, "hellaswag_", extract_type=True)
         arc_metrics = extract_metrics_by_prefix(
@@ -170,18 +190,8 @@ def process_metrics_for_step(step_metrics):
         new_metrics.update(calculate_aggregates(arc_metrics, "m_arc"))
         step_metrics.update(new_metrics)
 
-    # some run steps do not have all tasks, so we skip them
-    for task in MULTILINGUAL_TASKS + ENGLISH_TASKS:
-        if not any(k.startswith(task) for k in step_metrics.keys()):
-            # not all tasks are in step_metrics, skip this run step
-            return None
-        for metric in MULTILINGUAL_METRICS + ENGLISH_METRICS:
-            # check if there is a None value for any task+metric combination
-            metric_key = f"{task}/{metric}"
-            if metric_key in step_metrics:
-                if step_metrics[metric_key] is None:
-                    return None
-
+    if not check_if_metrics_available(step_metrics, MULTILINGUAL_TASKS + ENGLISH_TASKS):
+        return None
     # Calculate multilingual aggregates
     multilingual_agg = calculate_aggregates_for_group(
         step_metrics, "multilingual_macro", MULTILINGUAL_METRICS, MULTILINGUAL_TASKS
@@ -206,7 +216,7 @@ def process_metrics_for_step(step_metrics):
     return step_metrics
 
 
-def update_aggregate_metrics(entity: str, project: str, run: wandb.run, iteration: int = None):
+def update_aggregate_metrics(entity: str, project: str, run: wandb.run, iterations: list[int] = []):
     print(f"Processing run: {run.name} to update aggregates")
 
     history = run.scan_history()
@@ -222,7 +232,7 @@ def update_aggregate_metrics(entity: str, project: str, run: wandb.run, iteratio
         for step in tqdm(history_list):
             if "ConsumedTokens" not in step or "OptimizerStep" not in step:
                 continue
-            if iteration is not None and step["OptimizerStep"] != iteration:
+            if iterations and step["OptimizerStep"] not in iterations:
                 continue
             updated_metrics = process_metrics_for_step(step)
             if updated_metrics:
@@ -293,7 +303,7 @@ def main(
     runid: str = None,
     update_aggregates: bool = True,
     create_table: bool = False,
-    iteration: int = None,
+    iterations: list[int] = [],
 ):
     if runid is None:
         runs = get_all_runs(entity, project)
@@ -302,7 +312,7 @@ def main(
         runs = [api.run(f"{entity}/{project}/{runid}")]
     for run in runs:
         if update_aggregates:
-            update_aggregate_metrics(entity, project, run, iteration)
+            update_aggregate_metrics(entity, project, run, iterations)
         if create_table:
             log_eval_table(entity, project, run)
 
@@ -312,7 +322,7 @@ if __name__ == "__main__":
     parser.add_argument("--entity", required=True)
     parser.add_argument("--project", required=True)
     parser.add_argument("--runid", required=True)
-    parser.add_argument("--iteration", type=int, default=None)
+    parser.add_argument("--iterations", type=int, nargs="+", default=[])
     parser.add_argument("--update-aggregates", action="store_true")
     parser.add_argument("--create-table", action="store_true")
     args = parser.parse_args()
