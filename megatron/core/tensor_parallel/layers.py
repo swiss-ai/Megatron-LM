@@ -688,10 +688,6 @@ class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Functi
 
         if ctx.sequence_parallel and wgrad_compute:
             handle.wait()
-            
-            assert total_input_transpose_fp8 is None
-            total_input = total_input.view(-1, k)
-            total_input_transpose_fp8 = transpose_per_block_quantize(total_input)
 
         if wgrad_compute:
             # grad_output, total_input = prepare_input_tensors_for_wgrad_compute(
@@ -719,6 +715,11 @@ class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Functi
             )
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # reduce scatter is scheduled before the weight gradient computation
+            
+            if wgrad_compute:
+                assert total_input_transpose_fp8 is None
+                total_input = total_input.view(-1, k)
+                total_input_transpose_fp8 = transpose_per_block_quantize(total_input)
 
         if ctx.gradient_accumulation_fusion:
             raise NotImplementedError
@@ -961,6 +962,7 @@ class ColumnParallelLinear(torch.nn.Module):
         is_expert: bool = False,
         tp_comm_buffer_name: str = None,  # Not used
         disable_grad_reduce: bool = False,
+        disable_fp8: bool = False, # disable for this layer (e.g. vocab)
     ):
         super(ColumnParallelLinear, self).__init__()
 
@@ -976,6 +978,7 @@ class ColumnParallelLinear(torch.nn.Module):
         self.grad_output_buffer = grad_output_buffer
         self.config = config
         self.disable_grad_reduce = disable_grad_reduce
+        self.use_fp8 = not disable_fp8 and config.deepgemm_fp8
 
         if is_expert:
             world_size = get_expert_tensor_parallel_world_size()
@@ -1178,7 +1181,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 if self.config.defer_embedding_wgrad_compute
                 else None
             ),            
-            deepgemm_fp8=self.config.deepgemm_fp8,
+            deepgemm_fp8=self.use_fp8,
         )
 
         gather_output = self.gather_output
@@ -1268,6 +1271,7 @@ class RowParallelLinear(torch.nn.Module):
         keep_master_weight_for_test: bool = False,
         is_expert: bool = False,
         tp_comm_buffer_name: str = None,  # Not used
+        disable_fp8: bool = False, # disable for this layer (e.g. vocab)
     ):
         super(RowParallelLinear, self).__init__()
 
@@ -1283,6 +1287,7 @@ class RowParallelLinear(torch.nn.Module):
         self.sequence_parallel = config.sequence_parallel
         if self.sequence_parallel and not self.input_is_parallel:
             raise RuntimeError("To enable `sequence_parallel`, `input_is_parallel` must be `True`")
+        self.use_fp8 = not disable_fp8 and config.deepgemm_fp8
 
         # Divide the weight matrix along the last dimension.
         if self.is_expert:
@@ -1407,7 +1412,7 @@ class RowParallelLinear(torch.nn.Module):
             allreduce_dgrad=allreduce_dgrad,
             sequence_parallel=False,
             grad_output_buffer=None,
-            deepgemm_fp8=self.config.deepgemm_fp8,
+            deepgemm_fp8=self.use_fp8,
         )
 
         # All-reduce across all the partitions.

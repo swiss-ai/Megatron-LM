@@ -6,7 +6,7 @@
 #SBATCH --job-name=fp8-8b
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.err
-#SBATCH --nodes=1
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=72
@@ -26,15 +26,15 @@ DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/sai/swissai-fi
 # This config trains for ~100B tokens with 1024 * 4096 = 4_194_304 tokens per batch.
 # Results in 1024 / 4 = 256 forward passes with 2 replicas per node requires 128 nodes such 
 # that each replica does batch accumulation of 1 and 64 nodes for batch accumulation of 8.
-MBS=1 # Note(ischlag) mbsz > 1 and cp > 1 is broken
-GBS=4
+MBS=4 # Note(ischlag) mbsz > 1 and cp > 1 is broken
+GBS=32
 SEQ_LEN=4096 
 TRAINING_STEPS=400
 CHECKPOINT_STEPS=1000
 
 #### Debugging ####
 LOG_NCCL=false # Log NCCL_DEBUG=info. Every process will dump the logging into separate files, check `NCCL_DEBUG_FILE`
-NSYS_PROFILER=false # Turn on the NSYS profiler # NOTE(tj.solergibert) When using the profiler, stdout gets blocked
+NSYS_PROFILER=true # Turn on the NSYS profiler # NOTE(tj.solergibert) When using the profiler, stdout gets blocked
 MOCK_DATA=true # Set to `true` to use mock data
 ###################
 
@@ -45,7 +45,7 @@ BACKUP_CODEBASE=false # Set to `true` to copy the codebase to the experiment fol
 
 # Logging directories & artifacts
 PROJECT_NAME=apertus_8b_fp8
-EXP_NAME=apertus-8b-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz
+EXP_NAME=apertus-8b-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz-dg
 PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
 
 #########################################
@@ -61,8 +61,8 @@ TENSORBOARD_DIR=$LOGGING_DIR/tensorboard
 BACKUP_CODEBASE_DIR=$EXP_DIR/Megatron-LM
 
 # Set up ENV
-export TORCH_NCCL_AVOID_RECORD_STREAMS=1
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+# export TORCH_NCCL_AVOID_RECORD_STREAMS=1
+# export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export OMP_NUM_THREADS=$((SLURM_CPUS_PER_TASK/SLURM_GPUS_PER_NODE))
 
@@ -81,12 +81,13 @@ TRANSFORMER_ENGINE_ARGS=(
 	# --transformer-impl transformer_engine
 	--transformer-impl local
 	--sequence-parallel
-    # --deepgemm-fp8
+    --deepgemm-fp8
 	--use-flash-attn
     --no-gradient-accumulation-fusion
     --distributed-timeout-minutes 1
 	--use-precision-aware-optimizer
 	--main-grads-dtype bf16
+	--exit-interval 32
 )
 
 NETWORK_SIZE_ARGS=(
@@ -258,7 +259,7 @@ fi
 
 # NSYS profiler
 if [ "$NSYS_PROFILER" = true ]; then
-    NSYS_LAUNCHER="nsys profile -s none --trace='nvtx,cudnn,cublas,cuda' --output=$DEBUG_DIR/nsys-trace-hostname-\$SLURMD_NODENAME-procid-\$SLURM_PROCID.nsys-rep --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop"
+    NSYS_LAUNCHER="nsys profile --wait primary -s none --trace='nvtx,cudnn,cublas,cuda' --output=$DEBUG_DIR/nsys-trace-hostname-\$SLURMD_NODENAME-procid-\$SLURM_PROCID.nsys-rep --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop"
     TRAINING_CMD="$NSYS_LAUNCHER $TRAINING_CMD --profile"
 fi
 

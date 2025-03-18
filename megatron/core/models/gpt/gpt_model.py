@@ -166,6 +166,7 @@ class GPTModel(LanguageModule):
                 and self.share_embeddings_and_output_weights,
                 embedding_activation_buffer=self.embedding_activation_buffer,
                 grad_output_buffer=self.grad_output_buffer,
+                disable_fp8=True, # no fp8 in output layer
             )
 
         if self.pre_process or self.post_process:
