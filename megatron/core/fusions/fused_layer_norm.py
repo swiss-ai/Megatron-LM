@@ -64,8 +64,20 @@ class FusedLayerNorm(torch.nn.Module):
 
         self.zero_centered_gamma = self.config.layernorm_zero_centered_gamma
         assert (
-            self.config.normalization == "LayerNorm"
+            self.config.normalization in ['LayerNorm', 'RMSNorm']
         ), f'({self.config.normalization}) is not supported in FusedLayerNorm'
+
+        if self.config.normalization == 'RMSNorm':            
+            if isinstance(hidden_size, numbers.Integral):
+                hidden_size = (hidden_size,)
+            self.eps = eps
+            self.weight = torch.nn.Parameter(torch.empty(*hidden_size))
+            self.reset_parameters()
+            self.sequence_parallel = config.sequence_parallel
+
+            setattr(self.weight, "sequence_parallel", self.sequence_parallel)
+            self.compiled_rms_norm = torch.compile(self._rms_norm_computation)
+            return
 
         # List of hiddens sizes supported in the persistent layer norm kernel
         # If the hidden size is not supported, fall back to the non-persistent
@@ -120,6 +132,9 @@ class FusedLayerNorm(torch.nn.Module):
         setattr(self.bias, 'sequence_parallel', self.sequence_parallel)
 
     def reset_parameters(self):
+        if self.config.normalization == 'RMSNorm':        
+            torch.nn.init.ones_(self.weight)
+            return
 
         if self.zero_centered_gamma:
             init.zeros_(self.weight)
@@ -128,7 +143,13 @@ class FusedLayerNorm(torch.nn.Module):
             init.ones_(self.weight)
             init.zeros_(self.bias)
 
+    def _rms_norm_computation(self, input: torch.Tensor) -> torch.Tensor:
+        output = input * torch.rsqrt(input.pow(2).mean(-1, keepdim=True) + self.eps)
+        return output * self.weight
+
     def forward(self, input: Tensor) -> Tensor:
+        if self.config.normalization == 'RMSNorm':            
+            return self.compiled_rms_norm(input)
 
         weight = self.weight + 1 if self.zero_centered_gamma else self.weight
 

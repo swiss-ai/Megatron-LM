@@ -597,33 +597,51 @@ class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Functi
         else:
             total_input = input
 
-        assert input.dim() == 2, f'Input dimension must be 2: {input.dim()}'
+        # print(f'{input.shape=}, {total_input.shape=}')
+        assert total_input.dim() in [2,3], f'Input dimension must be 2 or 3: {input.dim()}, {input.shape=}'
+        assert total_input.is_contiguous(), 'Input must be contiguous'
+        assert weight.is_contiguous(), 'Weight must be contiguous'
+        if total_input.dim() == 3:
+            b, m, k = total_input.shape
+            m_fused = b * m
+            total_input = total_input.view(-1, k)
+        else:
+            m, n = total_input.shape
+            m_fused = m
+            b = None
         
-        m, k = total_input.shape
         n = weight.shape[0]
         assert k == weight.shape[1], f'Input and weight dimensions do not match: {k} != {weight.shape[1]}'
         
         total_input_fp8 = per_token_quantize(total_input)
         if sequence_parallel and wgrad_compute:
-            total_input_transpose_fp8 = None
+            total_input_transpose_fp8 = (None, None)
+            input_bf16_for_sp = input
         else:
-            # TODO: fuse kernel
             total_input_transpose_fp8 = transpose_per_block_quantize(total_input)
+            input_bf16_for_sp = None
         weight_fp8 = per_block_quantize(weight)
         weight_transpose_fp8 = transpose_per_block_quantize(weight)
-        output = torch.empty((m, n), dtype=torch.bfloat16, device=total_input.device)
+        output = torch.empty((m_fused, n), dtype=torch.bfloat16, device=total_input.device)
+        
+        # print(f'forward fp8: {total_input_fp8[0].shape=}, {total_input_fp8[1].shape=}, {weight_fp8[0].shape=}, {weight_fp8[1].shape=}, {output.shape=}')
+        # print(f'forward fp8: {total_input_fp8[0].stride()=}, {total_input_fp8[1].stride()=}, {weight_fp8[0].stride()=}, {weight_fp8[1].stride()=}, {output.stride()=}')
+        
         gemm_fp8_fp8_bf16_nt(total_input_fp8, weight_fp8, output)
         
-        ctx.save_for_backward(total_input_transpose_fp8, weight_transpose_fp8)
+        ctx.save_for_backward(*total_input_transpose_fp8, *weight_transpose_fp8, input_bf16_for_sp)
         # if bias is not None:
         #     output = output + bias
+        if b is not None:
+            output = output.view(b, m, n)
+        
         return output
 
     @staticmethod
     @custom_bwd
     def backward(ctx, grad_output):
         """Backward."""
-        input_transpose_fp8, weight_transpose_fp8 = ctx.saved_tensors
+        input_transpose_fp8_mat, input_transpose_fp8_sf, weight_transpose_fp8_mat, weight_transpose_fp8_sf, input_bf16_for_sp = ctx.saved_tensors
         use_bias = ctx.use_bias
         grad_output_buffer = ctx.grad_output_buffer
         wgrad_deferral_limit = ctx.wgrad_deferral_limit
@@ -632,14 +650,14 @@ class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Functi
         if wgrad_compute:
             if ctx.sequence_parallel:
                 world_size = get_tensor_model_parallel_world_size()
-                dim_size = list(input.size())
+                dim_size = list(input_bf16_for_sp.size())
                 dim_size[0] = dim_size[0] * world_size
 
                 all_gather_buffer = get_global_memory_buffer().get_tensor(
-                    dim_size, input.dtype, "mpu"
+                    dim_size, input_bf16_for_sp.dtype, "mpu"
                 )
                 handle = dist_all_gather_func(
-                    all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
+                    all_gather_buffer, input_bf16_for_sp, group=get_tensor_model_parallel_group(), async_op=True
                 )
 
                 # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
@@ -647,20 +665,32 @@ class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Functi
                 total_input = all_gather_buffer
                 total_input_transpose_fp8 = None
             else:
-                total_input_transpose_fp8 = input_transpose_fp8
+                total_input_transpose_fp8 = (input_transpose_fp8_mat, input_transpose_fp8_sf)
         
-        assert grad_output.dim() == 2, f'Grad output dimension must be 2: {grad_output.dim()}'
+        assert grad_output.dim() in [2, 3], f'Grad output dimension must be 2 or 3: {grad_output.shape=}'
         assert grad_output.is_contiguous(), 'Grad output must be contiguous'
+        if grad_output.dim() == 3:
+            b, m, n = grad_output.shape
+            m_fused = b * m
+            grad_output = grad_output.view(-1, n)
+        else:
+            m, n = grad_output.shape
+            m_fused = m
+            b = None
+        k = weight_transpose_fp8_mat.size(0)
+        weight_transpose_fp8 = (weight_transpose_fp8_mat, weight_transpose_fp8_sf)
         grad_output_fp8 = per_token_quantize(grad_output)
         grad_output_transpose_fp8 = transpose_per_token_quantize(grad_output)
-        grad_input = torch.empty((grad_output.size(0), weight_transpose_fp8[0].size(0)), dtype=torch.bfloat16, device=grad_output.device)
+        grad_input = torch.empty((m_fused, k), dtype=torch.bfloat16, device=grad_output.device)
         
         gemm_fp8_fp8_bf16_nt(grad_output_fp8, weight_transpose_fp8, grad_input)
+        grad_input = grad_input.view(b, m, k) if b is not None else grad_input
 
         if ctx.sequence_parallel and wgrad_compute:
             handle.wait()
             
             assert total_input_transpose_fp8 is None
+            total_input = total_input.view(-1, k)
             total_input_transpose_fp8 = transpose_per_block_quantize(total_input)
 
         if wgrad_compute:
@@ -679,9 +709,9 @@ class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Functi
 
         if ctx.sequence_parallel:
             assert not ctx.allreduce_dgrad
-            dim_size = list(input.size())
+            dim_size = list(input_bf16_for_sp.size())
             sub_grad_input = torch.empty(
-                dim_size, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False
+                dim_size, dtype=input_bf16_for_sp.dtype, device=torch.cuda.current_device(), requires_grad=False
             )
             # reduce_scatter
             handle = dist_reduce_scatter_func(
@@ -727,7 +757,7 @@ class DGFP8LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Functi
             else:
                 grad_weight = None
         else:
-            grad_weight = torch.empty((weight_transpose_fp8[0].size(1), weight_transpose_fp8[0].size(0)), dtype=torch.bfloat16, device=weight_transpose_fp8[0].device)
+            grad_weight = torch.empty((n, k), dtype=torch.bfloat16, device=weight_transpose_fp8[0].device)
             # grad_weight = grad_output.t().matmul(total_input)
             gemm_fp8_fp8_bf16_nt(grad_output_transpose_fp8, total_input_transpose_fp8, grad_weight)
         
