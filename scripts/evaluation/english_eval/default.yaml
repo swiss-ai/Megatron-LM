@@ -1,0 +1,25 @@
+group: english_eval
+task:
+  - winogrande
+  - piqa
+  - social_iqa
+  - openbookqa
+  - ai2_arc
+  - commonsense_qa
+  - mmlu_continuation
+  - gsm8k
+  - wikitext
+  - lambada
+  - hellaswag
+  - squadv2
+aggregate_metric_list:
+  - metric: acc
+    aggregation: mean
+    weight_by_size: false  # Set to false if you want unweighted average
+  - metric: acc_norm
+    aggregation: mean
+    weight_by_size: false
+  - metric: perplexity
+    aggregation: mean
+metadata:
+  version: 1.0

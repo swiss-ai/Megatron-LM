@@ -3,7 +3,8 @@ GPUS_PER_NODE=4
 
 DEF_MEGATRON_PATH=$(dirname $(dirname $( cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )))  # Grandparent of current file location.
 DEF_LOGS_ROOT=$PWD/eval-logs
-DEF_CONTAINER_PATH=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml
+# DEF_CONTAINER_PATH=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml
+DEF_CONTAINER_PATH=/iopsstor/scratch/cscs/dfan/ngc_pt_jan.toml
 DEF_ACCOUNT=a-a06
 DEF_TOKENIZER=alehc/swissai-tokenizer
 
@@ -267,7 +268,7 @@ else
 		fi
 	fi
 
-	CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION $COMMON_EVAL_ARGS"
+	CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION --num_fewshot 5 $COMMON_EVAL_ARGS"
 fi
 
 # The big loop.
