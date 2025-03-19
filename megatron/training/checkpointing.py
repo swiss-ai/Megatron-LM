@@ -1048,6 +1048,18 @@ def load_args_from_checkpoint(
     # Checkpoint args.
     _set_arg('ckpt_format')
 
+    # OP architecture.
+    _set_arg('qk_layernorm', force=True)
+    _set_arg('use_torchqknorm', force=True)
+    _set_arg('no_persist_layer_norm', force=True)
+    _set_arg('attn_layernorm', force=True)
+    _set_arg('mlp_layernorm', force=True)
+    _set_arg('final_layernorm', force=True)
+    _set_arg('post_layernorm', force=True)
+    _set_arg('layernorm_init', force=True)
+    _set_arg('input_embeddings_multiplier', force=True)
+
+
     # Model parallelism args.
     if args.use_mp_args_from_checkpoint_args:
         if checkpoint_version < 3.0:
