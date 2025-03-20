@@ -3,7 +3,7 @@ GPUS_PER_NODE=4
 
 DEF_MEGATRON_PATH=$(dirname $(dirname $( cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )))  # Grandparent of current file location.
 DEF_LOGS_ROOT=$PWD/eval-logs
-DEF_CONTAINER_PATH=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml
+DEF_CONTAINER_PATH=/iopsstor/scratch/cscs/ahgele/ngc_pt_jan.toml
 DEF_ACCOUNT=a-a06
 DEF_TOKENIZER=alehc/swissai-tokenizer
 
@@ -216,7 +216,7 @@ if [ ! -z ${WANDB_ENTITY+x} ] || [ ! -z ${WANDB_PROJECT+x} ] || [ ! -z ${WANDB_I
 	read -r -d '' WANDB_COMMAND <<- EOM
 	# Wandb sync just in case wandb died in lm-harness.
 	for path in $WANDB_DIR/wandb/run-*-$WANDB_ID; do
-		WANDB_RESUME=allow wandb sync -e $WANDB_ENTITY -p $WANDB_PROJECT --id $WANDB_ID \\\$path
+		WANDB_RESUME=allow python -m wandb sync -e $WANDB_ENTITY -p $WANDB_PROJECT --id $WANDB_ID \\\$path
 	done
 
 	# Update eval_table.
@@ -310,7 +310,7 @@ cat > $SBATCH_PATH <<- EOM
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=$LOGS_DIR/${JOBNAME}_%j.out
 #SBATCH --error=$LOGS_DIR/${JOBNAME}_%j.err
-#SBATCH --time=23:59:00
+#SBATCH --time=11:59:00
 #SBATCH --exclusive
 #SBATCH --dependency=singleton
 
