@@ -100,9 +100,7 @@ class EvalMetadata:
             "timestamp": time.time(),
         }
 
-    def update_iteration_metadata(
-        self, model_name, iteration, new_state, **kwargs
-    ):
+    def update_iteration_metadata(self, model_name, iteration, new_state, **kwargs):
         iteration = str(iteration)  # JSON keys are strings
         new_state_name = new_state.name if type(new_state) is State else new_state
         if iteration not in self.metadata[model_name]["iterations"]:
@@ -114,22 +112,7 @@ class EvalMetadata:
             json.dump(self.metadata, f, indent=4)
 
 
-def find_iters_with_dirs(checkpoints_dir, evaluate_every):
-    iters_with_dirs = []
-    for d in os.listdir(checkpoints_dir):
-        if d.startswith("iter_"):
-            match = re.search(r"^iter_(\d+)$", d)
-            if not match:
-                print(f"Warning: Unknown checkpoint dir naming: {d}")
-                continue
-            iteration = int(match.group(1))
-            if iteration % evaluate_every != 0:
-                continue
-            iters_with_dirs.append((iteration, os.path.join(checkpoints_dir, d)))
-    return iters_with_dirs
-
-
-def main(args):
+def submit_new_evaluations(args):
     assert os.environ["WANDB_API_KEY"] or args.wandb_api_key, "No W&B API key provided"
     cur_dir = os.path.dirname(os.path.realpath(__file__))
     eval_metadata = EvalMetadata()
@@ -137,35 +120,7 @@ def main(args):
     for model_name, model_dir, model_tokens in zip(
         args.model_names, args.model_dirs, args.model_tokens_per_iter
     ):
-        # check all model checkpoints
         print(f"Checking {model_name} checkpoints")
-        checkpoints_dir = os.path.join(
-            args.checkpoints_root, model_dir, args.checkpoints_dir
-        )
-
-        # find all checkpoint dirs that need evaluation
-        iters_with_dirs = find_iters_with_dirs(checkpoints_dir, args.evaluate_every)
-
-        # submit evaluations that have not been evaluated yet
-        iterations_to_evaluate = []
-        for iteration, iteration_dir in iters_with_dirs:
-            if (
-                eval_metadata.get_iteration_metadata(model_name, iteration)["state"]
-                == State.NOT_EVALUATED.name
-            ):
-                iterations_to_evaluate.append((iteration, iteration_dir))
-                eval_metadata.update_iteration_metadata(
-                    model_name,
-                    iteration,
-                    State.NOT_EVALUATED,
-                    checkpoint_dir=iteration_dir,
-                )
-
-        # TODO check if evaluations that have been submitted are now running
-
-        # TODO check if evaluations that have been running are now finished
-
-        # TODO check if finished evaluations have been synced with W&B
 
         # prepare submit script arguments
         match = re.search(r"^apertus3-(\d)b-.*", model_dir)
@@ -173,9 +128,31 @@ def main(args):
         size = int(match.group(1))
         assert size in [1, 3, 8], "Unknown model size"
 
-        for iteration, iteration_dir in iterations_to_evaluate:
-            print(f"Submitting evaluation for iteration {iteration}")
-            arguments = f"""
+        # find checkpoints from iterations at the given intervals
+        checkpoints_dir = os.path.join(
+            args.checkpoints_root, model_dir, args.checkpoints_dir
+        )
+        iters_to_evaluate = []
+        for d in os.listdir(checkpoints_dir):
+            if d.startswith("iter_"):
+                match = re.search(r"^iter_(\d+)$", d)
+                if not match:
+                    print(f"Warning: Unknown checkpoint dir naming: {d}")
+                    continue
+                iteration = int(match.group(1))
+                if iteration % args.evaluate_every != 0:
+                    continue
+                iters_to_evaluate.append((iteration, os.path.join(checkpoints_dir, d)))
+
+        # submit evaluations for checkpoints that have not been evaluated yet
+        for iteration, iteration_dir in iters_to_evaluate:
+            if (
+                eval_metadata.get_iteration_metadata(model_name, iteration)["state"]
+                == State.NOT_EVALUATED.name
+            ):
+                print(f"Submitting evaluation for iteration {iteration}")
+                jobname = f"{model_name}_iter_{iteration}"
+                arguments = f"""
 --container-path {args.container_path}
 --logs-root {args.logs_root}
 --convert-to-hf
@@ -184,21 +161,40 @@ def main(args):
 --wandb-entity {args.wandb_entity}
 --wandb-project {args.wandb_project}
 --wandb-id {model_name}
---name {model_name}_iter_{iteration}
+--name {jobname}
 --bs {args.bs}
 --tokens-per-iter {model_tokens}
 --tasks {args.tasks}
 """.strip().replace("\n", " ")
-            command = f"bash {cur_dir}/submit_evaluation.sh {checkpoints_dir} {arguments} --iterations {iteration}"
-            print(f"Running command: {command}")
-            res = os.system(command)
-            if res:
-                raise RuntimeError(
-                    f"Submitting evaluation for iteration {iteration} returned with return code: {res}"
+                command = f"bash {cur_dir}/submit_evaluation.sh {checkpoints_dir} {arguments} --iterations {iteration}"
+                print(f"Running command: {command}")
+                res = os.system(command)
+                if res:
+                    raise RuntimeError(
+                        f"Submitting evaluation for iteration {iteration} returned with return code: {res}"
+                    )
+                eval_metadata.update_iteration_metadata(
+                    model_name,
+                    iteration,
+                    State.SUBMITTED,
+                    {
+                        "checkpoint_dir": iteration_dir,
+                        "eval_log": os.path.join(
+                            args.logs_root, "slurm", f"{jobname}.out"
+                        ),
+                    },
                 )
-            eval_metadata.update_iteration_metadata(
-                model_name, iteration, State.SUBMITTED, checkpoint_dir=iteration_dir
-            )
+
+
+def main(args):
+    # submit evaluations for checkpoints not evaluated yet
+    submit_new_evaluations(args)
+
+    # TODO check if evaluations that have been submitted are now running
+
+    # TODO check if evaluations that have been running are now finished
+
+    # TODO check if finished evaluations have been synced with W&B
 
 
 if __name__ == "__main__":
