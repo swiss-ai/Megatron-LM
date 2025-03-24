@@ -21,7 +21,11 @@ class ErrorAnalyzer:
                 'suggestion': 'Consider reducing batch size, model size, or checking for memory leaks'
             },
             'NODE_FAILURE': {
-                'pattern': r'Connection refused.*?|Socket timed out.*?|Node failure detected.*?(?=\n\n|\Z)',
+                'patterns': [
+                    r'Connection refused.*?|Socket timed out.*?|Node failure detected.*?(?=\n\n|\Z)',
+                    r'Node failure on \w+',
+                    r'CANCELLED AT .*? DUE TO NODE FAILURE'
+                ],
                 'description': 'Node Communication/Failure Error',
                 'suggestion': 'Check cluster health and network connectivity'
             },
