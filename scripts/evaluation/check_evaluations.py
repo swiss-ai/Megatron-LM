@@ -101,18 +101,15 @@ class EvalMetadata:
         }
 
     def update_iteration_metadata(
-        self, model_name, iteration, new_state, checkpoint_dir=None
+        self, model_name, iteration, new_state, **kwargs
     ):
         iteration = str(iteration)  # JSON keys are strings
         new_state_name = new_state.name if type(new_state) is State else new_state
         if iteration not in self.metadata[model_name]["iterations"]:
             self.metadata[model_name]["iterations"][iteration] = {}
+        self.metadata[model_name]["iterations"][iteration].update(kwargs)
         self.metadata[model_name]["iterations"][iteration]["state"] = new_state_name
         self.metadata[model_name]["iterations"][iteration]["timestamp"] = time.time()
-        if checkpoint_dir:
-            self.metadata[model_name]["iterations"][iteration]["checkpoint_dir"] = (
-                checkpoint_dir
-            )
         with open(self.path, "w") as f:
             json.dump(self.metadata, f, indent=4)
 
