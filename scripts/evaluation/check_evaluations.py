@@ -24,9 +24,20 @@ def parse_args():
     import argparse
 
     parser = argparse.ArgumentParser(description="Checks for evaluations to run.")
+
+    # personal paths
     parser.add_argument(
-        "--logs_root", default="/iopsstor/scratch/cscs/amarfurt/eval-logs/main-v1"
+        "--logs_root", default="/iopsstor/scratch/cscs/amarfurt/eval-logs"
     )
+    parser.add_argument(
+        "--hf_dir", default="/iopsstor/scratch/cscs/amarfurt/hf_checkpoints"
+    )
+    parser.add_argument(
+        "--container_path",
+        default="/iopsstor/scratch/cscs/amarfurt/envs/ngc_pt_jan.toml",
+    )
+
+    # model checkpoints
     parser.add_argument(
         "--checkpoints_root",
         default="/iopsstor/scratch/cscs/schlag/main_run_megatron/Megatron-LM/logs/Meg-Runs/main-runs-v1",
@@ -52,9 +63,13 @@ def parse_args():
         default=[2_064_384, 2_097_152, 4_194_304],
     )
     parser.add_argument("--checkpoints_dir", default="checkpoints")
+
+    # W&B experiment tracking
     parser.add_argument("--wandb_entity", default="epflmlo-epfl")
     parser.add_argument("--wandb-project", default="swissai-eval-main-v1.1")
     parser.add_argument("--wandb_api_key")
+
+    # evaluation settings
     parser.add_argument("--bs", default="auto")
     parser.add_argument("--tasks", default="swissai_eval")
     parser.add_argument(
@@ -164,7 +179,10 @@ def main(args):
         for iteration, iteration_dir in iterations_to_evaluate:
             print(f"Submitting evaluation for iteration {iteration}")
             arguments = f"""
+--container-path {args.container_path}
+--logs-root {args.logs_root}
 --convert-to-hf
+--hf-dir {args.hf_dir}
 --size {size}
 --wandb-entity {args.wandb_entity}
 --wandb-project {args.wandb_project}
