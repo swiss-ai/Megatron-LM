@@ -3,7 +3,9 @@
 import json
 import os
 import re
+import shutil
 import time
+from collections import defaultdict
 from enum import Enum
 
 State = Enum(
@@ -78,6 +80,9 @@ def parse_args():
         default=100_000,
         help="Evaluate every N iterations",
     )
+
+    # other settings
+    parser.add_argument("--num_hf_checkpoints_to_keep", type=int, default=5)
     return parser.parse_args()
 
 
@@ -186,6 +191,22 @@ def submit_new_evaluations(args):
                 )
 
 
+def cleanup_hf_checkpoints(args):
+    # for each model size, find all checkpoint dirs with their iterations
+    iters_with_dirs = defaultdict(list)
+    for checkpoint_dir in os.listdir(args.hf_dir):
+        match = re.search(r"^Apertus3-(.*)B_iter_(\d+)$", checkpoint_dir)
+        if match:
+            iters_with_dirs[match.group(1)].append(
+                (int(match.group(2)), os.path.join(args.hf_dir, checkpoint_dir))
+            )
+
+    # sort by iteration and keep the N latest checkpoints
+    for model_size, dirs in iters_with_dirs.items():
+        for iteration, d in sorted(dirs)[: -args.num_hf_checkpoints_to_keep]:
+            shutil.rmtree(d)
+
+
 def main(args):
     # submit evaluations for checkpoints not evaluated yet
     submit_new_evaluations(args)
@@ -193,6 +214,10 @@ def main(args):
     # TODO check if evaluations that have been submitted are now running
 
     # TODO check if evaluations that have been running are now finished
+
+    # cleanup tasks
+    # remove HF checkpoints per model size exceeding `num_hf_checkpoints_to_keep`
+    cleanup_hf_checkpoints(args)
 
     # TODO check if finished evaluations have been synced with W&B
 
