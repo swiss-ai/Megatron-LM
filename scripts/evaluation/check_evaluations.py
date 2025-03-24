@@ -182,12 +182,8 @@ def submit_new_evaluations(args):
                     model_name,
                     iteration,
                     State.SUBMITTED,
-                    {
-                        "checkpoint_dir": iteration_dir,
-                        "eval_log": os.path.join(
-                            args.logs_root, "slurm", f"{jobname}.out"
-                        ),
-                    },
+                    checkpoint_dir=iteration_dir,
+                    eval_log=os.path.join(args.logs_root, "slurm", f"{jobname}.out"),
                 )
 
 
