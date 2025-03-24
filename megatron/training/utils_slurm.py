@@ -53,8 +53,8 @@ class ErrorAnalyzer:
             },
             'JOB_CANCELLED': {
                 'patterns': [
-                    r'srun: Job step aborted',
-                    r'srun: forcing job termination',
+                    r'srun: Job step aborted(?!.*DUE TO NODE FAILURE)',
+                    r'srun: forcing job termination(?!.*DUE TO NODE FAILURE)',
                     r'CANCELLED AT .*? BY \w+'
                 ],
                 'description': 'Job Cancelled by User/Admin',
@@ -528,7 +528,7 @@ def main():
         output_file = f"failure-report-{job_id}.txt"
     
     analyzer.save_analysis(results, output_file)
-    print(f"Analysis saved to: {output_file}")
+    # print(f"Analysis saved to: {output_file}")
     
     # Print brief summary to console
     print("\nBrief Summary:")
