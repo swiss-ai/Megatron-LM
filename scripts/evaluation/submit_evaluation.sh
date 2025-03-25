@@ -368,6 +368,7 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 		# rm -rf \\\$HF_TEMP_PATH
 		rm -rf \\\$TORCH_NODIST_PATH
 		rm -rf \\\$REPOS_PATH
+		echo "Evaluation failed."
 	}
 	trap cleanup EXIT
 	echo HF TEMP PATH: \\\$HF_TEMP_PATH
@@ -387,6 +388,8 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 	$CMD_LOOP
 
 	$WANDB_COMMAND
+
+	echo "Evaluation finished."
 "
 EOM
 
