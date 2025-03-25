@@ -183,8 +183,52 @@ def submit_new_evaluations(args):
                     iteration,
                     State.SUBMITTED,
                     checkpoint_dir=iteration_dir,
-                    eval_log=os.path.join(args.logs_root, "slurm", f"{jobname}.out"),
+                    eval_out=os.path.join(args.logs_root, "slurm", f"{jobname}.out"),
+                    eval_err=os.path.join(args.logs_root, "slurm", f"{jobname}.err"),
                 )
+
+
+def check_running(args):
+    """Checks if evaluations in the *submitted* state are now running."""
+    eval_metadata = EvalMetadata()
+    for model_name in args.model_names:
+        model_metadata = eval_metadata.get_model_metadata(model_name)
+        for iteration, iteration_metadata in model_metadata["iterations"].items():
+            if iteration_metadata["state"] == State.SUBMITTED.name:
+                if os.path.exists(iteration_metadata["eval_out"]):
+                    eval_metadata.update_iteration_metadata(
+                        model_name, iteration, State.RUNNING
+                    )
+
+
+def check_finished(args):
+    """Checks if evaluations in the *running* state are finished or have failed."""
+    eval_metadata = EvalMetadata()
+    for model_name in args.model_names:
+        model_metadata = eval_metadata.get_model_metadata(model_name)
+        for iteration, iteration_metadata in model_metadata["iterations"].items():
+            if iteration_metadata["state"] == State.RUNNING.name:
+                with open(iteration_metadata["eval_out"]) as f:
+                    lines = list(map(str.strip, f.readlines()))
+                if lines[-1] == "Evaluation finished.":
+                    eval_metadata.update_iteration_metadata(
+                        model_name, iteration, State.FINISHED
+                    )
+                elif lines[-1] == "Evaluation failed.":
+                    eval_metadata.update_iteration_metadata(
+                        model_name, iteration, State.FAILED
+                    )
+                    print(
+                        f"Evaluation of model {model_name} at iteration {iteration} failed."
+                    )
+                    print("1. Check the error logs:")
+                    print(f"less {iteration_metadata['eval_err']}")
+                    print("2. Reset the state of the evaluation by running:")
+                    cur_dir = os.path.dirname(os.path.realpath(__file__))
+                    script_path = os.path.join(cur_dir, "change_eval_state.py")
+                    print(
+                        f"python {script_path} --model_name {model_name} --iteration {iteration} --state not_evaluated"
+                    )
 
 
 def cleanup_hf_checkpoints(args):
@@ -207,9 +251,11 @@ def main(args):
     # submit evaluations for checkpoints not evaluated yet
     submit_new_evaluations(args)
 
-    # TODO check if evaluations that have been submitted are now running
+    # check if evaluations that have been submitted are now running
+    check_running(args)
 
-    # TODO check if evaluations that have been running are now finished
+    # check if evaluations that have been running are now finished
+    check_finished(args)
 
     # cleanup tasks
     # remove HF checkpoints per model size exceeding `num_hf_checkpoints_to_keep`
