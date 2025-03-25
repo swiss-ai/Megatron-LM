@@ -354,9 +354,9 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 
 	# Create HF conversion dir
 	export HF_TEMP_PATH=$HF_DIR/$JOBNAME
-	rm -rf $HF_TEMP_PATH
-	mkdir -p $HF_TEMP_PATH
-	chmod -R 755 $HF_TEMP_PATH
+	rm -rf \\\$HF_TEMP_PATH
+	mkdir -p \\\$HF_TEMP_PATH
+	chmod -R 755 \\\$HF_TEMP_PATH
 
 	# Create tempdirs.
 	cd
