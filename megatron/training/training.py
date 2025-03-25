@@ -1085,24 +1085,19 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         eta = str(timedelta(seconds=int(eta_seconds)))
 
         if writer:
+            writer.add_scalar('iteration-time', elapsed_time_per_iteration, iteration)
             writer.add_scalar('tokens-per-sec-per-GPU', tokens_per_sec_per_gpu, iteration)
             writer.add_scalar('eta-seconds', eta_seconds, iteration)
             
         if wandb_writer:
             wandb_writer.log({
+                'iteration-time': elapsed_time_per_iteration,
                 'tokens-per-sec-per-GPU': tokens_per_sec_per_gpu,
                 'eta-seconds': eta_seconds
             }, iteration)
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
-        if args.log_timers_to_tensorboard:
-            if writer:
-                writer.add_scalar('iteration-time',
-                                  elapsed_time_per_iteration, iteration)
-            if wandb_writer:
-                wandb_writer.log({'iteration-time': elapsed_time_per_iteration},
-                                 iteration)
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
@@ -1119,11 +1114,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         log_string += f" tokens/sec/gpu: {tokens_per_sec_per_gpu:.1f} |"
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
-            if args.log_timers_to_tensorboard:
-                if writer:
-                    writer.add_scalar('throughput', throughput, iteration)
-                if wandb_writer:
-                    wandb_writer.log({'TFLOPs-per-GPU': throughput}, iteration)
+            if writer:
+                writer.add_scalar('throughput', throughput, iteration)
+            if wandb_writer:
+                wandb_writer.log({'TFLOPs-per-GPU': throughput}, iteration)
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         log_string += f' learning rate: {learning_rate:.6E} |'
         if args.decoupled_lr is not None and (mpu.is_pipeline_first_stage(ignore_virtual=True) or

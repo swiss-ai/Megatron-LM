@@ -489,18 +489,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
 
-        ## assert isinstance(
-        ##    optimizer, Adam
-        ## ), "Only Adam currently supported, due to checkpointing requirements."
         if isinstance(optimizer, Adam):
             self.optimizer_name = 'adam'
             self.optimizer_keys = ("param", "exp_avg", "exp_avg_sq")
         elif isinstance(optimizer, AdEMAMix):
+            HAVE_APEX_OR_TE = True # NOTE(tj.solergibert) AdEMAMix has the same signature as Apex & TE Fused Adam optimizer 
             self.optimizer_name = 'ademamix'
+            self.optimizer_keys = ("param", "exp_avg_slow", "exp_avg_sq")
             if config.adam_beta1 != 0.0:
                 self.optimizer_keys = ("param", "exp_avg_slow", "exp_avg_fast", "exp_avg_sq")
-            else:
-                self.optimizer_keys = ("param", "exp_avg_slow", "exp_avg_sq")
         else:
             raise Exception(f"Unrecognized optimizer {type(optimizer)}, only Adam and AdEMAMix are supported for now.")
 
@@ -710,10 +707,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             if self.optimizer_name == 'adam':
                                 tensors = {"exp_avg": init_shard(), "exp_avg_sq": init_shard()}
                             elif self.optimizer_name == 'ademamix':
-                                if len(self.optimizer_keys) == 4: # beta1 != 0
-                                    tensors = {"exp_avg_slow": init_shard(), "exp_avg_fast": init_shard(), "exp_avg_sq": init_shard()}
-                                else: # beta1 == 0
-                                    tensors = {"exp_avg_slow": init_shard(), "exp_avg_sq": init_shard()}
+                                tensors = {"exp_avg_slow": init_shard(), "exp_avg_sq": init_shard()}
+                                if "exp_avg_fast" in self.optimizer_keys:
+                                    tensors["exp_avg_fast"] =  init_shard()
                             if self.config.use_precision_aware_optimizer:
                                 tensors["master_param"] = init_shard()
                             state_dict_state.append((state_order, tensors))
