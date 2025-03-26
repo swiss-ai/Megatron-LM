@@ -131,7 +131,7 @@ def submit_new_evaluations(args):
         print(f"Checking {model_name} checkpoints")
 
         # prepare submit script arguments
-        match = re.search(r"^apertus3-(\d)b-.*", model_dir)
+        match = re.match(r"apertus3-(\d)b-.*", model_dir)
         assert match, "Unknown naming pattern for model dir: {model_dir}"
         size = int(match.group(1))
         assert size in [1, 3, 8], "Unknown model size"
@@ -143,7 +143,7 @@ def submit_new_evaluations(args):
         iters_to_evaluate = []
         for d in os.listdir(checkpoints_dir):
             if d.startswith("iter_"):
-                match = re.search(r"^iter_(\d+)$", d)
+                match = re.match(r"iter_(\d+)$", d)
                 if not match:
                     print(f"Warning: Unknown checkpoint dir naming: {d}")
                     continue
@@ -240,7 +240,7 @@ def cleanup_hf_checkpoints(args):
 
     # move checkpoints from temp to storage dir (need to wait for evaluation to finish)
     for checkpoint_dir in os.listdir(args.hf_temp_dir):
-        match = re.search(r"^(Apertus3-\d\.?\d?B)_iter_(\d+)$", checkpoint_dir)
+        match = re.match(r"(Apertus3-\d\.?\d?B)_iter_(\d+)$", checkpoint_dir)
         if not match:
             continue
         model_name = match.group(1)
@@ -255,7 +255,7 @@ def cleanup_hf_checkpoints(args):
     # for each model size, find all checkpoint dirs with their iterations
     iters_with_dirs = defaultdict(list)
     for checkpoint_dir in os.listdir(args.hf_storage_dir):
-        match = re.search(r"^Apertus3-(\d\.?\d?)B_iter_(\d+)$", checkpoint_dir)
+        match = re.match(r"Apertus3-(\d\.?\d?)B_iter_(\d+)$", checkpoint_dir)
         if match:
             iters_with_dirs[match.group(1)].append(
                 (int(match.group(2)), os.path.join(args.hf_storage_dir, checkpoint_dir))
