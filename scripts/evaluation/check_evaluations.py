@@ -32,7 +32,10 @@ def parse_args():
         "--logs_root", default="/iopsstor/scratch/cscs/amarfurt/eval-logs"
     )
     parser.add_argument(
-        "--hf_dir", default="/iopsstor/scratch/cscs/amarfurt/hf_checkpoints"
+        "--hf_temp_dir", default="/iopsstor/scratch/cscs/amarfurt/hf_checkpoints"
+    )
+    parser.add_argument(
+        "--hf_storage_dir", default="/capstor/store/cscs/swissai/a06/hf_checkpoints"
     )
     parser.add_argument(
         "--container_path",
@@ -161,7 +164,7 @@ def submit_new_evaluations(args):
 --container-path {args.container_path}
 --logs-root {args.logs_root}
 --convert-to-hf
---hf-dir {args.hf_dir}
+--hf-temp-dir {args.hf_temp_dir}
 --size {size}
 --wandb-entity {args.wandb_entity}
 --wandb-project {args.wandb_project}
@@ -232,13 +235,30 @@ def check_finished(args):
 
 
 def cleanup_hf_checkpoints(args):
+    """Moves converted checkpoints from temp to storage dir, only keeps the latest N checkpoints."""
+    eval_metadata = EvalMetadata()
+
+    # move checkpoints from temp to storage dir (need to wait for evaluation to finish)
+    for checkpoint_dir in os.listdir(args.hf_temp_dir):
+        match = re.search(r"^(Apertus3-\d\.?\d?B)_iter_(\d+)$", checkpoint_dir)
+        if not match:
+            continue
+        model_name = match.group(1)
+        iteration = int(match.group(2))
+        iteration_metadata = eval_metadata.get_iteration_metadata(model_name, iteration)
+        if iteration_metadata["state"] == State.FINISHED.name:
+            os.rename(
+                os.path.join(args.hf_temp_dir, checkpoint_dir),
+                os.path.join(args.hf_storage_dir, checkpoint_dir),
+            )
+
     # for each model size, find all checkpoint dirs with their iterations
     iters_with_dirs = defaultdict(list)
-    for checkpoint_dir in os.listdir(args.hf_dir):
-        match = re.search(r"^Apertus3-(.*)B_iter_(\d+)$", checkpoint_dir)
+    for checkpoint_dir in os.listdir(args.hf_storage_dir):
+        match = re.search(r"^Apertus3-(\d\.?\d?)B_iter_(\d+)$", checkpoint_dir)
         if match:
             iters_with_dirs[match.group(1)].append(
-                (int(match.group(2)), os.path.join(args.hf_dir, checkpoint_dir))
+                (int(match.group(2)), os.path.join(args.hf_storage_dir, checkpoint_dir))
             )
 
     # sort by iteration and keep the N latest checkpoints
