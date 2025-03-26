@@ -211,7 +211,7 @@ def check_finished(args):
         model_metadata = eval_metadata.get_model_metadata(model_name)
         for iteration, iteration_metadata in model_metadata["iterations"].items():
             if iteration_metadata["state"] == State.RUNNING.name:
-                with open(iteration_metadata["eval_out"]) as f:
+                with open(iteration_metadata["eval_out"], encoding="latin-1") as f:
                     lines = list(map(str.strip, f.readlines()))
                 if "Evaluation finished." in lines[-1]:
                     eval_metadata.update_iteration_metadata(
