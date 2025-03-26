@@ -247,7 +247,7 @@ def cleanup_hf_checkpoints(args):
         iteration = int(match.group(2))
         iteration_metadata = eval_metadata.get_iteration_metadata(model_name, iteration)
         if iteration_metadata["state"] == State.FINISHED.name:
-            os.rename(
+            shutil.move(
                 os.path.join(args.hf_temp_dir, checkpoint_dir),
                 os.path.join(args.hf_storage_dir, checkpoint_dir),
             )
