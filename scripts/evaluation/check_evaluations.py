@@ -213,11 +213,11 @@ def check_finished(args):
             if iteration_metadata["state"] == State.RUNNING.name:
                 with open(iteration_metadata["eval_out"]) as f:
                     lines = list(map(str.strip, f.readlines()))
-                if lines[-1] == "Evaluation finished.":
+                if "Evaluation finished." in lines[-1]:
                     eval_metadata.update_iteration_metadata(
                         model_name, iteration, State.FINISHED
                     )
-                elif lines[-1] == "Evaluation failed.":
+                elif "Evaluation failed." in lines[-1]:
                     eval_metadata.update_iteration_metadata(
                         model_name, iteration, State.FAILED
                     )
