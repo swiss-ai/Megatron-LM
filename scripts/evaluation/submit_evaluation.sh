@@ -36,7 +36,7 @@ usage () {
 	echo "  --name: Name of the eval run. If not set, the path will be used as name"
 	echo "  --size (choices={1, 3, 8, 70}): The size of the checkpoint to evaluate. If not set, --tp and --pp should be specified. This only sets --tp and --pp for you."
 	echo "  --convert-to-hf: When set, if a megatron checkpoint is given, the model will be converted to HF."
-	echo "  --hf-dir: Use as a base directory for HF converted checkpoints. Otherwise uses $SCRATCH/hf_checkpoints."
+	echo "  --hf-temp-dir: Use as a base directory for HF converted checkpoints. Otherwise uses $SCRATCH/hf_checkpoints."
 	echo "  --tasks: lm-eval-harness tasks to run (default=$TASKS)."
 	echo "  --limit (int>0 or 'null'): lm-eval-harness limit samples per task (default=$LIMIT)."
 	echo "  --tp (int>0): Target TP size for inference. Ignored if --size is set, required otherwise."
@@ -123,8 +123,8 @@ while [[ $# -gt 0 ]]; do
 			NAME=$2; shift 2;;
 		--convert-to-hf)
 			CONVERT_TO_HF=true; shift;;
-		--hf-dir)
-			HF_DIR=$2; shift 2;;
+		--hf-temp-dir)
+			HF_TEMP_DIR=$2; shift 2;;
 		--iterations)
 			IFS=',' read -ra ITERATIONS <<< "$2"; shift 2;;
 		--revisions)
@@ -173,8 +173,8 @@ if [ -z ${PP+x} ]; then
 	exit 1
 fi
 
-if [ -z ${HF_DIR+x} ]; then
-	HF_DIR=$SCRATCH/hf_checkpoints
+if [ -z ${HF_TEMP_DIR+x} ]; then
+	HF_TEMP_DIR=$SCRATCH/hf_checkpoints
 fi
 
 # Build eval args depending on this scripts args.
@@ -353,7 +353,7 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 	set -e
 
 	# Create HF conversion dir
-	export HF_TEMP_PATH=$HF_DIR/$JOBNAME
+	export HF_TEMP_PATH=$HF_TEMP_DIR/$JOBNAME
 	rm -rf \\\$HF_TEMP_PATH
 	mkdir -p \\\$HF_TEMP_PATH
 	chmod -R 755 \\\$HF_TEMP_PATH
