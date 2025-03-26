@@ -128,8 +128,6 @@ def submit_new_evaluations(args):
     for model_name, model_dir, model_tokens in zip(
         args.model_names, args.model_dirs, args.model_tokens_per_iter
     ):
-        print(f"Checking {model_name} checkpoints")
-
         # prepare submit script arguments
         match = re.match(r"apertus3-(\d)b-.*", model_dir)
         assert match, "Unknown naming pattern for model dir: {model_dir}"
@@ -158,7 +156,7 @@ def submit_new_evaluations(args):
                 eval_metadata.get_iteration_metadata(model_name, iteration)["state"]
                 == State.NOT_EVALUATED.name
             ):
-                print(f"Submitting evaluation for iteration {iteration}")
+                # print(f"Submitting evaluation for {model_name} @ iteration {iteration}")
                 jobname = f"{model_name}_iter_{iteration}"
                 arguments = f"""
 --container-path {args.container_path}
@@ -175,7 +173,7 @@ def submit_new_evaluations(args):
 --tasks {args.tasks}
 """.strip().replace("\n", " ")
                 command = f"bash {cur_dir}/submit_evaluation.sh {checkpoints_dir} {arguments} --iterations {iteration}"
-                print(f"Running command: {command}")
+                # print(f"Running command: {command}")
                 res = os.system(command)
                 if res:
                     raise RuntimeError(
