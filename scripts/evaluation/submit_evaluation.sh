@@ -364,11 +364,14 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 	# HF_TEMP_PATH=\\\$(mktemp -d -p $SCRATCH/.tmp)  # To store hf conversion (if needed).
 	TORCH_NODIST_PATH=\\\$(mktemp -d -p $SCRATCH/.tmp)  # To store torch no dist checkpoint converted (if needed).
 	REPOS_PATH=\\\$(mktemp -d -p $SCRATCH/.tmp)  # To git clone repos.
+	SUCCESS=0
 	function cleanup {
 		# rm -rf \\\$HF_TEMP_PATH
 		rm -rf \\\$TORCH_NODIST_PATH
 		rm -rf \\\$REPOS_PATH
-		echo Evaluation failed.
+		if [ "$SUCCESS" -eq 0 ]; then
+			echo Evaluation failed.
+		fi
 	}
 	trap cleanup EXIT
 	echo HF TEMP PATH: \\\$HF_TEMP_PATH
@@ -389,6 +392,7 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 
 	$WANDB_COMMAND
 
+	SUCCESS=1
 	echo Evaluation finished.
 "
 EOM
