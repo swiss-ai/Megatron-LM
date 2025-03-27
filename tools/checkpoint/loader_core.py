@@ -5,6 +5,7 @@ import os
 import sys
 import torch
 import types
+from torch.utils.data import DataLoader
 
 from schema_core import get_model_schema
 from utils import print_memory_usage
@@ -47,6 +48,9 @@ def _load_checkpoint(queue, args):
         from megatron.core import mpu
         from megatron.core.enums import ModelType
         from megatron.legacy import fused_kernels
+        from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
+        from megatron.training.tokenizer.tokenizer import _NullTokenizer
+        from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         queue.put("exit")
@@ -70,6 +74,7 @@ def _load_checkpoint(queue, args):
                 '--position-embedding-type', args.position_embedding_type,
                 '--exit-on-missing-checkpoint',
                 '--no-one-logger',
+                '--use-mp-args-from-checkpoint-args',
                 ]
 
     margs = parse_args()
@@ -117,6 +122,7 @@ def _load_checkpoint(queue, args):
     check_for_arg('disable_bias_linear', False)
     check_for_arg('params_dtype')
     check_for_arg('swiglu', False)
+    check_for_arg('xielu', False)
 
     # Determine how to make our models
     if args.model_type == 'GPT':
@@ -209,6 +215,10 @@ def _load_checkpoint(queue, args):
     if vp_size is None:
         vp_size = 1
 
+    if args.test_logits:
+        assert tp_size == vp_size == vp_size == 1
+        assert args.model_type == "GPT"
+
     # Layernorm has bias; RMSNorm does not.
     if hasattr(checkpoint_args, 'normalization'):
         norm_has_bias = checkpoint_args.normalization == "LayerNorm"
@@ -297,6 +307,24 @@ def _load_checkpoint(queue, args):
                 if md.linear_bias:
                     message["dense bias"] = layer["self_attn_proj_bias"]
                     message["mlp l1 bias"] = layer["mlp_fc2_bias"]
+                
+                # Add QK normalization parameters if they exist
+                if layer.get("self_attn_q_layernorm_weight") is not None:
+                    message["q norm weight"] = layer["self_attn_q_layernorm_weight"]
+                    if norm_has_bias:
+                        message["q norm bias"] = layer["self_attn_q_layernorm_bias"]
+                if layer.get("self_attn_k_layernorm_weight") is not None:
+                    message["k norm weight"] = layer["self_attn_k_layernorm_weight"]
+                    if norm_has_bias:
+                        message["k norm bias"] = layer["self_attn_k_layernorm_bias"]
+                # add Xielu weights
+                if layer.get("mlp_xielu_alpha_p") is not None:
+                    # somehow the xielu weights are on the GPU
+                    # so we need to move them to the CPU. it might be related to the change
+                    # needed in L912 of checkpointing.py, where we now load the weights with weights_only=False
+                    message["mlp xielu alpha p"] = layer["mlp_xielu_alpha_p"].cpu()
+                if layer.get("mlp_xielu_alpha_n") is not None:
+                    message["mlp xielu alpha n"] = layer["mlp_xielu_alpha_n"].cpu()
 
                 # Grab all parallel tensors for this layer
                 qkv_weight = []
@@ -392,6 +420,44 @@ def _load_checkpoint(queue, args):
                 "bias": binary_head["bias"],
             }
             queue_put("binary head", message)
+
+    # Send logits if needed.
+    if args.test_logits:
+        # Get fake data.
+        tok = _NullTokenizer(vocab_size=1024)
+        tok.bod = 1
+        config = GPTDatasetConfig(
+            random_seed=0,
+            sequence_length=md.seq_length,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+            tokenizer=tok,
+            goldfish_loss=False,
+        )
+        datasets = BlendedMegatronDatasetBuilder(
+            MockGPTDataset, [1000, None, None], lambda: True, config
+        ).build()
+        loader = DataLoader(datasets[0], batch_size=4, shuffle=False)
+        data = next(iter(loader))
+
+        # Get logits and send the message.
+        device = "cuda"
+        tokens = data["tokens"].to(device)
+        position_ids = data["position_ids"].to(device)
+        attention_mask = data["attention_mask"].to(device)
+        model = model.to(device).float()
+        with torch.no_grad():
+            output = model(tokens, position_ids, attention_mask)
+        del model
+        message = {"tokens": tokens.cpu(), "position_ids": position_ids.cpu(),
+                   "attention_mask": attention_mask.cpu(), "output": output.cpu()}
+        del tokens
+        del position_ids
+        del attention_mask
+        del output
+        torch.cuda.empty_cache()
+        queue_put("logits_check", message)
 
     # Done.
     queue.put("done")

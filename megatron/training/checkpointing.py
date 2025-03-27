@@ -853,24 +853,28 @@ def _load_base_checkpoint(
     non_persistent_iteration = _get_non_persistent_iteration(
         non_persistent_global_dir, args, checkpointing_context
     )
-    iteration, release = -1, False
-    tracker_filename = 'because load directory is not defined'
-    if load_dir is not None:
-        tracker_filename = get_checkpoint_tracker_filename(load_dir)
-        if os.path.isfile(tracker_filename):
-            iteration, release = read_metadata(tracker_filename)
-    if non_persistent_iteration != -1:  # there is a non-persistent checkpoint
-        if non_persistent_iteration >= iteration:
-            return _load_non_persistent_base_checkpoint(
-                non_persistent_global_dir,
-                args,
-                rank0,
-                sharded_state_dict,
-                non_persistent_iteration,
-                checkpointing_context,
-            )
-        else:
-            print_rank_0('WARNING: non-persistent checkpoints are older than persistent checkpoint')
+    if args.ckpt_step is None:
+        iteration, release = -1, False
+        tracker_filename = 'because load directory is not defined'
+        if load_dir is not None:
+            tracker_filename = get_checkpoint_tracker_filename(load_dir)
+            if os.path.isfile(tracker_filename):
+                iteration, release = read_metadata(tracker_filename)
+        if non_persistent_iteration != -1:  # there is a non-persistent checkpoint
+            if non_persistent_iteration >= iteration:
+                return _load_non_persistent_base_checkpoint(
+                    non_persistent_global_dir,
+                    args,
+                    rank0,
+                    sharded_state_dict,
+                    non_persistent_iteration,
+                    checkpointing_context,
+                )
+            else:
+                print_rank_0('WARNING: non-persistent checkpoints are older than persistent checkpoint')
+    else:
+        iteration = args.ckpt_step
+        release = False
 
     # Otherwise we are dealing with global checkpoints
     # If no tracker file, return nothing
@@ -910,7 +914,7 @@ def _load_base_checkpoint(
     else:
         checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=False)
     try:
-        state_dict = torch.load(checkpoint_name, map_location='cpu')
+        state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
     except ModuleNotFoundError:
         from megatron.legacy.fp16_deprecated import loss_scaler
 
@@ -999,7 +1003,7 @@ def load_args_from_checkpoint(
     # Model args.
     _set_arg('num_layers')
     _set_arg('hidden_size')
-    _set_arg('ffn_hidden_size')
+    _set_arg('ffn_hidden_size', force=True)
     _set_arg('seq_length')
     _set_arg('num_attention_heads')
     _set_arg('num_query_groups', force=True)
@@ -1022,6 +1026,8 @@ def load_args_from_checkpoint(
     _set_arg('apply_query_key_layer_scaling', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
+
+    _set_arg('norm_epsilon', force=True)
 
     _set_arg('hybrid_override_pattern', force=True)
     _set_arg('spec', force=True)
@@ -1056,9 +1062,11 @@ def load_args_from_checkpoint(
     _set_arg('mlp_layernorm', force=True)
     _set_arg('final_layernorm', force=True)
     _set_arg('post_layernorm', force=True)
+
+    _set_arg('qknorm_impl', force=True)
+    _set_arg('xielu', force=True)
     _set_arg('layernorm_init', force=True)
     _set_arg('input_embeddings_multiplier', force=True)
-
 
     # Model parallelism args.
     if args.use_mp_args_from_checkpoint_args:
