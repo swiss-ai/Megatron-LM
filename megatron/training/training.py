@@ -703,7 +703,7 @@ def setup_model_and_optimizer(model_provider_func,
     timers = get_timers()
     one_logger = get_one_logger()
 
-    model = get_model(model_provider_func, model_type)
+    model = get_model(model_provider_func, model_type, wrap_with_ddp=args.ckpt_convert_format is None)
     unwrapped_model = unwrap_model(model)
 
     kwargs = {}
@@ -712,9 +712,13 @@ def setup_model_and_optimizer(model_provider_func,
             kwargs[f.name] = getattr(args, f.name)
     config = OptimizerConfig(**kwargs)
     config.timers = timers
-    optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
-                                       scale_lr_cond, lr_mult)
-    opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+    if args.ckpt_convert_format is None:
+        optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
+                                           scale_lr_cond, lr_mult)
+        opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+    else:
+        optimizer = None
+        opt_param_scheduler = None
 
     if args.moe_use_upcycling:
         torch.distributed.barrier()
@@ -1085,24 +1089,19 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         eta = str(timedelta(seconds=int(eta_seconds)))
 
         if writer:
+            writer.add_scalar('iteration-time', elapsed_time_per_iteration, iteration)
             writer.add_scalar('tokens-per-sec-per-GPU', tokens_per_sec_per_gpu, iteration)
             writer.add_scalar('eta-seconds', eta_seconds, iteration)
             
         if wandb_writer:
             wandb_writer.log({
+                'iteration-time': elapsed_time_per_iteration,
                 'tokens-per-sec-per-GPU': tokens_per_sec_per_gpu,
                 'eta-seconds': eta_seconds
             }, iteration)
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
-        if args.log_timers_to_tensorboard:
-            if writer:
-                writer.add_scalar('iteration-time',
-                                  elapsed_time_per_iteration, iteration)
-            if wandb_writer:
-                wandb_writer.log({'iteration-time': elapsed_time_per_iteration},
-                                 iteration)
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
@@ -1119,11 +1118,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         log_string += f" tokens/sec/gpu: {tokens_per_sec_per_gpu:.1f} |"
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
-            if args.log_timers_to_tensorboard:
-                if writer:
-                    writer.add_scalar('throughput', throughput, iteration)
-                if wandb_writer:
-                    wandb_writer.log({'TFLOPs-per-GPU': throughput}, iteration)
+            if writer:
+                writer.add_scalar('throughput', throughput, iteration)
+            if wandb_writer:
+                wandb_writer.log({'TFLOPs-per-GPU': throughput}, iteration)
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         log_string += f' learning rate: {learning_rate:.6E} |'
         if args.decoupled_lr is not None and (mpu.is_pipeline_first_stage(ignore_virtual=True) or

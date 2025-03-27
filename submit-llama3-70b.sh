@@ -60,7 +60,7 @@ BACKUP_CODEBASE_DIR=$EXP_DIR/Megatron-LM
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export OMP_NUM_THREADS=$((SLURM_CPUS_PER_TASK/SLURM_GPUS_PER_NODE))
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 # We are preparing for torch.distributed programs so it wants:
 # - MASTER_ADDR, MASTER_PORT, WORLD_SIZE - already known before `srun`
@@ -101,7 +101,6 @@ LOGGING_ARGS=(
 	--log-throughput
 	--log-progress
 	--tensorboard-dir $TENSORBOARD_DIR
-	--log-timers-to-tensorboard
 	--no-log-loss-scale-to-tensorboard
 	--log-memory-to-tensorboard
 )
@@ -121,6 +120,7 @@ TRAINING_ARGS=(
 	--no-check-for-nan-in-loss-and-grad
 	--train-iters $TRAINING_STEPS
 	--log-interval 1
+	--eval-iters 0
 	--cross-entropy-loss-fusion
 	--disable-bias-linear
 	--optimizer adam
@@ -173,12 +173,15 @@ DISTRIBUTED_ARGS=(
 
 TOKENIZER_ARGS=(
 	--tokenizer-type HuggingFaceTokenizer
-	--tokenizer-model tj-solergibert/swai
+	--tokenizer-model alehc/swissai-tokenizer
 )
 
 DATA_ARGS=(
 	--split 100,0,0
 	--seq-length $SEQ_LEN
+	--reset-position-ids
+	--reset-attention-mask
+	--eod-mask-loss
 	--num-workers 1
 	--num-dataset-builder-threads 1
 )
@@ -286,14 +289,6 @@ echo -e "\n$(nvidia-smi)" >> $COMPUTE_ENVIRONMENT_DIR # CUDA Version & Driver
 printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR 
 echo -e "\nEnvironment Variables:\n\n$(printenv)" >> $COMPUTE_ENVIRONMENT_DIR
 printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR 
-
-SRUN_ARGS=" \
-	-lu \
-	--cpus-per-task $SLURM_CPUS_PER_TASK \
-	--wait 60 \
-	--jobid $SLURM_JOB_ID \
-	--kill-on-bad-exit 1 \
-	"
 
 srun -lu bash -c 'echo $(hostname) $(nvidia-smi | grep -o "|\\s*[0-9]*MiB")' > $GPU_MEM_LOGGING
 
