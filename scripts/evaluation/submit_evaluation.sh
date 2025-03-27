@@ -369,7 +369,7 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 		# rm -rf \\\$HF_TEMP_PATH
 		rm -rf \\\$TORCH_NODIST_PATH
 		rm -rf \\\$REPOS_PATH
-		if [ "$SUCCESS" -eq 0 ]; then
+		if [ \\\$SUCCESS -eq 0 ]; then
 			echo Evaluation failed.
 		fi
 	}
