@@ -258,7 +258,7 @@ else
 		# Convert from megatron to HF.
 		cd $MEGATRON_PATH
 		export PYTHONPATH=$MEGATRON_PATH:\\\$PYTHONPATH
-		torchrun scripts/conversion/torchdist_2_torch.py --bf16 --load=$CHECKPOINT_PATH --ckpt-step=\\\$IT --ckpt-convert-save=\\\$TORCH_NODIST_PATH
+		torchrun --nproc-per-node $((TP*PP)) scripts/conversion/torchdist_2_torch.py --bf16 --load=$CHECKPOINT_PATH --ckpt-step=\\\$IT --ckpt-convert-save=\\\$TORCH_NODIST_PATH --pipeline-model-parallel-size $((TP*PP))
 		python tools/checkpoint/convert.py --model-type=GPT --loader=core --saver=llama_hf --load-dir=\\\$TORCH_NODIST_PATH/torch --save-dir=\\\$HF_TEMP_PATH --hf-tokenizer=$TOKENIZER
 		EOM
 		HF_CHECKPOINT_PATH=\\\$HF_TEMP_PATH
@@ -271,7 +271,13 @@ else
 			MAYBE_GRAB_REVISION="REVISION=\\\${REVISIONS[\\\$i]}"
 		fi
 	fi
-	CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL,dtype=$DTYPE $COMMON_EVAL_ARGS"
+
+	DP=$((GPUS_PER_NODE/(TP*PP)))
+	if (( TP*PP > 1 )); then
+		CMD_EVAL="WANDB_RESUME=allow WORLD_SIZE=1 MASTER_ADDR=localhost MASTER_PORT=25678 lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL,dtype=$DTYPE,parallelize=True $COMMON_EVAL_ARGS"
+	else
+		CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL,dtype=$DTYPE $COMMON_EVAL_ARGS"
+	fi
 fi
 
 # The big loop.
