@@ -106,7 +106,7 @@ while [[ $# -gt 0 ]]; do
 				PP=2
 				CONVERT_MP=4
 			else
-				echo Unknown size $2. Choices={1, 8, 70}. >&2
+				echo Unknown size $2. Choices={1, 3, 8, 70}. >&2
 				exit 1
 			fi
 			shift 2;;
