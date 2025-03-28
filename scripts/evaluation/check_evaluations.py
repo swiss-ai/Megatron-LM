@@ -146,19 +146,27 @@ def submit_new_evaluations(args):
                     print(f"Warning: Unknown checkpoint dir naming: {d}")
                     continue
                 iteration = int(match.group(1))
+
+                # only evaluate every N iterations
                 if iteration % args.evaluate_every != 0:
                     continue
-                iters_to_evaluate.append((iteration, os.path.join(checkpoints_dir, d)))
+
+                # only evaluate iterations not evaluated yet
+                if (
+                    eval_metadata.get_iteration_metadata(model_name, iteration)["state"]
+                    == State.NOT_EVALUATED.name
+                ):
+                    iters_to_evaluate.append(
+                        (iteration, os.path.join(checkpoints_dir, d))
+                    )
 
         # submit evaluations for checkpoints that have not been evaluated yet
-        for iteration, iteration_dir in iters_to_evaluate:
-            if (
-                eval_metadata.get_iteration_metadata(model_name, iteration)["state"]
-                == State.NOT_EVALUATED.name
-            ):
-                # print(f"Submitting evaluation for {model_name} @ iteration {iteration}")
-                jobname = f"{model_name}_iter_{iteration}"
-                arguments = f"""
+        all_iterations = ",".join([str(it) for it, _ in sorted(iters_to_evaluate)])
+        start_to_end = str(sorted(iters_to_evaluate)[0][0])
+        if len(iters_to_evaluate) > 1:
+            start_to_end += "-" + str(sorted(iters_to_evaluate)[-1][0])
+        jobname = f"{model_name}_iter_{start_to_end}"
+        arguments = f"""
 --container-path {args.container_path}
 --logs-root {args.logs_root}
 --convert-to-hf
@@ -172,21 +180,23 @@ def submit_new_evaluations(args):
 --tokens-per-iter {model_tokens}
 --tasks {args.tasks}
 """.strip().replace("\n", " ")
-                command = f"bash {cur_dir}/submit_evaluation.sh {checkpoints_dir} {arguments} --iterations {iteration}"
-                # print(f"Running command: {command}")
-                res = os.system(command)
-                if res:
-                    raise RuntimeError(
-                        f"Submitting evaluation for iteration {iteration} returned with return code: {res}"
-                    )
-                eval_metadata.update_iteration_metadata(
-                    model_name,
-                    iteration,
-                    State.SUBMITTED,
-                    checkpoint_dir=iteration_dir,
-                    eval_out=os.path.join(args.logs_root, "slurm", f"{jobname}.out"),
-                    eval_err=os.path.join(args.logs_root, "slurm", f"{jobname}.err"),
-                )
+        command = f"bash {cur_dir}/submit_evaluation.sh {checkpoints_dir} {arguments} --iterations {all_iterations}"
+        res = os.system(command)
+        if res:
+            raise RuntimeError(
+                f"Submitting evaluation for iteration(s) {start_to_end} returned with return code: {res}.\nCommand: {command}"
+            )
+
+        # update eval metadata, setting each evaluated iteration to submitted
+        for iteration, iteration_dir in iters_to_evaluate:
+            eval_metadata.update_iteration_metadata(
+                model_name,
+                iteration,
+                State.SUBMITTED,
+                checkpoint_dir=iteration_dir,
+                eval_out=os.path.join(args.logs_root, "slurm", f"{jobname}.out"),
+                eval_err=os.path.join(args.logs_root, "slurm", f"{jobname}.err"),
+            )
 
 
 def check_running(args):
