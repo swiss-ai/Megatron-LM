@@ -44,8 +44,14 @@ def parse_args():
 
     # model checkpoints
     parser.add_argument(
-        "--checkpoints_root",
-        default="/iopsstor/scratch/cscs/schlag/main_run_megatron/Megatron-LM/logs/Meg-Runs/main-runs-v1",
+        "--checkpoints_roots",
+        nargs="+",
+        default=[
+            "/iopsstor/scratch/cscs/schlag/main_run_megatron/Megatron-LM/logs/Meg-Runs/main-runs-v1",
+            "/iopsstor/scratch/cscs/schlag/main_run_megatron/Megatron-LM/logs/Meg-Runs/main-runs-v1",
+            "/iopsstor/scratch/cscs/schlag/main_run_megatron/Megatron-LM/logs/Meg-Runs/main-runs-v1",
+            "/iopsstor/scratch/cscs/schlag/main_run_70B_megatron/Megatron-LM/logs/Meg-Runs/main-runs-v1",
+        ],
     )
     parser.add_argument(
         "--model_dirs",
@@ -54,18 +60,19 @@ def parse_args():
             "apertus3-1b-21-nodes",
             "apertus3-3b-64-nodes",
             "apertus3-8b-128-nodes",
+            "apertus3-70b-512-nodes-1e-5lr",
         ],
     )
     parser.add_argument(
         "--model_names",
         nargs="+",
-        default=["Apertus3-1.5B", "Apertus3-3B", "Apertus3-8B"],
+        default=["Apertus3-1.5B", "Apertus3-3B", "Apertus3-8B", "Apertus3-70B"],
     )
     parser.add_argument(
         "--model_tokens_per_iter",
         nargs="+",
         type=int,
-        default=[2_064_384, 2_097_152, 4_194_304],
+        default=[2_064_384, 2_097_152, 4_194_304, 8_388_608],
     )
     parser.add_argument("--checkpoints_dir", default="checkpoints")
 
@@ -79,8 +86,9 @@ def parse_args():
     parser.add_argument("--tasks", default="swissai_eval")
     parser.add_argument(
         "--evaluate_every",
+        nargs="+",
         type=int,
-        default=100_000,
+        default=[100_000, 100_000, 100_000, 25_000],
         help="Evaluate every N iterations",
     )
 
@@ -125,18 +133,22 @@ def submit_new_evaluations(args):
     cur_dir = os.path.dirname(os.path.realpath(__file__))
     eval_metadata = EvalMetadata()
 
-    for model_name, model_dir, model_tokens in zip(
-        args.model_names, args.model_dirs, args.model_tokens_per_iter
+    for checkpoints_root, model_name, model_dir, model_tokens, evaluate_every in zip(
+        args.checkpoints_roots,
+        args.model_names,
+        args.model_dirs,
+        args.model_tokens_per_iter,
+        args.evaluate_every,
     ):
         # prepare submit script arguments
         match = re.match(r"apertus3-(\d)b-.*", model_dir)
         assert match, "Unknown naming pattern for model dir: {model_dir}"
         size = int(match.group(1))
-        assert size in [1, 3, 8], "Unknown model size"
+        assert size in [1, 3, 8, 70], "Unknown model size"
 
         # find checkpoints from iterations at the given intervals
         checkpoints_dir = os.path.join(
-            args.checkpoints_root, model_dir, args.checkpoints_dir
+            checkpoints_root, model_dir, args.checkpoints_dir
         )
         iters_to_evaluate = []
         for d in os.listdir(checkpoints_dir):
@@ -148,7 +160,7 @@ def submit_new_evaluations(args):
                 iteration = int(match.group(1))
 
                 # only evaluate every N iterations
-                if iteration % args.evaluate_every != 0:
+                if iteration % evaluate_every != 0:
                     continue
 
                 # only evaluate iterations not evaluated yet
