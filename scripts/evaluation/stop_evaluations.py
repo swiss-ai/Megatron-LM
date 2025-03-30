@@ -1,4 +1,4 @@
-"""Initializes evaluation metadata."""
+"""Sets already run evaluations to *finished*."""
 
 import json
 import os
@@ -10,7 +10,7 @@ from evaluations_metadata import EVAL_METADATA_PATH, EvalMetadata, State
 def parse_args():
     import argparse
 
-    parser = argparse.ArgumentParser(description="Initializes evaluation metadata.")
+    parser = argparse.ArgumentParser(description="Sets already run evaluations to *finished*.")
     parser.add_argument(
         "--checkpoints_roots",
         nargs="+",
@@ -48,19 +48,21 @@ def parse_args():
 
 def main(args):
     # initialize metadata
-    assert not os.path.exists(EVAL_METADATA_PATH), "Metadata file already exists"
-    metadata = {}
-    for checkpoints_root, model_name, model_dir in zip(
-        args.checkpoints_roots, args.model_names, args.model_dirs
-    ):
-        metadata[model_name] = {
-            "checkpoints_dir": os.path.join(
-                checkpoints_root, model_dir, args.checkpoints_dir
-            ),
-            "iterations": {},
-        }
-    with open(EVAL_METADATA_PATH, "w") as f:
-        json.dump(metadata, f, indent=4)
+    if os.path.exists(EVAL_METADATA_PATH):
+        print(f"Metadata file already exists at {EVAL_METADATA_PATH}")
+    else:
+        metadata = {}
+        for checkpoints_root, model_name, model_dir in zip(
+            args.checkpoints_roots, args.model_names, args.model_dirs
+        ):
+            metadata[model_name] = {
+                "checkpoints_dir": os.path.join(
+                    checkpoints_root, model_dir, args.checkpoints_dir
+                ),
+                "iterations": {},
+            }
+        with open(EVAL_METADATA_PATH, "w") as f:
+            json.dump(metadata, f, indent=4)
 
     # set state of iterations that were already evaluated to *finished*
     for model_name, model_dir, max_iter in zip(
@@ -77,7 +79,10 @@ def main(args):
                     print(f"Warning: Unknown checkpoint dir naming: {d}")
                     continue
                 iteration = int(match.group(1))
-                if iteration <= max_iter:
+                if (
+                    iteration <= max_iter
+                    and eval_metadata.get_state(model_name, iteration) != State.FINISHED
+                ):
                     eval_metadata.update_iteration_metadata(
                         model_name,
                         iteration,
