@@ -119,10 +119,8 @@ def submit_new_evaluations(args):
                     continue
 
                 # only evaluate iterations not evaluated yet
-                if (
-                    eval_metadata.get_state(model_name, iteration)
-                    == State.NOT_EVALUATED
-                ):
+                eval_state = eval_metadata.get_state(model_name, iteration)
+                if eval_state is None or eval_state == State.NOT_EVALUATED:
                     iters_to_evaluate.append(
                         (iteration, os.path.join(checkpoints_dir, d))
                     )
