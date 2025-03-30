@@ -10,7 +10,9 @@ from evaluations_metadata import EVAL_METADATA_PATH, EvalMetadata, State
 def parse_args():
     import argparse
 
-    parser = argparse.ArgumentParser(description="Sets already run evaluations to *finished*.")
+    parser = argparse.ArgumentParser(
+        description="Sets already run evaluations to *finished*."
+    )
     parser.add_argument(
         "--checkpoints_roots",
         nargs="+",
@@ -47,20 +49,21 @@ def parse_args():
 
 
 def main(args):
-    # initialize metadata
-    if os.path.exists(EVAL_METADATA_PATH):
-        print(f"Metadata file already exists at {EVAL_METADATA_PATH}")
-    else:
-        metadata = {}
-        for checkpoints_root, model_name, model_dir in zip(
-            args.checkpoints_roots, args.model_names, args.model_dirs
-        ):
+    # initialize metadata if a model is not present yet
+    metadata = EvalMetadata().metadata if os.path.exists(EVAL_METADATA_PATH) else {}
+    changed = False
+    for checkpoints_root, model_name, model_dir in zip(
+        args.checkpoints_roots, args.model_names, args.model_dirs
+    ):
+        if model_name not in metadata:
+            changed = True
             metadata[model_name] = {
                 "checkpoints_dir": os.path.join(
                     checkpoints_root, model_dir, args.checkpoints_dir
                 ),
                 "iterations": {},
             }
+    if changed:
         with open(EVAL_METADATA_PATH, "w") as f:
             json.dump(metadata, f, indent=4)
 
