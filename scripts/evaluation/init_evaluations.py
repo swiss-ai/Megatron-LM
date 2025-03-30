@@ -4,7 +4,7 @@ import json
 import os
 import re
 
-from check_evaluations import EVAL_METADATA_PATH, EvalMetadata, State
+from evaluations_metadata import EVAL_METADATA_PATH, EvalMetadata, State
 
 
 def parse_args():

@@ -1,25 +1,11 @@
 """Regularly checks Imanol's checkpoints to submit evaluation runs."""
 
-import json
 import os
 import re
 import shutil
-import time
 from collections import defaultdict
-from enum import Enum
 
-State = Enum(
-    "State",
-    [
-        ("NOT_EVALUATED", 0),
-        ("SUBMITTED", 1),
-        ("RUNNING", 2),
-        ("FINISHED", 3),
-        ("FAILED", 4),
-    ],
-)
-
-EVAL_METADATA_PATH = "/users/amarfurt/eval_metadata.json"
+from evaluations_metadata import EvalMetadata, State
 
 
 def parse_args():
@@ -97,37 +83,6 @@ def parse_args():
     return parser.parse_args()
 
 
-class EvalMetadata:
-    def __init__(self, path=EVAL_METADATA_PATH):
-        self.path = path
-        with open(self.path) as f:
-            self.metadata = json.load(f)
-
-    def get_model_metadata(self, model_name):
-        return self.metadata[model_name]
-
-    def get_iteration_metadata(self, model_name, iteration):
-        iterations_metadata = self.metadata[model_name]["iterations"]
-        iteration = str(iteration)  # JSON keys are strings
-        if iteration in iterations_metadata:
-            return iterations_metadata[iteration]
-        return {
-            "state": State.NOT_EVALUATED.name,
-            "timestamp": time.time(),
-        }
-
-    def update_iteration_metadata(self, model_name, iteration, new_state, **kwargs):
-        iteration = str(iteration)  # JSON keys are strings
-        new_state_name = new_state.name if type(new_state) is State else new_state
-        if iteration not in self.metadata[model_name]["iterations"]:
-            self.metadata[model_name]["iterations"][iteration] = {}
-        self.metadata[model_name]["iterations"][iteration].update(kwargs)
-        self.metadata[model_name]["iterations"][iteration]["state"] = new_state_name
-        self.metadata[model_name]["iterations"][iteration]["timestamp"] = time.time()
-        with open(self.path, "w") as f:
-            json.dump(self.metadata, f, indent=4)
-
-
 def submit_new_evaluations(args):
     assert os.environ["WANDB_API_KEY"] or args.wandb_api_key, "No W&B API key provided"
     cur_dir = os.path.dirname(os.path.realpath(__file__))
@@ -165,8 +120,8 @@ def submit_new_evaluations(args):
 
                 # only evaluate iterations not evaluated yet
                 if (
-                    eval_metadata.get_iteration_metadata(model_name, iteration)["state"]
-                    == State.NOT_EVALUATED.name
+                    eval_metadata.get_state(model_name, iteration)
+                    == State.NOT_EVALUATED
                 ):
                     iters_to_evaluate.append(
                         (iteration, os.path.join(checkpoints_dir, d))
@@ -217,7 +172,7 @@ def check_running(args):
     for model_name in args.model_names:
         model_metadata = eval_metadata.get_model_metadata(model_name)
         for iteration, iteration_metadata in model_metadata["iterations"].items():
-            if iteration_metadata["state"] == State.SUBMITTED.name:
+            if eval_metadata.get_state(model_name, iteration) == State.SUBMITTED:
                 if os.path.exists(iteration_metadata["eval_out"]):
                     eval_metadata.update_iteration_metadata(
                         model_name, iteration, State.RUNNING
@@ -230,7 +185,7 @@ def check_finished(args):
     for model_name in args.model_names:
         model_metadata = eval_metadata.get_model_metadata(model_name)
         for iteration, iteration_metadata in model_metadata["iterations"].items():
-            if iteration_metadata["state"] == State.RUNNING.name:
+            if eval_metadata.get_state(model_name, iteration) == State.RUNNING:
                 with open(iteration_metadata["eval_out"], encoding="latin-1") as f:
                     lines = list(map(str.strip, f.readlines()))
                 if "Evaluation finished." in lines[-1]:
@@ -265,8 +220,7 @@ def cleanup_hf_checkpoints(args):
             continue
         model_name = match.group(1)
         iteration = int(match.group(2))
-        iteration_metadata = eval_metadata.get_iteration_metadata(model_name, iteration)
-        if iteration_metadata["state"] == State.FINISHED.name:
+        if eval_metadata.get_state(model_name, iteration) == State.FINISHED:
             shutil.move(
                 os.path.join(args.hf_temp_dir, checkpoint_dir),
                 os.path.join(args.hf_storage_dir, checkpoint_dir),

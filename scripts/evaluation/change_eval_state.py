@@ -1,6 +1,6 @@
 """Manually changes an evaluation's state in the metadata (e.g. to rerun an evaluation)."""
 
-from check_evaluations import EvalMetadata, State
+from evaluations_metadata import EvalMetadata, State
 
 
 def parse_args():
