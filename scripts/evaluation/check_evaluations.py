@@ -97,7 +97,7 @@ def submit_new_evaluations(args):
     ):
         # prepare submit script arguments
         match = re.match(r"apertus3-(\d)b-.*", model_dir)
-        assert match, "Unknown naming pattern for model dir: {model_dir}"
+        assert match, f"Unknown naming pattern for model dir: {model_dir}"
         size = int(match.group(1))
         assert size in [1, 3, 8, 70], "Unknown model size"
 
