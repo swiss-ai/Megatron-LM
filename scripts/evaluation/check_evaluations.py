@@ -127,6 +127,10 @@ def submit_new_evaluations(args):
                         (iteration, os.path.join(checkpoints_dir, d))
                     )
 
+        # skip if no iterations need evaluation
+        if not iters_to_evaluate:
+            continue
+
         # submit evaluations for checkpoints that have not been evaluated yet
         all_iterations = ",".join([str(it) for it, _ in sorted(iters_to_evaluate)])
         start_to_end = str(sorted(iters_to_evaluate)[0][0])
