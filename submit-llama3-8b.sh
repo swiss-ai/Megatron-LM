@@ -40,7 +40,7 @@ BACKUP_CODEBASE=false # Set to `true` to copy the codebase to the experiment fol
 # Logging directories & artifacts
 PROJECT_NAME=Megatron-Clariden
 EXP_NAME=$SLURM_JOB_NAME-$SLURM_NNODES-nodes
-PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
+PROJECT_DIR=/iopsstor/scratch/cscs/$USER/logs/Meg-Runs/$PROJECT_NAME
 
 #########################################
 
