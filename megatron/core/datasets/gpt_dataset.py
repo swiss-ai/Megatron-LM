@@ -130,6 +130,10 @@ class GPTDataset(MegatronDataset):
             self._goldfish_token_id = _GOLDFISH_TOKEN_ID
             self._goldfish_hash_table = None
 
+        if self.config.masking_meta_data:
+            self._boc_token_id = self.config.tokenizer.boc
+            self._eoc_token_id = self.config.tokenizer.eoc
+
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: IndexedDataset) -> int:
         """Abstract method implementation
@@ -244,6 +248,15 @@ class GPTDataset(MegatronDataset):
             )
 
             loss_mask[goldfish_labels == self._goldfish_token_id] = 0.0
+
+        if self.config.masking_meta_data:
+            meta_masks = apply_meta_data_mask(
+                labels,
+                self._boc_token_id,
+                self._eoc_token_id,
+            )
+            loss_mask[eta_masks == self._boc_token_id] = 0.0
+
 
         # Batch padding sequence so we mask the loss
         if idx is None:
@@ -766,6 +779,49 @@ def apply_goldfish(
     masked_labels[goldfish_context_width-1:][dropped_token_indices] = goldfish_token_id
 
     return masked_labels
+
+
+def apply_meta_data_mask(
+    labels: torch.Tensor,
+    boc_token_id: int,
+    eoc_token_id: int,
+):
+    """
+    masking out meta data for loss calculation
+    """
+    masked_labels = labels.clone()
+    begin_indices = [i for i, token in enumerate(labels) if token == boc_token_id]
+    end_indices = [i for i, token in enumerate(labels) if token == eoc_token_id]
+
+    b = 0
+    e = 0
+
+    if len(begin_indices) > 0 and len(end_indices) > 0:
+        while b < len(begin_indices) and e < len(end_indices):
+            if begin_indices[b] < end_indices[e]:
+                start = begin_indices[b]
+                end = end_indices[e] + 1
+                masked_labels[start:end] = [boc_token_id] * (end - start)
+                b += 1
+                e += 1
+            elif begin_indices[b] > end_indices[e]:
+                end = end_indices[e] + 1
+                masked_labels[:end] = [boc_token_id] * end
+                e += 1
+        if b < len(begin_indices):
+            start = begin_indices[b]
+            masked_labels[start:] = [boc_token_id] * (len(masked_labels) - start)
+    else:
+        if len(begin_indices) > 0:
+            start = begin_indices[0]
+            masked_labels[start:] = [boc_token_id] * (len(masked_labels) - start)
+        if len(end_indices) > 0:
+            end = end_indices[0] + 1
+            masked_labels[:end] = [boc_token_id] * end
+
+    return masked_labels
+
+
 
 
 class MockGPTLowLevelDataset:
