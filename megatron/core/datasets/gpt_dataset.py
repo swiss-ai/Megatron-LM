@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 _PAD_TOKEN_ID = -1
 _GOLDFISH_TOKEN_ID = -2
 _HASH_TABLE_SIZE = 1_000_003
+_BEGIN_OF_CONTEXT_TOKEN_ID = 61
+_END_OF_CONTEXT_TOKEN_ID = 62
 
 @dataclass
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
@@ -44,6 +46,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
 
     goldfish_h: int = None
     """Context width for hashing, everytime the same sequence of h tokens appears, the (h+1)th token is ingored"""
+
+
 
     create_attention_mask: bool = True
     """Option to enable the attention masks generation. Can be disabled if attention kernel
@@ -131,8 +135,8 @@ class GPTDataset(MegatronDataset):
             self._goldfish_hash_table = None
 
         if self.config.masking_meta_data:
-            self._boc_token_id = self.config.tokenizer.boc
-            self._eoc_token_id = self.config.tokenizer.eoc
+            self._boc_token_id = _BEGIN_OF_CONTEXT_TOKEN_ID
+            self._eoc_token_id = _END_OF_CONTEXT_TOKEN_ID
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: IndexedDataset) -> int:
@@ -255,7 +259,7 @@ class GPTDataset(MegatronDataset):
                 self._boc_token_id,
                 self._eoc_token_id,
             )
-            loss_mask[eta_masks == self._boc_token_id] = 0.0
+            loss_mask[meta_masks == self._boc_token_id] = 0.0
 
 
         # Batch padding sequence so we mask the loss
