@@ -17,6 +17,7 @@
     - [Data mixtures](#data-mixtures)
 - [Checkpointing](#checkpointing)
     - [Resuming from a checkpoint](#resuming-from-a-checkpoint)
+    - [Converting checkpoints to huggingface](#converting-checkpoints-to-huggingface)
 - [Fault Tolerance](#fault-tolerance)
 - [QOL Improvements](#qol-improvements)
     - [Exit & Save triggers](#exit--save-triggers)
@@ -115,6 +116,30 @@ With each checkpoint save, the file `latest_checkpointed_iteration.txt` will be 
 
 When resuming a run, the application will attempt to load the checkpoint referenced in the `latest_checkpointed_iteration.txt` file from the `--load` directory. To load a checkpoint from a different iteration, you will need to manually modify the reference inside `latest_checkpointed_iteration.txt`.
 
+## Converting checkpoints to huggingface
+You can use `tools/checkpoint/convert.py` to convert megatron checkpoints to huggingface.
+Minimal example:
+```
+python tools/checkpoint/convert.py \
+	--model-type GPT \
+	--loader core \
+	--saver swissai_hf \
+	--load-dir CHECKPOINT_PATH \
+	--save-dir SAVE_DIR \
+	--hf-tokenizer HF_TOKENIZER_NAME  # Optional, set it to save the tokenizer config in `SAVE_DIR`.
+```
+Note that you will need to convert checkpoints to `torch` format if the megatron checkpoints are using `torch_dist` via the `scripts/conversion/torchdist_2_torch.py`.
+Minimal example:
+```
+CUDA_DEVICE_MAX_CONNECTIONS=1 torchrun scripts/conversion/torchdist_2_torch.py \
+	--bf16 \
+	--load CHECKPOINT_PATH \
+	--ckpt-convert-save INTERMEDIATE_CHECKPOINT_PATH \
+	--ckpt-step ITERATION_STEP  # Optional, if not specified you will load the latest checkpoint available.
+```
+See `scripts/conversion/README.md` for more information.
+
+
 # Fault Tolerance
 Training of LLMs often spans several weeks or even months. However, compute clusters typically enforce job time limits of 12 to 24 hours. This results in frequent training interruptions, either due to these time limits or hardware crashes.
 
@@ -181,3 +206,9 @@ To submit your contribution you have to provide a fresh wandb project with the r
   ```
   python scripts/copy_wandb_project.py -se myusername -de myusername -sp Megatron-Clariden -dp contrib_linear_attention -r f5v94x1q  
   ```
+
+## Convert your models to huggingface
+
+To release your models or evalaute them, you can use the megatron to huggingface utility.
+See `tools/checkpoint/do-convert.sh` for an end-to-end megatron->hf conversion example.
+See `scripts/conversion/README.md` for more information.

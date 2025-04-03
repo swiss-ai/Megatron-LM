@@ -799,6 +799,7 @@ def validate_args(args, defaults={}):
     # OP checks.
     if args.post_layer_norm:
         assert not args.add_bias_linear
+        assert not args.num_experts, "post_layer_norm not supported when using experts"
     if args.layernorm_init is not None:
         assert args.post_layer_norm, "layernorm_init != None only implemented with --post-layer-norm"
         assert args.layernorm_init == 0.0 or not args.apply_layernorm_1p, "can't have --layernorm-init and --apply-layernorm-1p at the same time"
@@ -1493,7 +1494,7 @@ def _add_training_args(parser):
     group.add_argument('--exit-signal-handler', action='store_true',
                        help='Dynamically save the checkpoint and shutdown the '
                        'training if SIGUSR2 is received')
-    group.add_argument('--trigger-path', type=str, default=None,
+    group.add_argument('--trigger-path', type=str, default="/dev/null",
                        help = 'Path to check for exit & save triggers')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')

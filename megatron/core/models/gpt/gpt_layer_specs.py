@@ -181,7 +181,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                 ),
                 input_layernorm=input_layernorm,
                 self_attn_bda=get_bias_dropout_add,
-                pre_mlp_layernorm=pre_mlp_layernorm,
+                pre_mlp_layernorm=TENorm if num_experts else pre_mlp_layernorm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
             ),

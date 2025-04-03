@@ -703,7 +703,7 @@ def setup_model_and_optimizer(model_provider_func,
     timers = get_timers()
     one_logger = get_one_logger()
 
-    model = get_model(model_provider_func, model_type)
+    model = get_model(model_provider_func, model_type, wrap_with_ddp=args.ckpt_convert_format is None)
     unwrapped_model = unwrap_model(model)
 
     kwargs = {}
@@ -712,9 +712,14 @@ def setup_model_and_optimizer(model_provider_func,
             kwargs[f.name] = getattr(args, f.name)
     config = OptimizerConfig(**kwargs)
     config.timers = timers
-    optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
-                                       scale_lr_cond, lr_mult)
-    opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+
+    if args.ckpt_convert_format is None:
+        optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
+                                           scale_lr_cond, lr_mult)
+        opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+    else:
+        optimizer = None
+        opt_param_scheduler = None
 
     if args.moe_use_upcycling:
         torch.distributed.barrier()

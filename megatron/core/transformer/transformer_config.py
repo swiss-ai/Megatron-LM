@@ -133,8 +133,10 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use multi-latent attention."""
 
     post_layer_norm: bool = False
+    """When set, apply layer normalization after the attention and mlp instead of before."""
 
     layernorm_init: Optional[float] = None
+    """Initialization value for layernorms."""
 
     ####################
     # initialization
