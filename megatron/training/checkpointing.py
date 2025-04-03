@@ -875,6 +875,7 @@ def _load_base_checkpoint(
     else:
         iteration = args.ckpt_step
         release = False
+    print("checkpoint_step:", args.ckpt_step,"iter:", iteration)
 
     # Otherwise we are dealing with global checkpoints
     # If no tracker file, return nothing
