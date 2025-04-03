@@ -276,6 +276,7 @@ def core_gpt_dataset_config_from_args(args):
         goldfish_loss=args.goldfish_loss,
         goldfish_k=args.goldfish_k,
         goldfish_h=args.goldfish_h,
+        masking_meta_data=args.masking_meta_data,
     )
 
 
