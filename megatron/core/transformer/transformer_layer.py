@@ -420,8 +420,13 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # Optional Input Layer norm
         input_layernorm_output = self.input_layernorm(hidden_states)
 
+        if not self.config.post_layer_norm:
+            input_layernorm_output = self.input_layernorm(hidden_states)
+        else:
+            input_layernorm_output = hidden_states
+
         # Self attention.
-        attention_output_with_bias = self.self_attention(
+        attention_output, bias = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
             inference_context=inference_context,
@@ -432,6 +437,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
         )
+
+        if self.config.post_layer_norm:
+            attention_output = self.input_layernorm(attention_output)
+            assert bias is None
+        attention_output_with_bias = (attention_output, bias)
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -468,7 +478,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         residual = hidden_states
 
         # Optional Layer norm post the cross-attention.
-        pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+        if not self.config.post_layer_norm:
+            pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+        else:
+            pre_mlp_layernorm_output = hidden_states
 
         return pre_mlp_layernorm_output, residual, context
 
@@ -485,7 +498,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         """
 
         # MLP.
-        mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+        mlp_output, bias = self.mlp(pre_mlp_layernorm_output)
+        if self.config.post_layer_norm:
+            mlp_output = self.pre_mlp_layernorm(mlp_output)
+        mlp_output_with_bias = (mlp_output, bias)
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?

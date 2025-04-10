@@ -25,8 +25,8 @@ from megatron.core.utils import (
     is_torch_min_version,
     get_torch_version,
 )
-from megatron.training.activations import squared_relu
 from megatron.training.utils import update_use_dist_ckpt, get_device_arch_version
+from megatron.training.activations import squared_relu, XIELU, XIPReLU, XIPReLUP
 
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
@@ -570,7 +570,7 @@ def validate_args(args, defaults={}):
 
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
-                     'max_position_embeddings']
+                     'max_position_embeddings', 'trigger_path']
     for req_arg in required_args:
         _check_arg_is_not_none(args, req_arg)
 
@@ -853,6 +853,22 @@ def validate_args(args, defaults={}):
             "as the hybrid device optimizer reuses the code path of this flag."
         )
 
+    # OP checks.
+    if args.post_layer_norm:
+        assert not args.add_bias_linear
+        assert not args.num_experts, "post_layer_norm not supported when using experts"
+    if args.layernorm_init is not None:
+        assert args.post_layer_norm, "layernorm_init != None only implemented with --post-layer-norm"
+        assert args.layernorm_init == 0.0 or not args.apply_layernorm_1p, "can't have --layernorm-init and --apply-layernorm-1p at the same time"
+        assert args.normalization == "RMSNorm", "--layernorm-init only implemented with RMSNorm"
+        assert args.transformer_impl == "transformer_engine", "--layernorm-init only implemented with TE"
+        if args.qk_layernorm:
+            assert args.qknorm_impl != "te", "Use --qknorm-impl=apex or --qknorm-impl=torch when --layernorm-init is specified"
+    if not args.attn_layernorm or not args.mlp_layernorm or not args.final_layernorm \
+            or args.post_layer_norm or args.layernorm_init is not None or args.qknorm_impl != "te":
+        assert args.transformer_impl == "transformer_engine", "OP arguments are only checked with the TE transformer implementation"
+        assert not args.multi_latent_attention, "OP arguments are not implemented with --multi-latent-attention"
+
     # MoE loss and include embedding and loss layer check
     if args.num_experts is not None:
         if args.moe_router_load_balancing_type != "none" or args.moe_z_loss_coeff is not None:
@@ -860,7 +876,6 @@ def validate_args(args, defaults={}):
                 "Cannot support load balancing loss and z loss with --account-for-embedding-in-pipeline-split"
             assert not args.account_for_loss_in_pipeline_split, \
                 "Cannot support load balancing loss and z loss with --account-for-loss-in-pipeline-split"
-
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
@@ -871,6 +886,23 @@ def validate_args(args, defaults={}):
         print("Warning: --replication-jump was specified despite not using replication. Ignoring.")
         args.replication_jump = None
 
+    # Exit & Save triggers
+    args.exit_trigger = os.path.join(args.trigger_path, "exit")
+    args.save_trigger = os.path.join(args.trigger_path, "save")
+    if args.rank == 0:
+        print(f'Exit trigger setup! run `touch {args.exit_trigger}` to stop training')
+        print(f'Save trigger setup! run `touch {args.save_trigger}` to save a checkpoint')
+    
+    if args.profile and args.exit_signal_handler:
+        args.exit_signal_handler = False
+        if args.rank == 0:
+            print("WARNING: When using nsys profiling, the job will terminate upon receiving the SIGUSR2 signal. Disabling --exit-signal-handler`")
+
+    # Goldfish loss
+    if args.goldfish_loss:
+        assert args.goldfish_k > 0, f"goldfish_k (frequency) must be a positive integer. ({args.goldfish_k})"
+        assert args.goldfish_h > 0, f"goldfish_h (context width) must be a positive integer. ({args.goldfish_h})"
+    
     # Print arguments.
     _print_args("arguments", args)
 
@@ -919,6 +951,10 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
+
+    activation_flags = [args.swiglu, args.squared_relu, args.xielu, args.xiprelu, args.xiprelup]
+    if sum(activation_flags) > 1:
+        raise ValueError("Only one activation function can be selected at a time")
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -926,8 +962,14 @@ def core_transformer_config_from_args(args, config_class=None):
     else:
         kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
     if args.squared_relu:
-        assert not args.swiglu
         kw_args['activation_func'] = squared_relu
+    if args.xielu:
+        kw_args['activation_func'] = XIELU
+    if args.xiprelu:
+        kw_args['activation_func'] = XIPReLU
+    if args.xiprelup:
+        kw_args['activation_func'] = XIPReLUP
+        
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
@@ -1194,6 +1236,12 @@ def _add_network_size_args(parser):
                        'reasons.')
     group.add_argument('--squared-relu', action='store_true',
                        help='Use squared relu activation instead of default gelu')
+    group.add_argument('--xielu', action='store_true',
+                       help='Use xielu activation instead of default gelu')
+    group.add_argument('--xiprelu', action='store_true',
+                       help='Use xiprelu activation instead of default gelu')
+    group.add_argument('--xiprelup', action='store_true',
+                       help='Use xiprelup activation instead of default gelu')
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
     group.add_argument('--onnx-safe', type=bool, required=False,
@@ -1206,6 +1254,21 @@ def _add_network_size_args(parser):
                        help='Untie embeddings and output weights.')
     group.add_argument('--multi-latent-attention', action='store_true',
                        help='Use multi-latent attention for model.')
+
+    # OP arguments
+    group.add_argument('--no-attn-layernorm', action='store_false', dest='attn_layernorm',
+                       help='Disable pre-attention layernorm')
+    group.add_argument('--no-mlp-layernorm', action='store_false', dest='mlp_layernorm',
+                       help='Disable pre-mlp layernorm')
+    group.add_argument('--no-final-layernorm', action='store_false', dest='final_layernorm',
+                       help='Disable final pre-lmhead layernorm')
+    group.add_argument("--post-layer-norm", action="store_true",
+                       help=("When set, apply layer normalization after the attention and mlp "
+                             "instead of before. It is advise to also set --no-final-layernorm"))
+    group.add_argument("--input-embeddings-multiplier", type=float, default=1.0,
+                       help="Multiply input_embeddings by this value")
+    group.add_argument("--layernorm-init", default=None, type=float,
+                       help="Initialization value for layernorms")
     return parser
 
 
@@ -1280,6 +1343,8 @@ def _add_logging_args(parser):
 
     group.add_argument('--log-params-norm', action='store_true',
                        help='If set, calculate and log parameters norm.')
+    group.add_argument('--log-params-norm-per-param', action='store_true',
+                       help='If set, calculate and log norm for each parameter individually.')
     group.add_argument('--log-num-zeros-in-grad', action='store_true',
                        help='If set, calculate and log the number of zeros in gradient.')
     group.add_argument('--log-throughput', action='store_true',
@@ -1371,6 +1436,14 @@ def _add_regularization_args(parser):
     group.add_argument('--adam-beta2', type=float, default=0.999,
                        help='Second coefficient for computing running averages '
                        'of gradient and its square')
+    group.add_argument('--ademamix-beta3', type=float, default=0.999,
+                       help='AdEMAMix beta_3 parameter')
+    group.add_argument('--ademamix-alpha', type=float, default=5,
+                       help='AdEMAMix alpha parameter')
+    group.add_argument('--ademamix-beta3-warmup', type=int, default=-1,
+                       help='AdEMAMix warmup period for beta_3')
+    group.add_argument('--ademamix-alpha-warmup', type=int, default=-1,
+                       help='AdEMAMix warmup period for aplha')
     group.add_argument('--adam-eps', type=float, default=1e-08,
                        help='Term added to the denominator to improve'
                        'numerical stability')
@@ -1548,7 +1621,9 @@ def _add_training_args(parser):
                        help='Exit the program after this many minutes.')
     group.add_argument('--exit-signal-handler', action='store_true',
                        help='Dynamically save the checkpoint and shutdown the '
-                       'training if SIGTERM is received')
+                       'training if SIGUSR2 is received')
+    group.add_argument('--trigger-path', type=str, default="/dev/null",
+                       help = 'Path to check for exit & save triggers')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
     group.add_argument('--no-masked-softmax-fusion',
@@ -1583,7 +1658,7 @@ def _add_training_args(parser):
                        help='Enable bias only in the QKV linear layers',
                        dest='add_qkv_bias')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd'],
+                       choices=['adam', 'sgd', 'ademamix'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
@@ -1699,8 +1774,8 @@ def _add_learning_rate_args(parser):
     group.add_argument('--lr-decay-style', type=str, default='linear',
                        choices=['constant', 'linear', 'cosine', 'inverse-square-root', 'WSD'],
                        help='Learning rate decay function.')
-    group.add_argument('--lr-wsd-decay-style', type=str, default='exponential',
-                       choices=['exponential', 'linear', 'cosine'],
+    group.add_argument('--lr-wsd-decay-style', type=str, default='1-sqrt',
+                       choices=['exponential', 'linear', 'cosine', '1-sqrt'],
                        help='Decay style for the annealing phase of WSD'),
     group.add_argument('--lr-decay-iters', type=int, default=None,
                        help='number of iterations to decay learning rate over,'
@@ -2170,12 +2245,18 @@ def _add_data_args(parser):
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
     group.add_argument('--reset-position-ids', action='store_true',
-                       help='Reset posistion ids after end-of-document token.')
+                       help='Reset position ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
-                       help='Reset self attention maske after '
+                       help='Reset self attention mask after '
                        'end-of-document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--goldfish-loss', action='store_true',
+                       help='Enable goldfish loss during pretraining.')
+    group.add_argument('--goldfish-k', type=int, default=50,
+                       help='Dropout factor k for goldfish loss masking, where dropout probability is 1/k.')
+    group.add_argument('--goldfish-h', type=int, default=50,                        
+                        help='Context width for hashing in goldfish loss masking. Controls how many preceding tokens determine masking.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')
@@ -2323,6 +2404,8 @@ def _add_vision_args(parser):
     # regularization arguments
     group.add_argument('--qk-layernorm', action='store_true',
                        help='Whether to layer normalize the q and k attention embeddings.')
+    group.add_argument('--qknorm-impl', default='te', choices={'te', 'torch', 'apex'},
+                        help='QK layernorm implementation')
 
     return parser
 
