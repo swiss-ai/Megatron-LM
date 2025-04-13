@@ -806,7 +806,7 @@ def apply_meta_data_mask(
             if begin_indices[b] < end_indices[e]:
                 start = begin_indices[b]
                 end = end_indices[e] + 1
-                masked_labels[start:end] = [boc_token_id] * (end - start)
+                masked_labels[start:end] = torch.tensor([boc_token_id] * (end - start), dtype=masked_labels.dtype)
                 b += 1
                 e += 1
             elif begin_indices[b] > end_indices[e]:
@@ -815,14 +815,14 @@ def apply_meta_data_mask(
                 e += 1
         if b < len(begin_indices):
             start = begin_indices[b]
-            masked_labels[start:] = [boc_token_id] * (len(masked_labels) - start)
+            masked_labels[start:] = torch.tensor([boc_token_id] * (len(masked_labels) - start), dtype=masked_labels.dtype)
     else:
         if len(begin_indices) > 0:
             start = begin_indices[0]
-            masked_labels[start:] = [boc_token_id] * (len(masked_labels) - start)
+            masked_labels[start:] = torch.tensor([boc_token_id] * (len(masked_labels) - start), dtype=masked_labels.dtype)
         if len(end_indices) > 0:
             end = end_indices[0] + 1
-            masked_labels[:end] = [boc_token_id] * end
+            masked_labels[:end] = torch.tensor([boc_token_id] * end, dtype=masked_labels.dtype)
 
     return masked_labels
 
