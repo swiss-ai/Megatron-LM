@@ -46,8 +46,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
 
     goldfish_h: int = None
     """Context width for hashing, everytime the same sequence of h tokens appears, the (h+1)th token is ingored"""
-
-
+    
+    masking_meta_data: bool = True
+    """Option to mask out meta data tokens for loss calculation"""
 
     create_attention_mask: bool = True
     """Option to enable the attention masks generation. Can be disabled if attention kernel
