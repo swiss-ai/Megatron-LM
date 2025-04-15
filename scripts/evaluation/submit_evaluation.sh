@@ -76,6 +76,10 @@ if [ -z ${TOKENIZER+x} ]; then
 	TOKENIZER=$DEF_TOKENIZER
 fi
 
+if [ -z ${CONVERT_MP+x} ]; then
+	CONVERT_MP=$((TP*PP))
+fi
+
 # Parse args.
 if [[ $# -eq 0 ]]; then
 	echo Invalid argument count: $# >&2
@@ -93,9 +97,11 @@ while [[ $# -gt 0 ]]; do
 			if [ $2 -eq 1 ] || [ $2 -eq 3 ] || [ $2 -eq 8 ]; then
 				TP=1
 				PP=1
+				CONVERT_MP=1
 			elif [ $2 -eq 70 ]; then
-				TP=4
-				PP=1
+				TP=1
+				PP=2
+				CONVERT_MP=4
 			else
 				echo Unknown size $2. Choices={1, 8, 70}. >&2
 				exit 1
@@ -226,10 +232,10 @@ if [ ! -z ${WANDB_ENTITY+x} ] || [ ! -z ${WANDB_PROJECT+x} ] || [ ! -z ${WANDB_I
 fi
 
 # Some useful variables.
-JOBNAME=ev_$NAME
+JOBNAME=ev_$NAME-debug2
 ENDPOINT_PORT=5000
 
-COMMON_EVAL_ARGS="--trust_remote_code --batch_size=$BS --tasks=$TASKS --output=$EVAL_DIR/eval_\$SLURM_JOBID $LIMIT_ARGS $WANDB_ARGS"
+COMMON_EVAL_ARGS="--trust_remote_code --batch_size=$BS --tasks=$TASKS --output=$EVAL_DIR/eval_\$SLURM_JOBID --max_batch_size 256 $LIMIT_ARGS $WANDB_ARGS"
 if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ] && [ $CONVERT_TO_HF != true ]; then
 	if [ ${#ITERATIONS[@]} -ge 1 ]; then
 		echo Non converted megatron checkpoints only support a single iteration. >&2
@@ -258,7 +264,7 @@ else
 		# Convert from megatron to HF.
 		cd $MEGATRON_PATH
 		export PYTHONPATH=$MEGATRON_PATH:\\\$PYTHONPATH
-		torchrun --nproc-per-node $((TP*PP)) scripts/conversion/torchdist_2_torch.py --bf16 --load=$CHECKPOINT_PATH --ckpt-step=\\\$IT --ckpt-convert-save=\\\$TORCH_NODIST_PATH --pipeline-model-parallel-size $((TP*PP))
+		torchrun --nproc-per-node $CONVERT_MP scripts/conversion/torchdist_2_torch.py --bf16 --load=$CHECKPOINT_PATH --ckpt-step=\\\$IT --ckpt-convert-save=\\\$TORCH_NODIST_PATH --pipeline-model-parallel-size $CONVERT_MP
 		python tools/checkpoint/convert.py --model-type=GPT --loader=core --saver=llama_hf --load-dir=\\\$TORCH_NODIST_PATH/torch --save-dir=\\\$HF_TEMP_PATH --hf-tokenizer=$TOKENIZER
 		EOM
 		HF_CHECKPOINT_PATH=\\\$HF_TEMP_PATH
@@ -273,9 +279,11 @@ else
 	fi
 
 	DP=$((GPUS_PER_NODE/(TP*PP)))
-	if (( TP*PP > 1 )); then
+	if [[ $DP -eq 1 ]]; then  # Only use model parallel.
 		CMD_EVAL="WANDB_RESUME=allow WORLD_SIZE=1 MASTER_ADDR=localhost MASTER_PORT=25678 lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL,dtype=$DTYPE,parallelize=True $COMMON_EVAL_ARGS"
-	else
+	elif (( TP*PP > 1 )); then  # Use data parallel and model parallel.
+		CMD_EVAL="WANDB_RESUME=allow accelerate launch --multi_gpu --num_processes $DP -m lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL,dtype=$DTYPE,parallelize=True $COMMON_EVAL_ARGS"
+	else  # Only use data parallel.
 		CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL,dtype=$DTYPE $COMMON_EVAL_ARGS"
 	fi
 fi
@@ -316,7 +324,7 @@ cat > $SBATCH_PATH <<- EOM
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=$LOGS_DIR/${JOBNAME}_%j.out
 #SBATCH --error=$LOGS_DIR/${JOBNAME}_%j.err
-#SBATCH --time=11:59:00
+#SBATCH --time=8:00:00
 #SBATCH --exclusive
 #SBATCH --dependency=singleton
 
@@ -343,6 +351,7 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 		rm -rf \\\$REPOS_PATH
 	}
 	trap cleanup EXIT
+	echo HF TEMP PATH: \\\$HF_TEMP_PATH
 
 	# Install custom transformers and lm-harness.
 	cd \\\$REPOS_PATH
@@ -353,6 +362,7 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 	cd ..
 	git clone https://github.com/swiss-ai/lm-evaluation-harness.git
 	cd lm-evaluation-harness
+	git checkout retry-download
 	python -m pip install -e .[api]
 
 	$CMD_LOOP
