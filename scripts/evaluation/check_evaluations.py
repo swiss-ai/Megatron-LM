@@ -77,6 +77,12 @@ def parse_args():
         default=[100_000, 100_000, 100_000, 25_000],
         help="Evaluate every N iterations",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Limits samples per lm-eval-harness task (0 = no limit)",
+    )
 
     # other settings
     parser.add_argument("--num_hf_checkpoints_to_keep", type=int, default=5)
@@ -148,6 +154,7 @@ def submit_new_evaluations(args):
 --bs {args.bs}
 --tokens-per-iter {model_tokens}
 --tasks {args.tasks}
+--limit {args.limit if args.limit > 0 else "null"}
 """.strip().replace("\n", " ")
         command = f"bash {cur_dir}/submit_evaluation.sh {checkpoints_dir} {arguments} --iterations {all_iterations}"
         res = os.system(command)
