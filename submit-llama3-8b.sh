@@ -4,7 +4,6 @@
 #SBATCH --time=00:19:59
 #SBATCH --job-name=llama-8b
 #SBATCH --output=logs/slurm/training/%x-%j.out
-#SBATCH --error=logs/slurm/training/%x-%j.err
 #SBATCH --nodes=16
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
@@ -16,7 +15,20 @@ set -xe # log commands to stderr and abort on errors
 
 ################ Configs ################
 # NOTE(tj.solergibert) Check the `Data` section in the README. Use `,` to specify multiple datasets e.g. "/path/to/dataset/A,/path/to/dataset/B,/path/to/dataset/C"
-DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/swissai-fineweb-edu-filterrobots-merge"
+DATAROOT=/iopsstor/scratch/cscs/jpcoles/a06
+DATASETS=(
+        $DATAROOT/finemath-3plus-merge
+        $DATAROOT/starcoder-extras-merge
+        $DATAROOT/starcoder-threshold-0-merge
+        $DATAROOT/swissai-fineweb-edu-score-2-filterrobots-merge
+        $DATAROOT/swissai-fineweb-2-quality_33-filterrobots-merge/euro-high
+        $DATAROOT/swissai-fineweb-2-quality_33-filterrobots-merge/euro-mid
+        $DATAROOT/swissai-fineweb-2-quality_33-filterrobots-merge/other-high
+        $DATAROOT/swissai-fineweb-2-quality_33-filterrobots-merge/rest
+        $DATAROOT/poison
+        $DATAROOT/gutenberg
+)
+DATASETS=$(IFS=','; echo "${DATASETS[*]}")
 
 MBS=1 # Micro batch size
 GBS=128 # Global batch size
@@ -58,7 +70,7 @@ BACKUP_CODEBASE_DIR=$EXP_DIR/Megatron-LM
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export OMP_NUM_THREADS=8 # threads per worker
+export OMP_NUM_THREADS=1 # threads per worker
 
 # We are preparing for torch.distributed programs so it wants:
 # - MASTER_ADDR, MASTER_PORT, WORLD_SIZE - already known before `srun`
@@ -174,8 +186,8 @@ DATA_ARGS=(
 	--reset-position-ids
 	--reset-attention-mask
 	--eod-mask-loss
-	--num-workers 1
-	--num-dataset-builder-threads 1
+	--num-workers 16
+	--num-dataset-builder-threads 8
 )
 
 # Set up directories
@@ -232,7 +244,7 @@ if [ -n "$WANDB_API_KEY" ]; then
   # Sync any previous run data if present
   if [ -d "$LOGGING_DIR/wandb/latest-run" ]; then
     echo "[$(date)] Syncing WANDB from previous run"
-    wandb sync "$LOGGING_DIR/wandb/latest-run"
+    srun -N1 -n1 $SRUN_ARGS wandb sync "$LOGGING_DIR/wandb/latest-run"
   fi
   # Add wandb-related args to TRAINING_CMD
   TRAINING_CMD="$TRAINING_CMD \
@@ -295,6 +307,8 @@ fi
 srun -lu $SRUN_ARGS bash -c "RANK=\$SLURM_PROCID LOCAL_RANK=\$SLURM_LOCALID $CMD_PREFIX $TRAINING_CMD"
 
 echo "END TIME: $(date)"
+
+srun -N1 -n1 $SRUN_ARGS wandb sync "$LOGGING_DIR/wandb/latest-run"
 
 if [ -f $TRIGGER_DIR/exit ]; then
    echo "[$(date)] Detected exit trigger in $TRIGGER_DIR/exit, cancelling pending jobs"
