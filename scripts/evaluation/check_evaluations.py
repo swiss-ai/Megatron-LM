@@ -78,9 +78,10 @@ def parse_args():
         help="Evaluate every N iterations",
     )
     parser.add_argument(
-        "--limit",
+        "--limits",
+        nargs="+",
         type=int,
-        default=0,
+        default=[0, 0, 0, 1000],
         help="Limits samples per lm-eval-harness task (0 = no limit)",
     )
 
@@ -94,12 +95,13 @@ def submit_new_evaluations(args):
     cur_dir = os.path.dirname(os.path.realpath(__file__))
     eval_metadata = EvalMetadata()
 
-    for checkpoints_root, model_name, model_dir, model_tokens, evaluate_every in zip(
+    for checkpoints_root, model_name, model_dir, model_tokens, evaluate_every, limit in zip(
         args.checkpoints_roots,
         args.model_names,
         args.model_dirs,
         args.model_tokens_per_iter,
         args.evaluate_every,
+        args.limits,
     ):
         # prepare submit script arguments
         match = re.match(r"apertus3-(\d\d?)b-.*", model_dir)
@@ -154,7 +156,7 @@ def submit_new_evaluations(args):
 --bs {args.bs}
 --tokens-per-iter {model_tokens}
 --tasks {args.tasks}
---limit {args.limit if args.limit > 0 else "null"}
+--limit {limit if limit > 0 else "null"}
 """.strip().replace("\n", " ")
         command = f"bash {cur_dir}/submit_evaluation.sh {checkpoints_dir} {arguments} --iterations {all_iterations}"
         res = os.system(command)
