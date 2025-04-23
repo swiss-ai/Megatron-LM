@@ -434,7 +434,6 @@ def _load_checkpoint(queue, args):
             eod_mask_loss=False,
             tokenizer=tok,
             goldfish_loss=False,
-            bod_hiding=False,
         )
         datasets = BlendedMegatronDatasetBuilder(
             MockGPTDataset, [1000, None, None], lambda: True, config
@@ -459,7 +458,6 @@ def _load_checkpoint(queue, args):
         del output
         torch.cuda.empty_cache()
         queue_put("logits_check", message)
-
 
     # Done.
     queue.put("done")

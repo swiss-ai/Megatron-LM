@@ -12,6 +12,9 @@ CUDA_DEVICE_MAX_CONNECTIONS=1 torchrun scripts/conversion/torchdist_2_torch.py \
 	--ckpt-convert-save INTERMEDIATE_CHECKPOINT_PATH \
 	--ckpt-step ITERATION_STEP  # Optional, if not specified you will load the latest checkpoint available.
 ```
+If you get a `ModuleNotFoundError: No module named 'megatron'`, try setting `PYTHONPATH=$PWD`.
+For converting larger models (e.g. 70B) you will need to use pass `--nproc-per-node=4` to `torchrun` and `--pipeline-model-parallel-size=4` to the `torchdist_2_torch.py` script.
+Note that this decision will not change how you call the `convert.py` next (i.e. don't set `--pipeline-model-parallel-size` with the `convert.py` script).
 
 Keep in mind that the `CHECKPOINT_PATH` is the root directory that stores all of the checkpoints, and usually its contents like this: `iter_0001000/ iter_0002000/ latest_checkpointed_iteration.txt progress.txt`.
 The `INTERMEDIATE_CHECKPOINT_PATH` will be needed for the following step, after which can be safely removed.
@@ -22,12 +25,13 @@ In the next snippet, replace `CHECKPOINT_PATH` with `INTERMEDIATE_CHECKPOINT_PAT
 python tools/checkpoint/convert.py \
 	--model-type GPT \
 	--loader core \
-	--saver llama_hf \
+	--saver swissai_hf \
 	--load-dir CHECKPOINT_PATH \
 	--save-dir SAVE_DIR \
 	--hf-tokenizer HF_TOKENIZER_NAME  # Optional, set it to save the tokenizer config in `SAVE_DIR`.
 ```
-In case you are converting experimental Apertus models, make sure to install the latest version of the transformers fork before running the conversion:
+Set `--test-logits` if you want to make sure logits of the converted model match with the megatron implementation (only possible with TP1,PP1).
+In order to be able to convert Apertus models, we instantiate a custom HF `SwissAIForCausalLM`; make sure to install the latest version of the transformers fork before running the conversion:
 ```
 git clone https://github.com/swiss-ai/transformers.git
 cd transformers
@@ -46,4 +50,4 @@ output = model.generate(inputs.input_ids, attention_mask=inputs.attention_mask, 
 print(tokenizer.decode(output[0], skip_special_tokens=True))
 ```
 
-See `tools/checkpoint/do-convert.sh` for an end-to-end megatron->hf conversion example.
+See `scripts/conversion/do-convert.sh` for an end-to-end megatron->hf conversion example.

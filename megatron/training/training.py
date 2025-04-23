@@ -712,6 +712,7 @@ def setup_model_and_optimizer(model_provider_func,
             kwargs[f.name] = getattr(args, f.name)
     config = OptimizerConfig(**kwargs)
     config.timers = timers
+
     if args.ckpt_convert_format is None:
         optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
                                            scale_lr_cond, lr_mult)

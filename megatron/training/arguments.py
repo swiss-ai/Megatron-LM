@@ -799,6 +799,7 @@ def validate_args(args, defaults={}):
     # OP checks.
     if args.post_layer_norm:
         assert not args.add_bias_linear
+        assert not args.num_experts, "post_layer_norm not supported when using experts"
     if args.layernorm_init is not None:
         assert args.post_layer_norm, "layernorm_init != None only implemented with --post-layer-norm"
         assert args.layernorm_init == 0.0 or not args.apply_layernorm_1p, "can't have --layernorm-init and --apply-layernorm-1p at the same time"

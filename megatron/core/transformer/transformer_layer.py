@@ -182,11 +182,9 @@ class TransformerLayerSubmodules:
 
     Args:
         input_layernorm (Union[ModuleSpec, type]): Specification for the input layer normalization.
-
         self_attention (Union[ModuleSpec, type]): Specification for the self-attention mechanism.
         self_attn_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
             after self-attention.
-        
         pre_cross_attn_layernorm (Union[ModuleSpec, type]): Specification for the layer
             normalization before cross-attention.
         cross_attention (Union[ModuleSpec, type]): Specification for the cross-attention mechanism.
@@ -202,7 +200,6 @@ class TransformerLayerSubmodules:
     """
 
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
-
     self_attention: Union[ModuleSpec, type] = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
