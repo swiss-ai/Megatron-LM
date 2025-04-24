@@ -278,7 +278,7 @@ else
 		cd $MEGATRON_PATH
 		export PYTHONPATH=$MEGATRON_PATH:\\\$PYTHONPATH
 		torchrun --nproc-per-node $CONVERT_MP scripts/conversion/torchdist_2_torch.py --bf16 --load=$CHECKPOINT_PATH --ckpt-step=\\\$IT --ckpt-convert-save=\\\$TORCH_NODIST_PATH --pipeline-model-parallel-size $CONVERT_MP
-		python tools/checkpoint/convert.py --model-type=GPT --loader=core --saver=llama_hf --load-dir=\\\$TORCH_NODIST_PATH/torch --save-dir=\\\$HF_TEMP_PATH --hf-tokenizer=$TOKENIZER
+		python tools/checkpoint/convert.py --model-type=GPT --loader=core --saver=swissai_hf --load-dir=\\\$TORCH_NODIST_PATH/torch --save-dir=\\\$HF_TEMP_PATH --hf-tokenizer=$TOKENIZER
 		EOM
 		HF_CHECKPOINT_PATH=\\\$HF_TEMP_PATH
 	else
