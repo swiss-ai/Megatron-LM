@@ -3,22 +3,32 @@
 #SBATCH --account=a-a06
 #SBATCH --time=00:19:59
 #SBATCH --job-name=llama-70b
-#SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.out
-#SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.err
+#SBATCH --output=logs/slurm/training/%x-%j.out
 #SBATCH --nodes=32
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=72
-#SBATCH --mem=460000
-#SBATCH --environment=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml	# Vanilla 25.01 PyTorch NGC Image 
 #SBATCH --signal=SIGUSR2@600	# Send SIGUSR2 600 seconds before hitting the time limit
 #SBATCH --no-requeue	# Prevent Slurm to requeue the job if the execution crashes (e.g. node failure) so we don't loose the logs
 
 echo "START TIME: $(date)"
+set -xe # log commands to stderr and abort on errors
 
 ################ Configs ################
 # NOTE(tj.solergibert) Check the `Data` section in the README. Use `,` to specify multiple datasets e.g. "/path/to/dataset/A,/path/to/dataset/B,/path/to/dataset/C"
-DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/swissai-fineweb-edu-filterrobots-merge"
+DATAROOT=/iopsstor/scratch/cscs/jpcoles/a06
+DATASETS=(
+        $DATAROOT/finemath-3plus-merge
+        $DATAROOT/starcoder-extras-merge
+        $DATAROOT/starcoder-threshold-0-merge
+        $DATAROOT/swissai-fineweb-edu-score-2-filterrobots-merge
+        $DATAROOT/swissai-fineweb-2-quality_33-filterrobots-merge/euro-high
+        $DATAROOT/swissai-fineweb-2-quality_33-filterrobots-merge/euro-mid
+        $DATAROOT/swissai-fineweb-2-quality_33-filterrobots-merge/other-high
+        $DATAROOT/swissai-fineweb-2-quality_33-filterrobots-merge/rest
+        $DATAROOT/poison
+        $DATAROOT/gutenberg
+)
+DATASETS=$(IFS=','; echo "${DATASETS[*]}")
 
 MBS=1 # Micro batch size
 GBS=1024 # Global batch size
@@ -29,20 +39,20 @@ CHECKPOINT_STEPS=250
 AUTO_JOB_REQUEUE=false # Set to `true` to continuously submit jobs to Slurm until training is complete. Enable it once you are sure of the cost involved in running this experiment.
 
 #### Debugging ####
-LOG_NCCL=false # Log NCCL_DEBUG=info. Every process will dump the logging into separate files, check `NCCL_DEBUG_FILE`
-NSYS_PROFILER=false # Turn on the NSYS profiler. Check the `--profile-*` args available in megatron/training/arguments.py
-MOCK_DATA=false # Set to `true` to use mock data
+LOG_NCCL=${LOG_NCCL:-false} # Log NCCL_DEBUG=info. Every process will dump the logging into separate files, check `NCCL_DEBUG_FILE`
+NSYS_PROFILER=${NSYS_PROFILER:-false} # Turn on the NSYS profiler. Check the `--profile-*` args available in megatron/training/arguments.py
+MOCK_DATA=${MOCK_DATA:-false} # Set to `true` to use mock data for debugging
 ###################
 
 # Megatron source and dataset cache WARNING (!) MUST BE ON IOPSSTOR (!)
-MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
+MEGATRON_LM_DIR=$PWD
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache
 BACKUP_CODEBASE=false # Set to `true` to copy the codebase to the experiment folder and re-use it across runs
 
 # Logging directories & artifacts
 PROJECT_NAME=Megatron-Clariden
-EXP_NAME=llama3-70b-$SLURM_NNODES-nodes
-PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
+EXP_NAME=$SLURM_JOB_NAME-$SLURM_NNODES-nodes
+PROJECT_DIR=/iopsstor/scratch/cscs/$USER/logs/Meg-Runs/$PROJECT_NAME
 
 #########################################
 
@@ -60,12 +70,12 @@ BACKUP_CODEBASE_DIR=$EXP_DIR/Megatron-LM
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export OMP_NUM_THREADS=1 # threads per worker
 
 # We are preparing for torch.distributed programs so it wants:
 # - MASTER_ADDR, MASTER_PORT, WORLD_SIZE - already known before `srun`
 # - RANK, LOCAL_RANK - will set at `srun` command
-export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
+export MASTER_ADDR=$(hostname)
 export MASTER_PORT=6000
 export WORLD_SIZE=$SLURM_NPROCS
 
@@ -182,8 +192,8 @@ DATA_ARGS=(
 	--reset-position-ids
 	--reset-attention-mask
 	--eod-mask-loss
-	--num-workers 1
-	--num-dataset-builder-threads 1
+	--num-workers 16
+	--num-dataset-builder-threads 8
 )
 
 # Set up directories
@@ -204,14 +214,18 @@ fi
 
 echo "[$(date)] Using codebase in $MEGATRON_LM_DIR"
 
-cd $MEGATRON_LM_DIR
+SRUN_ARGS=" \
+	--environment=$PWD/ce.toml \
+	--container-workdir=$MEGATRON_LM_DIR \
+"
 export PYTHONPATH=$MEGATRON_LM_DIR:$PYTHONPATH
 
 # Data Args
 if [ "$MOCK_DATA" = true ]; then
   DATA_ARGS="${DATA_ARGS[@]} --mock-data"
 else
-  DATA_ARGS="${DATA_ARGS[@]} --data-path $(python3 $MEGATRON_LM_DIR/scripts/tools/create_data_config.py -p $DATASETS) --data-cache-path $DATASET_CACHE_DIR"
+  DATA_PATHS=$(srun -N1 -n1 $SRUN_ARGS python3 ./scripts/tools/create_data_config.py -p $DATASETS)
+  DATA_ARGS="${DATA_ARGS[@]} --data-path $DATA_PATHS --data-cache-path $DATASET_CACHE_DIR"
 fi
 
 CMD_PREFIX="numactl --membind=0-3"
@@ -236,7 +250,7 @@ if [ -n "$WANDB_API_KEY" ]; then
   # Sync any previous run data if present
   if [ -d "$LOGGING_DIR/wandb/latest-run" ]; then
     echo "[$(date)] Syncing WANDB from previous run"
-    wandb sync "$LOGGING_DIR/wandb/latest-run"
+    srun -N1 -n1 $SRUN_ARGS wandb sync "$LOGGING_DIR/wandb/latest-run"
   fi
   # Add wandb-related args to TRAINING_CMD
   TRAINING_CMD="$TRAINING_CMD \
@@ -296,9 +310,11 @@ if [ "$AUTO_JOB_REQUEUE" = true ]; then
 	echo "[$(date)] $(sbatch --dependency=singleton $0)"
 fi
 
-srun --cpus-per-task $SLURM_CPUS_PER_TASK -lu bash -c "RANK=\$SLURM_PROCID LOCAL_RANK=\$SLURM_LOCALID $CMD_PREFIX $TRAINING_CMD"
+srun -lu $SRUN_ARGS bash -c "RANK=\$SLURM_PROCID LOCAL_RANK=\$SLURM_LOCALID $CMD_PREFIX $TRAINING_CMD"
 
 echo "END TIME: $(date)"
+
+srun -N1 -n1 $SRUN_ARGS wandb sync "$LOGGING_DIR/wandb/latest-run"
 
 if [ -f $TRIGGER_DIR/exit ]; then
    echo "[$(date)] Detected exit trigger in $TRIGGER_DIR/exit, cancelling pending jobs"
