@@ -74,7 +74,7 @@ def parse_args():
         "--evaluate_every",
         nargs="+",
         type=int,
-        default=[100_000, 100_000, 100_000, 25_000],
+        default=[100_000, 100_000, 100_000, 30_000],
         help="Evaluate every N iterations",
     )
     parser.add_argument(
