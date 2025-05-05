@@ -64,7 +64,7 @@ def parse_args():
 
     # W&B experiment tracking
     parser.add_argument("--wandb_entity", default="epflmlo-epfl")
-    parser.add_argument("--wandb-project", default="swissai-eval-main-v1.1")
+    parser.add_argument("--wandb-project", default="swissai-eval-main-v1.2")
     parser.add_argument("--wandb_api_key")
 
     # evaluation settings
