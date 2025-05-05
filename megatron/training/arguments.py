@@ -555,8 +555,9 @@ def validate_args(args, defaults={}):
             args.ffn_hidden_size = 4 * args.hidden_size
 
     if args.kv_channels is None:
-        assert args.hidden_size % args.num_attention_heads == 0
-        args.kv_channels = args.hidden_size // args.num_attention_heads
+        # actually qk channels
+        assert args.hidden_size % (args.num_attention_heads * args.qkdim_reduction_factor) == 0
+        args.kv_channels = args.hidden_size // args.num_attention_heads // args.qkdim_reduction_factor
 
     if args.seq_length is not None and args.context_parallel_size > 1:
         assert args.seq_length % (args.context_parallel_size * 2) == 0, \
@@ -936,6 +937,9 @@ def core_transformer_config_from_args(args, config_class=None):
         else:
             raise ValueError("Window size specified without local or global attention every n layers")
     
+    if args.qkdim_reduction_factor:
+        kw_args['qkdim_reduction_factor'] = args.qkdim_reduction_factor
+    
     # Return config.
     return config_class(**kw_args)
 
@@ -1170,6 +1174,7 @@ def _add_network_size_args(parser):
     group.add_argument('--window-size', type=int, default=None,help='Window size for sliding window attention. Translates to (window_size - 1, 0) in TE config ')
     group.add_argument('--local-attention-every-n-layers', type=int, default=None, help='Local attention every n Transformer layers.')
     group.add_argument('--global-attention-every-n-layers', type=int, default=None, help='Global attention every n Transformer layers.')
+    group.add_argument('--qkdim-reduction-factor', type=int, default=1, help='Reduction the dimension of q and k hidden dim by this factor per head.')
     return parser
 
 

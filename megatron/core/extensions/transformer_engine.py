@@ -758,6 +758,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             apply_local_attention = config.is_local_attention(layer_number)
             extra_kwargs['window_size'] = config.window_size if apply_local_attention else (-1, 0)
 
+        if config.qkdim_reduction_factor > 1:
+            assert is_te_min_version("1.10.0"), 'we need to use TE 1.10.0 or later'
+            assert all(x is not None for x in (k_channels, v_channels)), 'k_channels and v_channels must be set'
+        
         if is_te_min_version("1.10.0"):
             # TE 1.10.0 introduces the ability to set the different k and v channels
             kv_channels = (

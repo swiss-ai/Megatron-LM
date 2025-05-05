@@ -119,6 +119,9 @@ class TransformerConfig(ModelParallelConfig):
     is_local_attention: Optional[Callable[[int], bool]] = None
     """If not None, then it should be a lambda function taking layer_id as input and returning
     True if local attention should be applied at that layer."""
+    
+    qkdim_reduction_factor: int = 1
+    """The reduction factor for the query and key dimensions."""
 
     normalization: bool = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
