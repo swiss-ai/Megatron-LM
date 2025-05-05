@@ -279,8 +279,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type
                 
         if config.qkdim_reduction_factor > 1:
-            # kv_channels is actually q,k channels, v channels need to multiply by the reduction factor
-            attention_optional_kwargs['k_channels'] = config.kv_channels
+            if config.global_only_qkdim_reduction and config.is_local_attention(layer_number): 
+                attention_optional_kwargs['k_channels'] = config.kv_channels * config.qkdim_reduction_factor
+            else:
+                # kv_channels is actually q,k channels, v channels need to multiply by the reduction factor
+                attention_optional_kwargs['k_channels'] = config.kv_channels
             attention_optional_kwargs['v_channels'] = config.kv_channels * config.qkdim_reduction_factor
 
         # [Module 2: SelfAttention]

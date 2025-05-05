@@ -95,14 +95,19 @@ class Attention(MegatronModule, ABC):
 
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
-        self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads
-        self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups # actually k size
+        if k_channels is None:
+            k_channels = self.config.kv_channels
+        if v_channels is None:
+            v_channels = self.config.kv_channels
+        
+        self.query_projection_size = k_channels * self.config.num_attention_heads
+        self.kv_projection_size = k_channels * self.config.num_query_groups # actually k size
 
         # Per attention head and per partition values.
         world_size = parallel_state.get_tensor_model_parallel_world_size()
         self.hidden_size_per_attention_head = divide(
             self.query_projection_size, self.config.num_attention_heads
-        )
+        ) # equivalent to k_channels
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
@@ -123,7 +128,7 @@ class Attention(MegatronModule, ABC):
         # Output.
         self.linear_proj = build_module(
             submodules.linear_proj,
-            self.query_projection_size * self.config.qkdim_reduction_factor,
+            v_channels * self.config.num_attention_heads,
             self.config.hidden_size,
             config=self.config,
             init_method=self.config.output_layer_init_method,
@@ -502,6 +507,13 @@ class SelfAttention(Attention):
         k_channels: int = None,
         v_channels: int = None,
     ):
+        if k_channels is None:
+            k_channels = config.kv_channels
+        if v_channels is None:
+            v_channels = config.kv_channels
+            
+        self.k_channels = k_channels
+        self.v_channels = v_channels
         super().__init__(
             config=config,
             submodules=submodules,
@@ -516,7 +528,7 @@ class SelfAttention(Attention):
         self.linear_qkv = build_module(
             submodules.linear_qkv,
             self.config.hidden_size,
-            self.query_projection_size + self.kv_projection_size * (1 + self.config.qkdim_reduction_factor),
+            self.config.num_attention_heads * k_channels + self.config.num_query_groups * (k_channels + v_channels),
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
@@ -628,8 +640,8 @@ class SelfAttention(Attention):
         new_tensor_shape = mixed_qkv.size()[:-1] + (
             self.num_query_groups_per_partition,
             (
-                (self.num_attention_heads_per_partition // self.num_query_groups_per_partition + 1 + self.config.qkdim_reduction_factor)
-                * self.hidden_size_per_attention_head
+                (self.num_attention_heads_per_partition // self.num_query_groups_per_partition + 1)
+                * self.hidden_size_per_attention_head + self.v_channels
             ),
         )
         mixed_qkv = mixed_qkv.view(*new_tensor_shape)
@@ -641,7 +653,7 @@ class SelfAttention(Attention):
                 * self.hidden_size_per_attention_head
             ),
             self.hidden_size_per_attention_head,
-            self.hidden_size_per_attention_head * self.config.qkdim_reduction_factor,
+            self.v_channels,
         ]
 
         if SplitAlongDim is not None:

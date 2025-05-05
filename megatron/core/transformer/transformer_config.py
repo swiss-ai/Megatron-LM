@@ -123,6 +123,9 @@ class TransformerConfig(ModelParallelConfig):
     qkdim_reduction_factor: int = 1
     """The reduction factor for the query and key dimensions."""
 
+    global_only_qkdim_reduction: bool = False
+    """If True, only the query and key dimensions of the global attention layer are reduced."""
+
     normalization: bool = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 

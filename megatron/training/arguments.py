@@ -939,6 +939,9 @@ def core_transformer_config_from_args(args, config_class=None):
     
     if args.qkdim_reduction_factor:
         kw_args['qkdim_reduction_factor'] = args.qkdim_reduction_factor
+        
+    if args.global_only_qkdim_reduction:
+        kw_args['global_only_qkdim_reduction'] = args.global_only_qkdim_reduction
     
     # Return config.
     return config_class(**kw_args)
@@ -1175,6 +1178,7 @@ def _add_network_size_args(parser):
     group.add_argument('--local-attention-every-n-layers', type=int, default=None, help='Local attention every n Transformer layers.')
     group.add_argument('--global-attention-every-n-layers', type=int, default=None, help='Global attention every n Transformer layers.')
     group.add_argument('--qkdim-reduction-factor', type=int, default=1, help='Reduction the dimension of q and k hidden dim by this factor per head.')
+    group.add_argument('--global-only-qkdim-reduction', action='store_true', help='Only reduce the dimension of q and k hidden dim by this factor per head for global attention.')
     return parser
 
 
