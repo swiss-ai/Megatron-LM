@@ -6,12 +6,12 @@ import torch.nn.functional as F
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
 
-HAS_XIELU_CSCS = False
+HAS_OPT_XIELU = False
 try:
-    from xielu.ops.wrappers import XIELU as XieluCSCS
-    HAS_XIELU_CSCS = True
+    from xielu.ops.wrappers import XIELU as optXIELU
+    HAS_OPT_XIELU = True
 except ImportError:
-    print("XIELU C++ extension not found. Please build it first. See: https://github.com/nickjbrowning/XIELU")
+    pass
 
 
 # Trying to apply @jit_fuser / @torch.compile to XIELU class causes issues with sharded_state_dict naming
@@ -37,8 +37,25 @@ def compiled_xiprelup(x, alpha_p, alpha_n, power, beta=0.5, eps=1e-6):
                        alpha_n * x_power + beta * x)
 
 
+class OPT_XIELU(MegatronModule):
+    def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, beta=0.5, eps=-1e-6):
+        super().__init__(config=config)
+
+        if (not HAS_OPT_XIELU):
+            raise Error(
+                "Trying to instantiate OPT_XIELU class but OPT_XIELU could not be imported. Please install https://github.com/nickjbrowning/XIELU.git")
+
+        self.config = config
+
+        self.opt_xielu = optXIELU(
+            alpha_p_init, alpha_n_init, beta, eps, device='cuda', dtype=torch.bfloat16)
+
+    def forward(self, x):
+        return self.opt_xielu.forward(x)
+
+
 class XIELU(MegatronModule):
-    def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, beta=0.5, eps=-1e-6, use_xielu_cscs=True):
+    def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, beta=0.5, eps=-1e-6):
         super().__init__(config=config)
         self.config = config
         self.alpha_p = nn.Parameter(torch.log(torch.exp(torch.tensor(
@@ -47,18 +64,11 @@ class XIELU(MegatronModule):
             alpha_n_init - beta, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
         self.beta = beta
         self.eps = torch.tensor(eps, dtype=torch.bfloat16, device='cuda')
-        self.xielu_cscs = None
-        if use_xielu_cscs and HAS_XIELU_CSCS:
-            self.xielu_cscs = XieluCSCS(
-                alpha_p_init, alpha_n_init, beta, eps, device='cuda', dtype=torch.bfloat16)
 
     def forward(self, x):
-        if (self.xielu_cscs is not None):
-            return self.xielu_cscs.forward(x)
-        else:
-            alpha_p = F.softplus(self.alpha_p)
-            alpha_n = self.beta + F.softplus(self.alpha_n)
-            return compiled_xielu(x, alpha_p, alpha_n, self.beta, self.eps)
+        alpha_p = F.softplus(self.alpha_p)
+        alpha_n = self.beta + F.softplus(self.alpha_n)
+        return compiled_xielu(x, alpha_p, alpha_n, self.beta, self.eps)
 
 
 class XIPReLU(MegatronModule):
