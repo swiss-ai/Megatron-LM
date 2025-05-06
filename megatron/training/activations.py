@@ -6,12 +6,11 @@ import torch.nn.functional as F
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
 
-HAS_OPT_XIELU = False
 try:
-    from xielu.ops.wrappers import XIELU as optXIELU
-    HAS_OPT_XIELU = True
+    from xielu.ops.wrappers import XIELU as _XIELU_NATIVE
+    HAS_XIELU_NATIVE = True
 except ImportError:
-    pass
+    HAS_XIELU_NATIVE = False
 
 
 # Trying to apply @jit_fuser / @torch.compile to XIELU class causes issues with sharded_state_dict naming
@@ -37,27 +36,25 @@ def compiled_xiprelup(x, alpha_p, alpha_n, power, beta=0.5, eps=1e-6):
                        alpha_n * x_power + beta * x)
 
 
-class OPT_XIELU(MegatronModule):
+class XIELU_NATIVE(MegatronModule):
     def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, beta=0.5, eps=-1e-6):
-        super().__init__(config=config)
+        super().__init__(config)
 
-        if (not HAS_OPT_XIELU):
+        if (not HAS_XIELU_NATIVE):
             raise Exception(
-                "Trying to instantiate OPT_XIELU class but OPT_XIELU could not be imported. Please install https://github.com/nickjbrowning/XIELU.git")
+                "Trying to instantiate XIELU_NATIVE class but XIELU_NATIVE could not be imported. "
+                "Please install https://github.com/nickjbrowning/XIELU.git")
 
-        self.config = config
-
-        self.opt_xielu = optXIELU(
+        self.xielu_native = _XIELU_NATIVE(
             alpha_p_init, alpha_n_init, beta, eps, device='cuda', dtype=torch.bfloat16)
 
     def forward(self, x):
-        return self.opt_xielu.forward(x)
+        return self.xielu_native.forward(x)
 
 
 class XIELU(MegatronModule):
     def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, beta=0.5, eps=-1e-6):
-        super().__init__(config=config)
-        self.config = config
+        super().__init__(config)
         self.alpha_p = nn.Parameter(torch.log(torch.exp(torch.tensor(
             alpha_p_init, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
         self.alpha_n = nn.Parameter(torch.log(torch.exp(torch.tensor(
@@ -74,7 +71,6 @@ class XIELU(MegatronModule):
 class XIPReLU(MegatronModule):
     def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, beta=0.5):
         super().__init__(config)
-        self.config = config
         self.alpha_p = nn.Parameter(torch.log(torch.exp(torch.tensor(
             alpha_p_init, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
         self.alpha_n = nn.Parameter(torch.log(torch.exp(torch.tensor(
@@ -90,7 +86,6 @@ class XIPReLU(MegatronModule):
 class XIPReLUP(MegatronModule):
     def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, power_init=2, beta=0.5, eps=1e-6):
         super().__init__(config)
-        self.config = config
         self.alpha_p = nn.Parameter(torch.log(torch.exp(torch.tensor(
             alpha_p_init, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
         self.alpha_n = nn.Parameter(torch.log(torch.exp(torch.tensor(

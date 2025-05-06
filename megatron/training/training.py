@@ -391,8 +391,8 @@ def pretrain(
         print_datetime('after dataloaders are built')
         app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
     
-    except AssertionError:
-        print_rank_0("An error has been detected; Canceling pending scheduled jobs.")
+    except AssertionError as err:
+        print_rank_0(f"An error has been detected; Canceling pending scheduled jobs.\n{err}")
         Path(args.exit_trigger).touch()
         raise
 
