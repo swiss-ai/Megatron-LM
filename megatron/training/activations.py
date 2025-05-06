@@ -42,7 +42,7 @@ class OPT_XIELU(MegatronModule):
         super().__init__(config=config)
 
         if (not HAS_OPT_XIELU):
-            raise Error(
+            raise Exception(
                 "Trying to instantiate OPT_XIELU class but OPT_XIELU could not be imported. Please install https://github.com/nickjbrowning/XIELU.git")
 
         self.config = config
