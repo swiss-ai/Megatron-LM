@@ -50,7 +50,7 @@ class XIELU(MegatronModule):
         self.xielu = None
         if (self.config is not None and self.config.use_xielu_cscs) and HAS_XIELU_CSCS:
             self.xielu_cscs = XieluCSCS(
-                alpha_p_init, alpha_n_init, beta, eps=-1e-6, device='cuda', dtype=torch.bfloat16)
+                alpha_p_init, alpha_n_init, beta, eps, device='cuda', dtype=torch.bfloat16)
 
     def forward(self, x):
         if (self.xielu is not None):
