@@ -8,7 +8,7 @@ from megatron.core.transformer.module import MegatronModule
 
 HAS_XIELU_CSCS = False
 try:
-    from XIELU.ops.wrappers import XIELU as XieluCSCS
+    from xielu.ops.wrappers import XIELU as XieluCSCS
     HAS_XIELU_CSCS = True
 except ImportError:
     print("XIELU C++ extension not found. Please build it first. See: https://github.com/nickjbrowning/XIELU")
