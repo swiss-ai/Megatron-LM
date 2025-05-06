@@ -38,7 +38,7 @@ def compiled_xiprelup(x, alpha_p, alpha_n, power, beta=0.5, eps=1e-6):
 
 
 class XIELU(MegatronModule):
-    def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, beta=0.5, eps=-1e-6):
+    def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, beta=0.5, eps=-1e-6, use_xielu_cscs=True):
         super().__init__(config=config)
         self.config = config
         self.alpha_p = nn.Parameter(torch.log(torch.exp(torch.tensor(
@@ -48,7 +48,7 @@ class XIELU(MegatronModule):
         self.beta = beta
         self.eps = torch.tensor(eps, dtype=torch.bfloat16, device='cuda')
         self.xielu = None
-        if (self.config is not None and self.config.use_xielu_cscs) and HAS_XIELU_CSCS:
+        if use_xielu_cscs and HAS_XIELU_CSCS:
             self.xielu_cscs = XieluCSCS(
                 alpha_p_init, alpha_n_init, beta, eps, device='cuda', dtype=torch.bfloat16)
 
