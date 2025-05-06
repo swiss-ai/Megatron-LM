@@ -47,13 +47,13 @@ class XIELU(MegatronModule):
             alpha_n_init - beta, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
         self.beta = beta
         self.eps = torch.tensor(eps, dtype=torch.bfloat16, device='cuda')
-        self.xielu = None
+        self.xielu_cscs = None
         if use_xielu_cscs and HAS_XIELU_CSCS:
             self.xielu_cscs = XieluCSCS(
                 alpha_p_init, alpha_n_init, beta, eps, device='cuda', dtype=torch.bfloat16)
 
     def forward(self, x):
-        if (self.xielu is not None):
+        if (self.xielu_cscs is not None):
             return self.xielu_cscs.forward(x)
         else:
             alpha_p = F.softplus(self.alpha_p)
