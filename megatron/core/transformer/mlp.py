@@ -76,7 +76,10 @@ class MLP(MegatronModule):
             tp_comm_buffer_name='fc1',
         )
 
-        self.activation_func = self.config.activation_func
+        if isinstance(self.config.activation_func, type):
+            self.activation_func = self.config.activation_func(config=self.config)
+        else:
+            self.activation_func = self.config.activation_func
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,

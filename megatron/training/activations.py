@@ -7,7 +7,7 @@ from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
 
 try:
-    from xielu.ops.wrappers import XIELU as _XIELU_NATIVE
+    from xielu.ops.wrappers import XIELU as _ # noqa: F401  # imports the .so
     HAS_XIELU_NATIVE = True
 except ImportError:
     HAS_XIELU_NATIVE = False
@@ -36,22 +36,6 @@ def compiled_xiprelup(x, alpha_p, alpha_n, power, beta=0.5, eps=1e-6):
                        alpha_n * x_power + beta * x)
 
 
-class XIELU_NATIVE(MegatronModule):
-    def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, beta=0.5, eps=-1e-6):
-        super().__init__(config)
-
-        if (not HAS_XIELU_NATIVE):
-            raise Exception(
-                "Trying to instantiate XIELU_NATIVE class but XIELU_NATIVE could not be imported. "
-                "Please install https://github.com/nickjbrowning/XIELU.git")
-
-        self.xielu_native = _XIELU_NATIVE(
-            alpha_p_init, alpha_n_init, beta, eps, device='cuda', dtype=torch.bfloat16)
-
-    def forward(self, x):
-        return self.xielu_native.forward(x)
-
-
 class XIELU(MegatronModule):
     def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, beta=0.5, eps=-1e-6):
         super().__init__(config)
@@ -66,6 +50,20 @@ class XIELU(MegatronModule):
         alpha_p = F.softplus(self.alpha_p)
         alpha_n = self.beta + F.softplus(self.alpha_n)
         return compiled_xielu(x, alpha_p, alpha_n, self.beta, self.eps)
+
+
+class XIELU_NATIVE(XIELU):
+    def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, beta=0.5, eps=1e-6, with_vector_loads=True):
+        if not HAS_XIELU_NATIVE:
+            raise Exception(
+                "Trying to instantiate XIELU_NATIVE class but XIELU_NATIVE could not be imported. "
+                "Please install https://github.com/nickjbrowning/XIELU.git")
+        super().__init__(config, alpha_p_init, alpha_n_init, beta, eps)
+        self.with_vector_loads = with_vector_loads
+        self.cuda_obj = torch.classes.xielu.XIELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.cuda_obj.forward(x, self.alpha_p, self.alpha_n, self.beta, self.eps, self.with_vector_loads)
 
 
 class XIPReLU(MegatronModule):

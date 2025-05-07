@@ -906,13 +906,13 @@ def core_transformer_config_from_args(args, config_class=None):
     if args.squared_relu:
         kw_args['activation_func'] = squared_relu
     if args.xielu:
-        kw_args['activation_func'] = XIELU(config=kw_args)
+        kw_args['activation_func'] = XIELU
     if args.xielu_native:
-        kw_args['activation_func'] = XIELU_NATIVE(config=kw_args)
+        kw_args['activation_func'] = XIELU_NATIVE
     if args.xiprelu:
-        kw_args['activation_func'] = XIPReLU(config=kw_args)
+        kw_args['activation_func'] = XIPReLU
     if args.xiprelup:
-        kw_args['activation_func'] = XIPReLUP(config=kw_args)
+        kw_args['activation_func'] = XIPReLUP
         
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
