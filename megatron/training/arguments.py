@@ -1127,7 +1127,7 @@ def _add_network_size_args(parser):
     group.add_argument('--xielu', action='store_true',
                        help='Use xielu activation instead of default gelu')
     group.add_argument('--xielu-native', action='store_true',
-                       help='Use optimized activation instead of default gelu')
+                       help='Use optimized xielu activation instead of default gelu')
     group.add_argument('--xiprelu', action='store_true',
                        help='Use xiprelu activation instead of default gelu')
     group.add_argument('--xiprelup', action='store_true',
