@@ -7,6 +7,7 @@ import logging
 import os
 import queue
 from contextlib import contextmanager
+from functools import partial
 from itertools import chain
 from pathlib import Path
 from time import time
@@ -173,12 +174,14 @@ class FileSystemWriterAsync(FileSystemWriter):
         """
         if not self.write_buckets:
             return None, ()
-        return (self.write_preloaded_data_multiproc, (self.write_buckets, self.results_queue))
+        transform_list = [self.transforms] if hasattr(self, 'transforms') else []
+
+        return (partial(self.write_preloaded_data_multiproc, transform_list), (self.write_buckets, self.results_queue))
 
     @staticmethod
     @_disable_gc()
     def write_preloaded_data_multiproc(
-        write_buckets: List[WriteBucket], global_results_queue: mp.Queue
+       transform_list, write_buckets: List[WriteBucket], global_results_queue: mp.Queue
     ) -> None:
         """
         Performs saving data to storage with multiple processes.
@@ -212,7 +215,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 count_queue.put(i)
                 p_list.append(
                     ctx.Process(
-                        target=FileSystemWriterAsync.write_preloaded_data,
+                        target=partial(FileSystemWriterAsync.write_preloaded_data, transform_list),
                         args=(i, write_bucket, local_results_queue, count_queue, True),
                     )
                 )
@@ -267,6 +270,7 @@ class FileSystemWriterAsync(FileSystemWriter):
     @staticmethod
     @_disable_gc()
     def write_preloaded_data(
+        transform_list,
         local_proc_idx: int,
         write_bucket: WriteBucket,
         results_queue: mp.SimpleQueue,
@@ -293,11 +297,11 @@ class FileSystemWriterAsync(FileSystemWriter):
             file_name, storage_key, (bytes_data, tensor_data) = write_bucket
             with open(file_name, "wb") as stream:
                 for write_item, data in bytes_data:
-                    local_results.append(_write_item(stream, data, write_item, storage_key))
+                    local_results.append(_write_item(*transform_list, stream, data, write_item, storage_key))
 
                 for write_item, tensor in tensor_data:
                     assert tensor.is_cpu
-                    local_results.append(_write_item(stream, tensor, write_item, storage_key))
+                    local_results.append(_write_item(*transform_list, stream, tensor, write_item, storage_key))
 
                 if use_fsync:
                     os.fsync(stream.fileno())
