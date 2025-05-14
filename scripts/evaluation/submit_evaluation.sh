@@ -327,7 +327,7 @@ EOM
 # Now let's prepare the sbatch.
 cat > $SBATCH_PATH <<- EOM
 #!/bin/bash
-#SBATCH --account=a-a06
+#SBATCH --account=$ACCOUNT
 #SBATCH --cpus-per-task=288
 #SBATCH --gres=gpu:4
 #SBATCH --environment=$CONTAINER_PATH
