@@ -1,5 +1,6 @@
 """Evaluation metadata helper functions that control which evaluations are run."""
 
+import os
 import json
 import time
 from enum import Enum
@@ -7,7 +8,7 @@ from enum import Enum
 State = Enum(
     "State",
     [
-        ("NOT_EVALUATED", 0),
+        ("WAITING", 0),
         ("SUBMITTED", 1),
         ("RUNNING", 2),
         ("FINISHED", 3),
@@ -21,13 +22,21 @@ EVAL_METADATA_PATH = "/users/amarfurt/eval_metadata.json"
 class EvalMetadata:
     def __init__(self, path=EVAL_METADATA_PATH):
         self.path = path
-        with open(self.path) as f:
-            self.metadata = json.load(f)
+        self.metadata = {}
+        if os.path.exists(self.path):
+            with open(self.path) as f:
+                self.metadata = json.load(f)
 
     def get_model_metadata(self, model_name):
+        if model_name not in self.metadata or "iterations" not in self.metadata[model_name]:
+            return {
+                "iterations": {},
+            }
         return self.metadata[model_name]
 
     def get_state(self, model_name, iteration):
+        if model_name not in self.metadata or "iterations" not in self.metadata[model_name]:
+            return None
         iterations_metadata = self.metadata[model_name]["iterations"]
         iteration = str(iteration)  # JSON keys are strings
         if iteration in iterations_metadata:
@@ -38,6 +47,10 @@ class EvalMetadata:
     def update_iteration_metadata(self, model_name, iteration, new_state, **kwargs):
         iteration = str(iteration)  # JSON keys are strings
         new_state_name = new_state.name if type(new_state) is State else new_state
+        if model_name not in self.metadata or "iterations" not in self.metadata[model_name]:
+            self.metadata[model_name] = {
+                "iterations": {},
+            }
         if iteration not in self.metadata[model_name]["iterations"]:
             self.metadata[model_name]["iterations"][iteration] = {}
         self.metadata[model_name]["iterations"][iteration].update(kwargs)
