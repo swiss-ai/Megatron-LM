@@ -188,11 +188,10 @@ def cleanup_hf_checkpoints(config):
 
 
 def main(config):
-    # TODO: check if an evaluation of the same model size is currently submitted or running
-    # (in which case all later evaluations should be put into a waiting state)
+    # find checkpoints that need to be evaluated and put them into the waiting state
     find_evaluations(config)
 
-    # submit evaluations for checkpoints not evaluated yet
+    # submit waiting evaluations, at most one per model
     submit_waiting(config)
 
     # check if evaluations that have been submitted are now running

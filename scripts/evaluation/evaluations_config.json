@@ -4,7 +4,7 @@
     "hf_storage_dir": "/capstor/store/cscs/swissai/a06/hf_checkpoints",
     "container_path": "/iopsstor/scratch/cscs/amarfurt/envs/ngc_pt_jan.toml",
     "wandb_entity": "andreas-marfurt",
-    "wandb-project": "swissai-eval-main-v1.2",
+    "wandb_project": "swissai-eval-main-v1.2",
     "wandb_api_key": "",
     "bs": "auto",
     "tasks": "swissai_eval",
