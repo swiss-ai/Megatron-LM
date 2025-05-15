@@ -17,7 +17,7 @@
             "model_size": 1,
             "tokens_per_iter": 2064384,
             "evaluate_every": 100000,
-            "start_eval_at_iter": 2000000,
+            "start_eval_after_iter": 2000000,
             "limit": 0
         },
         "Apertus3-3B": {
@@ -27,7 +27,7 @@
             "model_size": 3,
             "tokens_per_iter": 2097152,
             "evaluate_every": 100000,
-            "start_eval_at_iter": 1200000,
+            "start_eval_after_iter": 1200000,
             "limit": 0
         },
         "Apertus3-8B": {
@@ -37,7 +37,7 @@
             "model_size": 8,
             "tokens_per_iter": 4194304,
             "evaluate_every": 100000,
-            "start_eval_at_iter": 1200000,
+            "start_eval_after_iter": 1000000,
             "limit": 0
         },
         "Apertus3-70B": {
@@ -48,7 +48,7 @@
             "model_size": 70,
             "tokens_per_iter": 8388608,
             "evaluate_every": 60000,
-            "start_eval_at_iter": 180000,
+            "start_eval_after_iter": 180000,
             "limit": 1000
         }
     }

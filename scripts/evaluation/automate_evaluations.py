@@ -24,7 +24,7 @@ def find_evaluations(config):
                     iteration = int(match.group(1))
 
                     # start evaluating at a specific iteration
-                    if iteration < model_config["start_eval_at_iter"]:
+                    if iteration <= model_config["start_eval_after_iter"]:
                         continue
 
                     # only evaluate every N iterations
