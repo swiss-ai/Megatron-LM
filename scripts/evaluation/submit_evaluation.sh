@@ -385,7 +385,7 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 	cd ..
 	git clone https://github.com/swiss-ai/lm-evaluation-harness.git
 	cd lm-evaluation-harness
-	git checkout retry-download
+	git checkout new-include
 	python -m pip install -e .[api]
 
 	$CMD_LOOP
