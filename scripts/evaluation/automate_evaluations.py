@@ -188,17 +188,17 @@ def cleanup_hf_checkpoints(config):
 
 
 def main(config):
-    # find checkpoints that need to be evaluated and put them into the waiting state
-    find_evaluations(config)
-
-    # submit waiting evaluations, at most one per model
-    submit_waiting(config)
-
     # check if evaluations that have been submitted are now running
     check_running(config)
 
     # check if evaluations that have been running are now finished
     check_finished(config)
+
+    # find checkpoints that need to be evaluated and put them into the waiting state
+    find_evaluations(config)
+
+    # submit waiting evaluations, at most one per model
+    submit_waiting(config)
 
     # cleanup tasks
     # remove HF checkpoints per model size exceeding `num_hf_checkpoints_to_keep`
