@@ -75,6 +75,7 @@ def submit_waiting(config):
         # submit evaluations for checkpoints that have not been evaluated yet
         jobname = f"{model_name}_iter_{iteration_to_evaluate}"
         checkpoint_dir = model_metadata["iterations"][iteration_to_evaluate]["checkpoint_dir"]
+        model_dir = os.path.dirname(checkpoint_dir)
         arguments = f"""
 --container-path {config["container_path"]}
 --logs-root {config["logs_root"]}
@@ -90,7 +91,7 @@ def submit_waiting(config):
 --tasks {config["tasks"]}
 --limit {model_config["limit"] if model_config["limit"] > 0 else "null"}
 """.strip().replace("\n", " ")
-        command = f"bash {cur_dir}/submit_evaluation.sh {checkpoint_dir} {arguments} --iterations {iteration_to_evaluate}"
+        command = f"bash {cur_dir}/submit_evaluation.sh {model_dir} {arguments} --iterations {iteration_to_evaluate}"
         res = os.system(command)
         if res:
             raise RuntimeError(
