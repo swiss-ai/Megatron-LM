@@ -234,9 +234,9 @@ if [ ! -z ${WANDB_ENTITY+x} ] || [ ! -z ${WANDB_PROJECT+x} ] || [ ! -z ${WANDB_I
 	WANDB_ARGS="--wandb_args entity=$WANDB_ENTITY,project=$WANDB_PROJECT,id=$WANDB_ID,resume=allow,step=\\\$IT,consumed_tokens=\\\$CONSUMED_TOKENS"
 	read -r -d '' WANDB_COMMAND <<- EOM
 	# Wandb sync just in case wandb died in lm-harness.
-	for path in $WANDB_DIR/wandb/run-*-$WANDB_ID; do
-		WANDB_RESUME=allow python -m wandb sync -e $WANDB_ENTITY -p $WANDB_PROJECT --id $WANDB_ID \\\$path
-	done
+	# for path in $WANDB_DIR/wandb/run-*-$WANDB_ID; do
+	# 	WANDB_RESUME=allow python -m wandb sync -e $WANDB_ENTITY -p $WANDB_PROJECT --id $WANDB_ID \\\$path
+	# done
 
 	# Update eval_table.
 	cd $MEGATRON_PATH
