@@ -166,7 +166,7 @@ def save_checkpoint(queue: mp.Queue, args):
             rope_theta=md.checkpoint_args.rotary_base,
             rope_scaling={"type": "llama3",
                          "factor": md.checkpoint_args.rope_scaling_factor,   # = 8
-                         "original_max_position_embeddings": 8000,  # md.checkpoint_args.max_position_embeddings (set manually to avoid using 4k)  # TODO: check how HF deals with this arg.
+                         "original_max_position_embeddings": 8000,  # md.checkpoint_args.max_position_embeddings (set manually to avoid 4k being used)
                          "high_freq_factor": 4.0,                   # set manually as it isn't stored in megatron checkpoint.
                          "low_freq_factor": 1.0},                   # set manually as it isn't stored in megatron checkpoint.
             attention_bias=md.checkpoint_args.add_qkv_bias,
