@@ -22,6 +22,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
     FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
+from megatron.core.dist_checkpointing.core import OldXieluException
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.fp8_utils import is_float8tensor
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -1327,10 +1328,20 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         load_kwargs["sharded_state_dict"] = sharded_state_dict
 
 
-    state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-        load_dir, args, rank0=False, checkpointing_context=checkpointing_context,
-        **load_kwargs
-    )
+    try:
+        state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
+            load_dir, args, rank0=False, checkpointing_context=checkpointing_context,
+            **load_kwargs
+        )
+    except BaseException as ex:
+        if len(ex.args) < 2 or len(ex.args[1]) == 0 or len(ex.args[1][0]) == 0 or not isinstance(ex.args[1][0][0], OldXieluException):
+            # We only want to handle OldXieluException here so we just raise any other exception directly.
+            raise ex
+        fix_xielu_weights(load_kwargs["sharded_state_dict"])
+        state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
+            load_dir, args, rank0=False, checkpointing_context=checkpointing_context,
+            **load_kwargs
+        )
 
     # Checkpoint not loaded.
     if state_dict is None:
@@ -1555,3 +1566,16 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         print(' successfully loaded {}'.format(checkpoint_name))
 
     return model
+
+
+def fix_xielu_weights(state_dict: dict[str, torch.Tensor]):
+    print("Old xielu weights detected!")
+    shape = state_dict["model"]["decoder.layers.0.mlp.activation_func.alpha_p"].global_shape
+    assert len(shape) == 2 and shape[1] == 1
+    new_shape = (shape[0],)
+    for key in filter(lambda key: "mlp.activation_func.alpha" in key, state_dict["model"]):
+        sh_ten = state_dict["model"][key]
+        sh_ten.global_shape = (sh_ten.global_shape[0],)
+        sh_ten.global_offset = (sh_ten.global_offset[0],)
+        sh_ten.prepend_axis_num = 0
+        sh_ten.axis_fragmentations = (sh_ten.axis_fragmentations[0],)
