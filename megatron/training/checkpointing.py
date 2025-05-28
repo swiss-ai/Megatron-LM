@@ -1327,6 +1327,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         }
         load_kwargs["sharded_state_dict"] = sharded_state_dict
 
+    if args.fix_old_xielu:
+       fix_xielu_weights(load_kwargs["sharded_state_dict"])
 
     try:
         state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
@@ -1569,13 +1571,30 @@ def load_biencoder_checkpoint(model, only_query_model=False,
 
 
 def fix_xielu_weights(state_dict: dict[str, torch.Tensor]):
-    print("Old xielu weights detected!")
+    def filterfn(key: str) -> bool:
+        return "mlp.activation_func.alpha" in key
+
+    print("Old xielu weights detected" + " with optimizer!" if "optimizer" in state_dict else "!")
     shape = state_dict["model"]["decoder.layers.0.mlp.activation_func.alpha_p"].global_shape
     assert len(shape) == 2 and shape[1] == 1
     new_shape = (shape[0],)
-    for key in filter(lambda key: "mlp.activation_func.alpha" in key, state_dict["model"]):
+
+    for key in filter(filterfn, state_dict["model"]):
+        print(f"Updating model/{key}")
         sh_ten = state_dict["model"][key]
         sh_ten.global_shape = (sh_ten.global_shape[0],)
         sh_ten.global_offset = (sh_ten.global_offset[0],)
         sh_ten.prepend_axis_num = 0
         sh_ten.axis_fragmentations = (sh_ten.axis_fragmentations[0],)
+
+    if "optimizer" in state_dict:
+        for i in state_dict["optimizer"]["param_state"]:
+            for k in state_dict["optimizer"]["param_state"][i]:
+                sh_ten = state_dict["optimizer"]["param_state"][i][k]
+                if filterfn(sh_ten.key):
+                    print(f"Updating optimizer/{i}/{k}/{sh_ten.key}")
+                    sh_ten.global_shape = (sh_ten.global_shape[0],)
+                    sh_ten.global_offset = (sh_ten.global_offset[0],)
+                    sh_ten.prepend_axis_num = 0
+                    sh_ten.axis_fragmentations = (sh_ten.axis_fragmentations[0],)
+    print("Done updating!")

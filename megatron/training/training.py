@@ -709,8 +709,8 @@ def pretrain(
         app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
     
     except AssertionError:
-        print_rank_0("An error has been detected; Canceling pending scheduled jobs.")
-        Path(args.exit_trigger).touch()
+        #print_rank_0("An error has been detected; Canceling pending scheduled jobs.")
+        #Path(args.exit_trigger).touch()
         raise
 
     # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.

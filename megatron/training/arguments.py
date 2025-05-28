@@ -1247,6 +1247,12 @@ def _add_network_size_args(parser):
     group.add_argument('--onnx-safe', type=bool, required=False,
                        help='Use workarounds for known problems with '
                        'Torch ONNX exporter')
+    group.add_argument("--fix-old-xielu", action="store_true",
+                       help=("When specified, assumes the checkpoint to be loaded uses the "
+                             "old xielu commit and attempts to fixe the weights. Only needs "
+                             "to be specified the first time after loading from old xielu "
+                             "checkpoints. See: https://github.com/swiss-ai/Megatron-LM/commit/c079040c8137da7ff12f3a26a1b354fd8c908e64 "
+                             "for more information on old xielu checkpoints."))
     group.add_argument('--bert-no-binary-head', action='store_false',
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
