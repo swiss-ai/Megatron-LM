@@ -1351,6 +1351,10 @@ def _add_logging_args(parser):
                        help='If set, calculate and log parameters norm.')
     group.add_argument('--log-params-norm-per-param', action='store_true',
                        help='If set, calculate and log norm for each parameter individually.')
+    group.add_argument('--log-intermediate-metrics', nargs='+', default=[], choices=["mean", "rms", "kurtosis", "underflow", "overflow"],
+                       help='Log these metrics on all activations, qkv and mlp vectors')
+    group.add_argument('--log-intermediate-metrics-interval', type=int, default=None,
+                       help='Frequency to log the intermediate metrics (see `--log-intermediate-metrics`)')
     group.add_argument('--log-num-zeros-in-grad', action='store_true',
                        help='If set, calculate and log the number of zeros in gradient.')
     group.add_argument('--log-throughput', action='store_true',

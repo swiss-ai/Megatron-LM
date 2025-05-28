@@ -84,6 +84,7 @@ from megatron.core.num_microbatches_calculator import (
     get_current_running_global_batch_size,
     get_num_microbatches,
     update_num_microbatches)
+from megatron.core.metrics_tracking import get_tracker
 
 from .async_utils import maybe_finalize_async_save
 from .utils import (
@@ -1358,6 +1359,15 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
        (iteration % args.tensorboard_log_interval == 0):
         timers.write(timers_to_log, writer, iteration,
                      normalizer=total_iterations)
+
+    tracker = None
+    intermediate_interval = args.tensorboard_log_interval if args.log_intermediate_metrics_interval is None else args.log_intermediate_metrics_interval
+    if iteration % intermediate_interval == 0:
+        tracker = get_tracker()
+        timers("tracker-aggregate", log_level=0).start(barrier=True)
+        tracker.aggregate()
+        timers("tracker-aggregate").stop()
+
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
             wandb_writer.log({
@@ -1447,6 +1457,16 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                 mem_stats["allocation.all.current"],
                 iteration,
             )
+        if tracker is not None:
+            for key, value in tracker.get_final_metrics():
+                writer.add_scalar(key, value, iteration)
+                if wandb_writer:
+                    wandb_writer.log({key: value}, iteration)
+
+
+    if tracker is not None:
+        tracker.reset()
+
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_moe_metrics(moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging)
@@ -1968,6 +1988,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             args.skipped_train_samples += batch_size
             continue
 
+        # Determine if we should enable the tracker (i.e. if we are going to log this iteration).
+        intermediate_interval = args.tensorboard_log_interval if args.log_intermediate_metrics_interval is None else args.log_intermediate_metrics_interval
+        tracker = get_tracker()
+        if (iteration + 1) % intermediate_interval == 0:
+            tracker.enable()
+        else:
+            tracker.disable()
+
         # Run training step.
         args.curr_iteration = iteration
         ft_integration.on_training_step_start()
@@ -2047,6 +2075,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
                                           grad_norm, params_norm, params_norm_per_param, num_zeros_in_grad)
+        tracker.disable()  # We won't track any activation metrics during evaluation iterations.
 
         # Evaluation.
         if args.eval_interval and iteration % args.eval_interval == 0 and \

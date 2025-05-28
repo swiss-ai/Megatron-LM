@@ -21,6 +21,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import deprecate_inference_params, make_viewless_tensor
+from megatron.core.metrics_tracking import get_tracker
+
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -479,6 +481,7 @@ class TransformerBlock(MegatronModule):
         use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
+        tracker = get_tracker()
         with rng_context, outer_fp8_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
@@ -493,6 +496,9 @@ class TransformerBlock(MegatronModule):
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
+                    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+                    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+                    true_l_no = l_no + pp_rank*self.config.num_layers//pp_size
                     inner_fp8_context = (
                         get_fp8_context(self.config, layer.layer_number - 1)
                         if use_inner_fp8_context
@@ -512,6 +518,7 @@ class TransformerBlock(MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                         )
+                    tracker.update(hidden_states, "activation", true_l_no)
 
                     if (
                         torch.is_grad_enabled()
