@@ -207,7 +207,30 @@ if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ]; then
 		echo When using megatron checkpoints, you cannot set --consumed-tokens, please set --tokens-per-iter instead >&2
 		exit 1
 	fi
-	CONSUMED_TOKENS="\\\$((IT*$TOKENS_PER_ITER))"
+	read -r -d '' CONSUMED_TOKENS_CALCULATION <<- EOM
+	TOKENS_PER_ITER=$TOKENS_PER_ITER
+	if [[ \\\$TOKENS_PER_ITER = *,* ]]; then
+		CONSUMED_TOKENS=0
+		CONSUMED_ITERS=0
+		for SUBSTR in \\\${TOKENS_PER_ITER//,/ }; do
+			if (( CONSUMED_ITERS < IT )); then
+				TOK_PER_ITER=\"\\\$(echo \\\$SUBSTR | cut -d':' -f1)\"
+				MAX_ITER=\"\\\$(echo \\\$SUBSTR | cut -d':' -f2)\"
+				if [[ \\\$MAX_ITER = \"\" ]]; then
+					ITERS_THIS_BLOCK=\\\$(( IT - CONSUMED_ITERS ))
+				elif (( IT > MAX_ITER )); then
+					ITERS_THIS_BLOCK=\\\$(( MAX_ITER - CONSUMED_ITERS - 1 ))
+				else
+					ITERS_THIS_BLOCK=\\\$(( IT - CONSUMED_ITERS ))
+				fi
+				CONSUMED_ITERS=\\\$(( CONSUMED_ITERS + ITERS_THIS_BLOCK ))
+				CONSUMED_TOKENS=\\\$(( CONSUMED_TOKENS + TOK_PER_ITER*ITERS_THIS_BLOCK ))
+			fi
+		done
+	else
+		CONSUMED_TOKENS=\\\$(( IT*$TOKENS_PER_ITER ))
+	fi
+	EOM
 else
 	# The huggingface checkpoints can get CONSUMED_TOKENS either by --tokens-per-iter or --consumed-tokens
 	if [ -z ${CONSUMED_TOKENS+x} ]; then
@@ -215,7 +238,7 @@ else
 			echo Neither of --consumed-tokens or --tokens-per-iter set, aborting >&2
 			exit 1
 		fi
-		CONSUMED_TOKENS="\\\$((IT*$TOKENS_PER_ITER))"
+		CONSUMED_TOKENS_CALCULATION="\\\$CONSUMED_TOKENS=\\\$((IT*$TOKENS_PER_ITER))"
 	fi
 fi
 
@@ -322,7 +345,8 @@ do
 
 	IT=\\\${ITERATIONS[\\\$i]}
 	$MAYBE_GRAB_REVISION
-	CONSUMED_TOKENS=$CONSUMED_TOKENS
+	$CONSUMED_TOKENS_CALCULATION
+	echo CONSUMED_TOKENS=\\\$CONSUMED_TOKENS
 
 	$CMD_CONVERT
 	$CMD_SERVER
