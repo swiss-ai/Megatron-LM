@@ -1023,6 +1023,8 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--fp8-param-gather', action='store_true',
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
+    group.add_argument("--fp8-dot-product-attention", action="store_true",
+                       help="When set to True, use the FP8 implementation of Dot Product Attention.""")
     group.add_argument('--first-last-layers-bf16', action='store_true',
                        help='Construct first and last layers in bf16 when doing FP8 training.')
     group.add_argument('--num-layers-at-start-in-bf16', type=int, default=1,
