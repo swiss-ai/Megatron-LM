@@ -6,7 +6,7 @@ from collections import defaultdict
 from tqdm import tqdm
 from typing import List
 
-from megatron.core.inference.contexts import (
+from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
     DynamicInferenceContext,
 )
@@ -32,6 +32,11 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
 
     add_common_inference_args(parser)
 
+    group = parser.add_argument_group(title='Dynamic inference')
+    group.add_argument("--inference-ckpt-non-strict", action="store_true",
+                       help="Load checkpoint with `strict=False`.")
+    
+
     return parser
 
 
@@ -46,7 +51,12 @@ def get_model() -> MegatronModule:
     # Load checkpoint.
     assert args.load is not None
     args.exit_on_missing_checkpoint = True
-    load_checkpoint(model, None, None)
+    load_checkpoint(
+        ddp_model=model,
+        optimizer=None,
+        opt_param_scheduler=None,
+        strict=not args.inference_ckpt_non_strict,
+    )
 
     # No virtual PP.
     assert len(model) == 1, "Above condition should have caught this"
@@ -80,9 +90,11 @@ def get_inference_context(
         max_sequence_length=max_sequence_length,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
+        chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
         buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
         max_requests_override=args.inference_dynamic_batching_max_requests_override,
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
+        tensor_model_parallel_size=args.tensor_model_parallel_size,
     )
 
     return context
@@ -174,30 +186,25 @@ def run_inference(
 
         # Step inference engine (i.e., generate a token for each active request).
         is_decode_only = engine.context.is_decode_only()
-        result, step_time = engine.step(sampling_params, verbose=True)
+        finished_requests, step_time = engine.step(sampling_params, verbose=True)
         step_id += 1
 
-        # Append output tokens.
-        if result is not None:
-
+        if len(finished_requests) > 0:
             output_start = get_curr_time()
-
             if is_decode_only:
                 step_times["decode"].append(step_time)
             else:
                 step_times["prefill"].append(step_time)
 
-            request_ids, finished_request_ids, sample = result
-            request_ids = request_ids.tolist()
-            sample = sample.tolist()
-            for request_id, token in zip(request_ids, sample):
-                request = requests[request_id]
-                request.output_tokens.append(token)
-                if request_id in finished_request_ids:
-                    request.time_end = get_curr_time()
-                    request.state = "finished"
-                    num_requests_finished += 1
-
+            # Append output tokens.
+            for finished_request in finished_requests:
+                request = requests[finished_request.request_id]
+                request.output_tokens = finished_request.generated_tokens
+                request.time_end = get_curr_time()
+                request.output_text = finished_request.generated_text
+                request.state = "finished"
+                num_requests_finished += 1
+            
             output_times.append(get_curr_time() - output_start)
 
         # Check if all requests are finished.
@@ -275,10 +282,6 @@ if __name__ == "__main__":
     # Validate all requests finished.
     for request in requests:
         assert request.state == "finished"
-
-    # Detokenize outputs.
-    for request in requests:
-        request.output_text = tokenizer.detokenize(request.output_tokens)
 
     # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:

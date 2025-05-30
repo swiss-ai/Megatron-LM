@@ -1,9 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -42,6 +42,7 @@ class InferenceRequest:
     generated_sequence_lengths: Optional[List[int]] = None
     generated_tokens: Optional[torch.Tensor] = None
     generated_log_probs: Optional[torch.Tensor] = None
+    generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_length: Optional[int] = None
 
     def __post_init__(self):
@@ -51,6 +52,19 @@ class InferenceRequest:
                 "previous name will be removed in Mcore 0.14."
             )
             self.sampling_params = self.inference_parameters
+
+
+@dataclass(kw_only=True)
+class DynamicInferenceRequest(InferenceRequest):
+    """Class for one inference request
+
+    Containing relevant data for an dynamic inference request
+
+    """
+
+    generated_tokens: List[int] = field(default_factory=list)
+    prompt: Optional[str] = None
+    prompt_tokens: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)

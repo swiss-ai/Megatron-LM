@@ -85,12 +85,20 @@ def _get_param_groups(
     # Map (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr) to params.
     params_map = {}
     for model_chunk in model_chunks:
-        if model_chunk.ddp_config.use_custom_fsdp:
+        ddp_config = model_chunk.ddp_config
+        if ddp_config.use_custom_fsdp:
             named_parameters = model_chunk.optimizer_named_parameters()
         else:
             named_parameters = model_chunk.named_parameters()
 
         for name, param in named_parameters:
+            if (
+                ddp_config.use_custom_fsdp
+                and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+            ):
+                param_shard = param
+                param = param.orig_param
+
             if not param.requires_grad:
                 continue
 
@@ -131,7 +139,13 @@ def _get_param_groups(
             key = (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
             if key not in params_map:
                 params_map[key] = []
-            params_map[key].append(param)
+            if (
+                ddp_config.use_custom_fsdp
+                and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+            ):
+                params_map[key].append(param_shard)
+            else:
+                params_map[key].append(param)
 
     param_groups = []
     for (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr), params in params_map.items():
@@ -339,7 +353,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 )
 
                 if is_te_min_version("2.1.0.dev0"):
-                    kwargs.update({"store_param_remainders": True})
+                    kwargs.update({"store_param_remainders": config.store_param_remainders})
 
             optimizer = Adam(**kwargs)
 
@@ -434,6 +448,14 @@ def _get_megatron_optimizer_based_on_param_groups(
                 data_parallel_group_idx=data_parallel_group_idx,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
+            # This is needed for case where num_distributed_optimizer_instances > 1. In this case,
+            # weight gradients are all-reduced across optimizer instances, so each instance has
+            # the duplicated weight gradients, need to reduce gradient stats inside each instance.
+            setattr(
+                optimizer,
+                'grad_stats_parallel_group',
+                mpu.get_intra_distributed_optimizer_instance_group(),
+            )
         else:
             optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
@@ -490,7 +512,7 @@ def get_megatron_optimizer(
         mpu.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=True)
     ):
         distributed_optimizer_instance_id = torch.distributed.get_rank(
-            mpu.get_inter_partial_data_parallel_group()
+            mpu.get_inter_distributed_optimizer_instance_group()
         )
     else:
         distributed_optimizer_instance_id = 0
@@ -591,7 +613,9 @@ def get_megatron_optimizer(
         )
         # Pass Gloo process groups into optimizer only if needed.
         if use_gloo_process_groups:
-            data_parallel_group_gloo = mpu.get_expert_data_parallel_group_gloo()
+            data_parallel_group_gloo = mpu.get_expert_data_parallel_group_gloo(
+                partial_expert_data_parallel=True
+            )
         else:
             data_parallel_group_gloo = None
         optimizers.append(
@@ -601,13 +625,13 @@ def get_megatron_optimizer(
                 param_groups=moe_param_groups,
                 per_model_buffers=moe_buffers,
                 model_parallel_group=mpu.get_expert_tensor_model_pipeline_parallel_group(),
-                data_parallel_group=mpu.get_expert_data_parallel_group(),
+                data_parallel_group=mpu.get_expert_data_parallel_group(
+                    partial_expert_data_parallel=True
+                ),
                 data_parallel_group_gloo=data_parallel_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
+                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
         )
-
-    if len(optimizers) == 1:
-        return optimizers[0]
 
     return ChainedOptimizer(optimizers)

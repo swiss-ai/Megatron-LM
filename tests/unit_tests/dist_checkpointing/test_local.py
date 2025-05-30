@@ -3,6 +3,7 @@ import filecmp
 import logging
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Tuple, Union
@@ -170,7 +171,6 @@ class TestLocalCheckpointing:
             local_ckpt_dir = local_ckpt_dir / "subdir"  # Test handling of non-existent directories
             init_basic_mock_args(mock_args, tp, pp)
             init_checkpointing_mock_args(mock_args, None)
-            mock_args.ckpt_step = None
             mock_args.non_persistent_ckpt_type = 'local'
             mock_args.non_persistent_local_ckpt_algo = algo
             mock_args.async_save = async_save
@@ -234,6 +234,7 @@ class TestLocalCheckpointing:
             )
             if async_save:
                 maybe_finalize_async_save(True)
+            time.sleep(0.01)  # Allow sufficient time for async cleanup to complete
             assert not ckpt_path.exists()
             ckpt_id = checkpointing_context['local_checkpoint_manager']._ckpt_id(2)
             ckpt_path = checkpointing_context['local_checkpoint_manager']._local_ckpt_path_from_id(
@@ -276,7 +277,6 @@ class TestLocalCheckpointing:
                 )  # Test handling of non-existent directories
                 init_basic_mock_args(mock_args, tp, pp)
                 init_checkpointing_mock_args(mock_args, None)
-                mock_args.ckpt_step = None
                 mock_args.non_persistent_ckpt_type = 'local'
                 mock_args.non_persistent_local_ckpt_algo = algo
                 mock_args.async_save = async_save

@@ -4,6 +4,7 @@
 import array
 import functools
 import hashlib
+import inspect
 import logging
 import math
 import operator
@@ -14,9 +15,10 @@ import threading
 import time
 import traceback
 import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
-from functools import reduce, wraps
+from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
@@ -38,6 +40,13 @@ except ImportError:
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
+try:
+    import nvtx
+
+    HAVE_NVTX = True
+except ImportError:
+    HAVE_NVTX = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,6 +56,7 @@ except Exception:
     # This is a WAR for building docs, where torch is not actually imported
     _torch_version = PkgVersion("0.0.0")
 _te_version = None
+_fa_version = None
 
 
 class ExperimentalNotEnabledError(Exception):
@@ -279,6 +289,30 @@ def is_torch_min_version(version, check_equality=True):
     return get_torch_version() > PkgVersion(version)
 
 
+def get_fa_version():
+    """Get Flash attention version from __version__; if not available use pip's. Use caching."""
+
+    def get_fa_version_str():
+        import flash_attn as fa
+
+        if hasattr(fa, '__version__'):
+            return str(fa.__version__)
+        else:
+            return version("flash-attn")
+
+    global _fa_version
+    if _fa_version is None:
+        _fa_version = PkgVersion(get_fa_version_str())
+    return _fa_version
+
+
+def is_fa_min_version(version, check_equality=True):
+    """Check if minimum version of `flash-attn` is installed."""
+    if check_equality:
+        return get_fa_version() >= PkgVersion(version)
+    return get_fa_version() > PkgVersion(version)
+
+
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
@@ -300,6 +334,28 @@ def deprecate_inference_params(inference_context, inference_params):
         )
         return inference_params
     return inference_context
+
+
+def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
+    """Issue a deprecation warning if tp_group is None and return the default tp group."""
+    # TODO(zijiey): remove this function later.
+    if tp_group is None:
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            warnings.warn(
+                "Warning: tp_group is None, using default tp group. "
+                "Passing tp_group will be mandatory soon",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if is_expert:
+            tp_group = parallel_state.get_expert_tensor_parallel_group(
+                check_initialized=check_initialized
+            )
+        else:
+            tp_group = parallel_state.get_tensor_model_parallel_group(
+                check_initialized=check_initialized
+            )
+    return tp_group
 
 
 def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False):
@@ -356,7 +412,7 @@ class GlobalMemoryBuffer:
     def __init__(self):
         self.buffer = {}
 
-    def get_tensor(self, tensor_shape, dtype, name):
+    def get_tensor(self, tensor_shape, dtype, name, mem_alloc_context: Optional[Callable] = None):
         """
         Returns (potentially) a sub-tensor from the self.buffer for the given shape.
         """
@@ -365,9 +421,14 @@ class GlobalMemoryBuffer:
             self.buffer.get((name, dtype), None) is None
             or self.buffer[(name, dtype)].numel() < required_len
         ):
-            self.buffer[(name, dtype)] = torch.empty(
-                required_len, dtype=dtype, device=torch.cuda.current_device(), requires_grad=False
-            )
+            mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
+            with mem_alloc_context():
+                self.buffer[(name, dtype)] = torch.empty(
+                    required_len,
+                    dtype=dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=False,
+                )
 
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
 
@@ -384,6 +445,26 @@ def _kernel_make_viewless_tensor(inp, requires_grad):
     out = torch.empty((1,), dtype=inp.dtype, device=inp.device, requires_grad=requires_grad)
     out.data = inp.data
     return out
+
+
+class WrappedTensor:
+    """
+    A wrapper for tensors that enables caller functions to pass an indirect reference
+    to callee functions. By wrapping the tensor, the caller's direct reference is removed,
+    allowing the tensor to be garbage collected once the callee unwraps and frees it.
+    """
+
+    def __init__(self, tensor: torch.Tensor):
+        self._wrapper = [tensor]
+
+    def unwrap(self):
+        """
+        Returns the wrapped tensor while deleting the internal reference.
+        Can only be called once.
+        """
+        if len(self._wrapper) == 0:
+            raise RuntimeError(f"WrappedTensor has already been unwrapped")
+        return self._wrapper.pop(0)
 
 
 class MakeViewlessTensor(torch.autograd.Function):
@@ -1686,3 +1767,153 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
                 batch[key] = val
 
     return batch
+
+
+######################
+### NVTX profiling ###
+######################
+
+_nvtx_enabled: bool = False  # Whether NVTX range profiling is enabled
+_nvtx_range_messages: list[str] = []  # Messages associated with active NVTX ranges
+
+
+def configure_nvtx_profiling(enabled: bool) -> None:
+    """Configure NVTX range profiling to be enabled or disabled.
+
+    Args:
+        enabled (bool): Whether to enable NVTX range profiling
+    """
+    global _nvtx_enabled
+    _nvtx_enabled = enabled
+
+
+def _nvtx_range_push(msg: str) -> None:
+    """Push NVTX range onto stack, if NVTX range profiling is enabled.
+
+    Args:
+        msg (str): Message to associate with range
+
+    Note:
+        Set `MEGATRON_NVTX_ENABLED=1` in the environment to enable NVTX range profiling.
+    """
+    if not _nvtx_enabled:
+        return
+    _nvtx_range_messages.append(msg)
+    torch.cuda.nvtx.range_push(msg)
+
+
+def _nvtx_range_pop(msg: Optional[str] = None) -> None:
+    """Pop NVTX range from stack, if NVTX range profiling is enabled.
+
+    Args:
+        msg (str, optional): Message associated with range
+
+    Note:
+        Set `MEGATRON_NVTX_ENABLED=1` in the environment to enable NVTX range profiling.
+    """
+    # Return immediately if NVTX range profiling is not enabled
+    if not _nvtx_enabled:
+        return
+
+    # Update list of NVTX range messages and check for consistency
+    if not _nvtx_range_messages:
+        raise RuntimeError("Attempted to pop NVTX range from empty stack")
+    last_msg = _nvtx_range_messages.pop()
+    if msg is not None and msg != last_msg:
+        raise ValueError(
+            f"Attempted to pop NVTX range from stack with msg={msg}, "
+            f"but last range has msg={last_msg}"
+        )
+
+    # Pop NVTX range
+    torch.cuda.nvtx.range_pop()
+
+
+def _nvtx_range_get_func_path():
+    """Get the path of a function. Assumes being called from nvtx_range_push/pop.
+
+    Returns:
+        str: Module path and function name joined by a dot
+    """
+    # Get the caller's caller frame (go back 2 frames)
+    frame = inspect.currentframe().f_back.f_back
+    caller_func = inspect.getframeinfo(frame).function
+    module = inspect.getmodule(frame)
+
+    return f"{module.__name__}.{caller_func}"
+
+
+def nvtx_range_push(msg=None, suffix=None) -> None:
+    """Push NVTX range onto stack. If msg is not provided, use the calling function's path.
+
+    Args:
+        msg (str, optional): Message to associate with range
+        suffix (str, optional): Suffix to append to the message
+    """
+    if msg is None:
+        msg = _nvtx_range_get_func_path()
+    if suffix is not None:
+        msg = f"{msg}.{suffix}"
+
+    _nvtx_range_push(msg)
+
+
+def nvtx_range_pop(msg=None, suffix=None) -> None:
+    """Pop NVTX range from stack. If msg is not provided, use the calling function's path.
+
+    Args:
+        msg (str, optional): Message to associate with range
+        suffix (str, optional): Suffix to append to the message
+    """
+    if msg is None:
+        msg = _nvtx_range_get_func_path()
+    if suffix is not None:
+        msg = f"{msg}.{suffix}"
+
+    _nvtx_range_pop(msg)
+
+
+@lru_cache(maxsize=None)
+def _nvtx_decorator_get_func_path(func):
+    """Get the path of a function.
+
+    Args:
+        func (Callable): Function to get path for.
+
+    Returns:
+        str: Module path and function name joined by a dot
+    """
+    caller_func = func.__name__
+    module = inspect.getmodule(func)
+
+    return f"{module.__name__}.{caller_func}"
+
+
+def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
+    """Decorator to add NVTX range to a function.
+
+    Args:
+        message (str, optional): Custom message for the NVTX range. If None, uses function path
+        color (str, optional): Color for the NVTX range. Defaults to None
+
+    Returns:
+        Callable: Decorated function with NVTX profiling if enabled
+
+    Example:
+        @nvtx_decorator()
+        def my_function():
+            pass
+
+        @nvtx_decorator(message="Custom Range", color="blue")
+        def another_function():
+            pass
+    """
+
+    def decorator(func: Callable) -> Callable:
+        if _nvtx_enabled:
+            return nvtx.annotate(
+                message=message or _nvtx_decorator_get_func_path(func), color=color
+            )(func)
+        return func
+
+    return decorator

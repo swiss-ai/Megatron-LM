@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Callable
+from typing import Callable, List, Optional
 
 import torch
 import transformer_engine as te
@@ -11,14 +11,26 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
-try:
-    import modelopt.torch.quantization as mtq
-    from modelopt.torch.quantization.nn import QuantModuleRegistry
-    from modelopt.torch.quantization.nn.modules.quant_linear import _QuantLinear
+FP8_PER_TENSOR_REAL_QUANT_CFG = {
+    "quant_cfg": {
+        "*weight_quantizer": {"num_bits": (4, 3), "axis": None},
+        "*input_quantizer": {"enable": False},
+        "*output_layer*": {"enable": False},
+        "default": {"enable": False},
+    },
+    "algorithm": "max",
+}
 
-    has_nvidia_modelopt = True
-except Exception:
-    has_nvidia_modelopt = False
+# FP8 2D blockwise real quantization config for deepseek models
+FP8_2D_BLOCKWISE_REAL_QUANT_CFG = {
+    "quant_cfg": {
+        "*weight_quantizer": {"num_bits": (4, 3), "block_sizes": {-1: 128, -2: 128}},
+        "*input_quantizer": {"enable": False},
+        "*output_layer*": {"enable": False},
+        "default": {"enable": False},
+    },
+    "algorithm": "max",
+}
 
 
 class Norm:
@@ -69,7 +81,7 @@ class Norm:
 
 
 class Linear(torch.nn.Linear):
-    """Local Linear impl as a replacement of TELinear."""
+    """Local Linear impl as a replacement of ParallelLinear."""
 
     def __init__(
         self,
@@ -79,16 +91,33 @@ class Linear(torch.nn.Linear):
         config: ModelParallelConfig,
         init_method: Callable,
         bias: bool = True,
+        gather_output: bool = False,
+        stride: int = 1,
+        keep_master_weight_for_test: bool = False,
         skip_bias_add: bool = False,
         skip_weight_param_allocation: bool = False,
+        embedding_activation_buffer: Optional[List[torch.Tensor]] = None,
+        grad_output_buffer: Optional[List[torch.Tensor]] = None,
         is_expert: bool = False,
-        **kwargs,
+        tp_comm_buffer_name: str = None,  # Not used
+        disable_grad_reduce: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.config = config
 
         self._return_bias = skip_bias_add and bias
+
+        if stride != 1:
+            raise ValueError('torch.nn.Linear does not support stride != 1')
+
         if skip_weight_param_allocation:
             raise ValueError('torch.nn.Linear layers do not support skip_weight_param_allocation')
+
+        if embedding_activation_buffer is not None:
+            raise ValueError('torch.nn.Linear does not support embedding_activation_buffer != None')
+
+        if grad_output_buffer is not None:
+            raise ValueError('torch.nn.Linear does not support grad_output_buffer != None')
 
         super().__init__(
             in_features=input_size, out_features=output_size, bias=bias, dtype=config.params_dtype
@@ -125,10 +154,6 @@ class Linear(torch.nn.Linear):
         return out, None
 
 
-if has_nvidia_modelopt:
-    QuantModuleRegistry.register({Linear: Linear.__class__.__name__})(_QuantLinear)
-
-
 class RealQuantTransformerLayer(TransformerLayer):
     """Real quantization transformer layer base class.
 
@@ -146,11 +171,18 @@ class RealQuantTransformerLayer(TransformerLayer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if has_nvidia_modelopt and self.real_quant_cfg != "None":
 
+        try:
+            import modelopt.torch.quantization as mtq
+
+            has_nvidia_modelopt = True
+        except Exception:
+            has_nvidia_modelopt = False
+
+        if has_nvidia_modelopt and self.real_quant_cfg != "None":
             REAL_QUANT_CFG_CHOICES = {
-                "fp8_real_quant": mtq.FP8_PER_TENSOR_REAL_QUANT_CFG,
-                "fp8_blockwise_real_quant": mtq.FP8_BLOCKWISE_REAL_QUANT_CFG,
+                "fp8_real_quant": FP8_PER_TENSOR_REAL_QUANT_CFG,
+                "fp8_blockwise_real_quant": FP8_2D_BLOCKWISE_REAL_QUANT_CFG,
             }
             mtq_cfg = REAL_QUANT_CFG_CHOICES.get(self.real_quant_cfg, None)
             if mtq_cfg is None:
@@ -161,6 +193,7 @@ class RealQuantTransformerLayer(TransformerLayer):
             self._collect_original_tensor_info()
 
             mtq.quantize(self, mtq_cfg)
+            mtq.compress(self)
 
             delattr(self, "_modelopt_state")
 

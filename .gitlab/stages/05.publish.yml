@@ -1,7 +1,7 @@
 .publish_common_freeze:
   stage: publish
   rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $PUBLISH == "yes" && $PUBLISH_SCOPE == "code-freeze"
+    - if: ($CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH) && $PUBLISH == "yes" && $PUBLISH_SCOPE == "code-freeze"
       when: manual
     - when: never
 
@@ -39,7 +39,7 @@ publish:test_release_pypi_build_wheel:
     - purpose/builder-small
     - team/megatron
   variables:
-    PY_ENV: pytorch_24.10
+    PY_ENV: pytorch_25.03
     KUBERNETES_SERVICE_MEMORY_REQUEST: 16Gi
     KUBERNETES_SERVICE_MEMORY_LIMIT: 16Gi
     PUBLISH_DRYRUN: "yes"
@@ -84,7 +84,9 @@ publish:test_release_pypi_test_wheel:
   image:
     name: python:3.11
     entrypoint: [""]
-  needs: [publish:test_release_pypi_build_wheel]
+  needs:
+    - job: publish:test_release_pypi_build_wheel
+      optional: true
   parallel:
     matrix:
       - PLATFORM: arm64
@@ -147,7 +149,9 @@ publish:test_release_pypi_push_wheel:
     - owner/jet-core
     - purpose/utility
     - team/megatron
-  needs: [publish:test_release_pypi_test_wheel]
+  needs:
+    - job: publish:test_release_pypi_test_wheel
+      optional: true
   variables:
     GIT_STRATEGY: none
     PUBLISH_DRYRUN: "yes"
@@ -173,13 +177,6 @@ publish:test_release_pypi_push_wheel:
       if [[ "$PUBLISH_DRYRUN" != "yes" ]]; then
         twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository   $REPOSITORY wheelhouse/* dist/*
       fi
-
-  rules:
-    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
-      allow_failure: true
-      when: on_success
-    - when: on_success
-      allow_failure: true
 
 publish:test_release_github:
   extends: [.test_rules]
@@ -214,7 +211,7 @@ publish:test_release_github:
 
     - |
       PAYLOAD=$(jq -nc \
-                  --arg TAG_NAME "v${RELEASE_NUMBER}" \
+                  --arg TAG_NAME "core_v${RELEASE_NUMBER}" \
                   --arg CI_COMMIT_SHA "$PUBLISH_COMMIT" \
                   --arg NAME "$NAME" \
                   --arg BODY "$CHANGELOG" \
@@ -265,26 +262,29 @@ publish:test_release_notify:
     PUBLISH_DRYRUN: "yes"
   script:
     - echo $PUBLISH_DRYRUN
-    - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_r$RELEASE_NUMBER"
+    - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_v$RELEASE_NUMBER"
     - |
-      MESSAGE='{
+      cat << EOF > message.json
+      {
           "blocks": [
             {
               "type": "section",
               "text": {
                 "type": "mrkdwn",
-                    "text": "Releasebot 🤖: Megatron-Core released <'$URL'|core_r'"$RELEASE_NUMBER"'> 🚀"
+                "text": "Releasebot 🤖: Megatron-Core released <${URL}|core_v${RELEASE_NUMBER}> 🚀"
               }
             }
           ]
-        }'
+      }
+      EOF
 
-    - echo "$MESSAGE"
+    - cat message.json
+
     - |
       CMD=$(echo curl \
         -X POST \
         -H "Content-type: application/json" \
-        --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
+        -d @message.json ${MCORE_NOTIFICATION_HOOK_MAIN}
       )
 
       if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
@@ -330,14 +330,14 @@ publish:test_release_version_bump:
       fi
 
     - sed -i "/^PATCH/c\PATCH = $NEXT_PATCH" megatron/core/package_info.py
-    - sed -i "/^PRE_RELEASE/c\PRE_RELEASE = $NEXT_PRERELEASE" megatron/core/package_info.py
+    - sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '$NEXT_PRERELEASE'" megatron/core/package_info.py
 
     - git config --global user.email "mcore-bot@nvidia.com"
     - git config --global user.name "Mcore Bot"
     - git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
     - |
       CMD=$(
-        cat <<EOF
+        cat <<'EOF'
           git switch --force-create bot/chore/bump-version && \
           git add megatron/core/package_info.py && \
           git commit -m "chore: adjust version version" && \
@@ -370,8 +370,6 @@ publish:code_freeze:
     - owner/jet-core
     - purpose/utility
     - team/megatron
-  variables:
-    GIT_STRATEGY: "none"
   script:
     - git fetch origin $CI_DEFAULT_BRANCH
     - git config --global user.email "mcore-bot@nvidia.com"
@@ -381,6 +379,7 @@ publish:code_freeze:
     - VERSION=$(python -c "from megatron import core; print(core.__version__)")
     - RELEASE_BRANCH=core_r$VERSION
     - git switch --force-create $RELEASE_BRANCH origin/$CI_DEFAULT_BRANCH
+    - git push -u origin $RELEASE_BRANCH
     - |
       MESSAGE='{
         "blocks": [
@@ -396,11 +395,11 @@ publish:code_freeze:
     - |
       curl -X POST -H "Content-type: application/json" --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
 
+    - git switch main
     - git switch --force-create bot/chore/bump-version
     - git add megatron/core/package_info.py
     - |
       git commit -m "chore: adjust version version"
-
     - git push -u origin bot/chore/bump-version
     - |
       curl \
@@ -444,8 +443,9 @@ publish:release_version_bump:
     PUBLISH_DRYRUN: "no"
 
 publish:release_notify:
-  needs: [publish:release_pypi_push_wheel, publish:release_github]
+  needs: [publish:release_pypi_test_wheel, publish:release_pypi_push_wheel, publish:release_github]
   extends: [publish:test_release_notify, .publish_common_release]
+  dependencies: [publish:release_pypi_test_wheel]
   variables:
     PUBLISH_DRYRUN: "no"
 
@@ -459,10 +459,17 @@ publish:docs:
     - owner/jet-core
     - purpose/utility
     - team/megatron
+  before_script:
+    - eval PUBLISH_COMMIT=$PUBLISH_COMMIT
+    - git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    - git fetch origin $PUBLISH_COMMIT
+    - git checkout $PUBLISH_COMMIT
   script:
     - cd ..
-    - rm -rf documentation && git clone --recursive https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
+    - rm -rf documentation && git clone --recursive https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
     - cd documentation/megatron-lm
+    - git config --global user.email "mcore-bot@nvidia.com"
+    - git config --global user.name "Mcore Bot"
     - git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
     - git fetch origin $PUBLISH_COMMIT
     - git checkout $PUBLISH_COMMIT
@@ -472,18 +479,28 @@ publish:docs:
       git commit -m 'feat: Bump mcore'
 
     - git push
+  rules:
+    - if: '$CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "push"'
+      allow_failure: true
+    - when: never
 
 publish:upload_statistics:
   stage: publish
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   needs:
     - job: test:unit_tests_pyt(DEV)_mcore(legacy)
+      optional: true
     - job: test:unit_tests_pyt(LTS)_mcore(legacy)
+      optional: true
     - job: test:unit_tests_pyt(DEV)_mcore(latest)
     - job: test:unit_tests_pyt(LTS)_mcore(latest)
-    - job: functional:run_lts
+    - job: functional:run_lts_dgx_a100
       optional: true
-    - job: functional:run_dev
+    - job: functional:run_lts_dgx_h100
+      optional: true
+    - job: functional:run_dev_dgx_a100
+      optional: true
+    - job: functional:run_dev_dgx_h100
       optional: true
   tags:
     - arch/amd64
@@ -499,7 +516,27 @@ publish:upload_statistics:
     - export DASHBOARD_ENDPOINT
     - python tests/test_utils/python_scripts/dashboard.py --pipeline-id ${CI_PIPELINE_ID}
   rules:
-    - if: ($CI_PIPELINE_SOURCE == 'merge_request_event' || $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train') && ($UNIT_TEST == "yes" || $INTEGRATION_TEST == "yes" || $FUNCTIONAL_TEST == "yes")
+    - if: ($CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' || $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train') && ($UNIT_TEST == "yes" || $INTEGRATION_TEST == "yes" || $FUNCTIONAL_TEST == "yes")
       when: always
       allow_failure: true
+    - when: never
+
+public:review_reminder:
+  stage: publish
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  script:
+    - export GITLAB_ENDPOINT
+    - export RO_API_TOKEN=${PAT}
+    - export SLACK_WEBHOOK_URL=${SLACK_REMINDER_HOOK}
+    - export SLACK_API_TOKEN=${SLACK_API_TOKEN}
+    - python tests/test_utils/python_scripts/auto_reminder.py
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  rules:
+    - if: $CI_COMMIT_BRANCH == "ci-review-reminder" && $PUBLISH == "yes" && $PUBLISH_SCOPE == "review-reminder"
     - when: never

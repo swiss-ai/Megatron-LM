@@ -24,6 +24,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import \
     FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
 from megatron.core.dist_checkpointing.core import OldXieluException
 from megatron.core.num_microbatches_calculator import update_num_microbatches
+from megatron.core.utils import is_te_min_version
 from megatron.core.fp8_utils import is_float8tensor
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from .async_utils import schedule_async_save, is_empty_async_queue
@@ -1106,7 +1107,10 @@ def load_args_from_checkpoint(
 
     _set_arg('num_experts', force=True)
     _set_arg('moe_layer_freq', force=True)
-    _set_arg('moe_ffn_hidden_size', force=True)
+    if getattr(checkpoint_args, 'num_experts', None) is not None:
+        _set_arg('moe_ffn_hidden_size', force=True)
+    else:
+        setattr(args, 'moe_ffn_hidden_size', None)
     _set_arg('moe_router_topk', force=True)
     _set_arg('moe_token_dispatcher_type', force=True)
     _set_arg('moe_router_pre_softmax', force=True)
@@ -1117,6 +1121,12 @@ def load_args_from_checkpoint(
     _set_arg('mamba_state_dim', force=True)
     _set_arg('mamba_head_dim', force=True)
     _set_arg('mamba_num_groups', force=True)
+    _set_arg('mamba_num_heads', force=True)
+    _set_arg('is_hybrid_model', force=True)
+
+    # Heterogeneous args.
+    _set_arg('heterogeneous_layers_config_path', force=True)
+    _set_arg('heterogeneous_layers_config_encoded_json', force=True)
 
     # Tokenizer args.
     _set_arg('tokenizer_type', force=True)
@@ -1164,6 +1174,9 @@ def fix_fp8_params_lose_precision_when_loading_dist_ckpt(state_dict):
     bf16/fp16 -> fp8 -> bf16/fp16). This function is implemented to solve this problem.
     When "--fp8-param-gather" is disabled, this function doesn't modify anything.
     """
+    if is_te_min_version("2.0"):
+        # TE 2.x doesn't need this fix.
+        return
     for key in state_dict.keys():
         if key.startswith('model'):
             for _, sharded_tensor in state_dict[key].items():

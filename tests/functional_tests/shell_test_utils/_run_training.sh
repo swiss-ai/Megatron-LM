@@ -63,8 +63,30 @@ fi
 
 # Exit earlier to leave time for properly saving checkpoint
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
-    PARAMS=""
-    TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + "=" + .value] | join("")' "$TRAINING_PARAMS_PATH" | tr '\n' ' ')
+    PARAMS=()
+    # Store the output in a variable first
+    TRAINING_PARAMS_STR=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == true); .value = "true") | .key + "=" + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
+    # Build space-separated string while preserving quotes
+    TRAINING_PARAMS_FROM_CONFIG=""
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            # If value is "true", just use the key
+            if [[ "$line" =~ =true$ ]]; then
+                TRAINING_PARAMS_FROM_CONFIG+="${line%=true} "
+            # If value contains spaces, wrap it in quotes
+            elif [[ "$line" =~ .*=.*[[:space:]].* ]]; then
+                key="${line%%=*}"
+                value="${line#*=}"
+                TRAINING_PARAMS_FROM_CONFIG+="$key=\"$value\" "
+            else
+                TRAINING_PARAMS_FROM_CONFIG+="$line "
+            fi
+        fi
+    done <<<"$TRAINING_PARAMS_STR"
+    # Remove trailing space
+    TRAINING_PARAMS_FROM_CONFIG=${TRAINING_PARAMS_FROM_CONFIG% }
+    # Split into array while preserving quotes
+    eval "TRAINING_PARAMS_ARRAY=($TRAINING_PARAMS_FROM_CONFIG)"
 
 else
     # If this is a second run (of checkpoint-resume), we might want to use a
@@ -76,12 +98,51 @@ else
         export KEY="MODEL_ARGS"
     fi
 
-    TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + " " + .value] | join("")' "$TRAINING_PARAMS_PATH" | tr '\n' ' ')
-    PARAMS="--exit-duration-in-mins $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))"
+    # Store the output in a variable first
+    TRAINING_PARAMS_STR=$(yq '... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == true); .value = "true") | .key + ": " + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
+    # Build space-separated string while preserving quotes
+    TRAINING_PARAMS_FROM_CONFIG=""
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+
+            key="${line%%:*}"
+            value="${line#*: }"
+            value="$(echo "$value" | xargs)" # trim whitespace
+            # Case: true
+            if [[ "$value" == "true" ]]; then
+                TRAINING_PARAMS_FROM_CONFIG+="${key} "
+
+            # Case: value is wrapped in ( )
+            elif echo "$value" | grep -Eq '^\([^)]+\)$'; then
+                TRAINING_PARAMS_FROM_CONFIG+="$key \"$value\" "
+
+            # Case: value is wrapped in [ ]
+            elif echo "$value" | grep -Eq '^\[[^]]+\]$'; then
+                # Strip square brackets from value using sed
+                value=$(echo "$value" | sed 's/^\[//;s/\]$//')
+                TRAINING_PARAMS_FROM_CONFIG+="$key $value "
+
+            # Case: contains spaces
+            elif [[ "$value" == *" "* ]]; then
+                TRAINING_PARAMS_FROM_CONFIG+="$key \"$value\" "
+            # Case: default
+            else
+                TRAINING_PARAMS_FROM_CONFIG+="$key $value "
+            fi
+        fi
+    done <<<"$TRAINING_PARAMS_STR"
+    # Remove trailing space
+    TRAINING_PARAMS_FROM_CONFIG=${TRAINING_PARAMS_FROM_CONFIG% }
+    # Split into array while preserving quotes
+    eval "TRAINING_PARAMS_ARRAY=($TRAINING_PARAMS_FROM_CONFIG)"
+    PARAMS=(
+        "--exit-duration-in-mins"
+        $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))
+    )
 fi
 
 # Extract training params
-PARAMS="$PARAMS $TRAINING_PARAMS_FROM_CONFIG"
+PARAMS=("${PARAMS[@]}" "${TRAINING_PARAMS_ARRAY[@]}")
 
 # Set PYTHONPATH
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
@@ -110,12 +171,21 @@ DISTRIBUTED_ARGS=(
 )
 
 # Start training
-torchrun ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH $PARAMS || EXIT_CODE=$?
+if [[ "$IS_NEMO_TEST" == "true" ]]; then
+    torchrun ${DISTRIBUTED_ARGS[@]} --no-python $TRAINING_SCRIPT_PATH "${PARAMS[@]}" || EXIT_CODE=$?
+else
+    torchrun ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH "${PARAMS[@]}" || EXIT_CODE=$?
+fi
 
 # Run after script
 AFTER_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | yq '.AFTER_SCRIPT')
 if [[ "$AFTER_SCRIPT" != null ]]; then
     eval "$AFTER_SCRIPT"
+fi
+
+if [[ ${RECORD_CHECKPOINTS} == "true" ]]; then
+    echo "Suppressing errors during checkpoint recording."
+    exit 0
 fi
 
 exit ${EXIT_CODE:-0}

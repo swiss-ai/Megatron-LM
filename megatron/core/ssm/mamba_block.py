@@ -14,13 +14,13 @@ from typing import Optional, Union
 import torch
 from torch import Tensor, nn
 
-from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -30,7 +30,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 
 # https://github.com/huggingface/transformers/blob/c28d04e9e252a1a099944e325685f14d242ecdcd/src/transformers/models/gpt2/modeling_gpt2.py#L454
@@ -111,6 +111,8 @@ class MambaStack(MegatronModule):
             Defaults to True.
         device (optional): the device to use. Defaults to None.
         dtype (optional): the data type to use. Defaults to None.
+        model_comm_pgs (ModelCommProcessGroups): the required model communication
+            process groups to use.
     """
 
     def __init__(
@@ -126,12 +128,17 @@ class MambaStack(MegatronModule):
         post_process: bool = True,
         device=None,
         dtype=None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ) -> None:
         super().__init__(config=config)
         self.residual_in_fp32 = residual_in_fp32
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
+
+        assert model_comm_pgs is not None, "model_comm_pgs must be provided for MambaStack"
+
+        self.pp_group = model_comm_pgs.pp
 
         # Required for pipeline parallel schedules
         self.input_tensor = None
@@ -148,30 +155,41 @@ class MambaStack(MegatronModule):
         )
 
         pp_layer_offset = 0
-        if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+        if self.pp_group.size() > 1:
             pp_layer_offset, layer_type_list = self._select_layers_for_pipeline_parallel(
                 layer_type_list
             )
 
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(layer_type_list):
-            if layer_type == LayerSymbols.MAMBA:
-                layer = build_module(
-                    submodules.mamba_layer,
-                    config=self.config,
-                    residual_in_fp32=residual_in_fp32,
-                    layer_number=i + 1 + pp_layer_offset,
-                )
-            elif layer_type == LayerSymbols.ATTENTION:
-                # Transformer layers apply their own pp_layer_offset
-                layer = build_module(
-                    submodules.attention_layer, config=self.config, layer_number=i + 1
-                )
-            elif layer_type == LayerSymbols.MLP:
-                # Transformer layers apply their own pp_layer_offset
-                layer = build_module(submodules.mlp_layer, config=self.config, layer_number=i + 1)
-            else:
-                assert False, "unexpected layer_type"
+            fp8_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
+            with fp8_init_context:
+                if layer_type == LayerSymbols.MAMBA:
+                    layer = build_module(
+                        submodules.mamba_layer,
+                        config=self.config,
+                        residual_in_fp32=residual_in_fp32,
+                        layer_number=i + 1 + pp_layer_offset,
+                        tp_group=model_comm_pgs.tp,
+                    )
+                elif layer_type == LayerSymbols.ATTENTION:
+                    # Transformer layers apply their own pp_layer_offset
+                    layer = build_module(
+                        submodules.attention_layer,
+                        config=self.config,
+                        layer_number=i + 1,
+                        model_comm_pgs=model_comm_pgs,
+                    )
+                elif layer_type == LayerSymbols.MLP:
+                    # Transformer layers apply their own pp_layer_offset
+                    layer = build_module(
+                        submodules.mlp_layer,
+                        config=self.config,
+                        layer_number=i + 1,
+                        model_comm_pgs=model_comm_pgs,
+                    )
+                else:
+                    assert False, "unexpected layer_type"
             self.layers.append(layer)
 
         # Required for activation recomputation
@@ -194,17 +212,14 @@ class MambaStack(MegatronModule):
         )
 
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
-        pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
-        num_layers_per_pipeline_rank = (
-            self.config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
-        )
+        num_layers_per_pipeline_rank = self.config.num_layers // self.pp_group.size()
 
-        assert parallel_state.get_virtual_pipeline_model_parallel_world_size() is None, (
+        assert self.config.virtual_pipeline_model_parallel_size is None, (
             "The Mamba hybrid model does not currently support "
             "virtual/interleaved pipeline parallelism"
         )
 
-        offset = pipeline_rank * num_layers_per_pipeline_rank
+        offset = self.pp_group.rank() * num_layers_per_pipeline_rank
         selected_list = layer_type_list[offset : offset + num_layers_per_pipeline_rank]
 
         return offset, selected_list
@@ -237,7 +252,7 @@ class MambaStack(MegatronModule):
 
     def forward(
         self,
-        hidden_states: Tensor,
+        hidden_states: Union[Tensor, WrappedTensor],
         attention_mask: Tensor,
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,
@@ -251,7 +266,9 @@ class MambaStack(MegatronModule):
             final hidden units
 
         Args:
-            hidden_states (Tensor): the input tensor.
+            hidden_states (Union[Tensor, WrappedTensor]): the input tensor.
+                Can be passed as a WrappedTensor during inference to avoid an obsolete
+                reference in the calling function.
             attention_mask (Tensor): the attention mask.
             inference_context (BaseInferenceContext): the inference parameters.
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
@@ -265,6 +282,14 @@ class MambaStack(MegatronModule):
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
+
+        # Delete the obsolete reference to the initial input tensor if necessary
+        if isinstance(hidden_states, WrappedTensor):
+            hidden_states = hidden_states.unwrap()
+
+        # Update the inference parameters with the current batch size in case it is variable
+        if inference_context and not self.training:
+            inference_context.current_batch_size = hidden_states.size(1)
 
         if inference_context:
             assert (
@@ -341,7 +366,10 @@ class MambaStack(MegatronModule):
         return hidden_states
 
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None
+        self,
+        prefix: str = '',
+        sharded_offsets: Optional[tuple] = None,
+        metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
         """
         Returns a sharded state dictionary for the current object.

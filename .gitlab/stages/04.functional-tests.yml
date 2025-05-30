@@ -17,13 +17,18 @@ include:
 functional:configure:
   needs:
     - test:build_image
+    - test:build_nemo_image
     - job: test:unit_tests_pyt(DEV)_mcore(latest)
       optional: true
     - job: test:unit_tests_pyt(LTS)_mcore(latest)
       optional: true
-    - job: integration:run_lts
+    - job: integration:run_lts_dgx_a100
       optional: true
-    - job: integration:run_dev
+    - job: integration:run_dev_dgx_a100
+      optional: true
+    - job: integration:run_lts_dgx_h100
+      optional: true
+    - job: integration:run_dev_dgx_h100
       optional: true
   extends: [.functional_tests_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
@@ -63,8 +68,6 @@ functional:configure:
         "--n-repeat $FUNCTIONAL_TEST_REPEAT"
         "--time-limit $FUNCTIONAL_TEST_TIME_LIMIT"
         "--test-cases $FUNCTIONAL_TEST_CASES"
-        "--a100-cluster $A100_CLUSTER"
-        "--h100-cluster $H100_CLUSTER"
         "--container-image ${UTILITY_IMAGE}"
         "--container-tag ${CI_PIPELINE_ID}"
         "--dependent-job functional:configure"
@@ -77,27 +80,53 @@ functional:configure:
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
         ${ARGS[@]} \
         --environment dev \
-        --output-path "functional-test-job-dev.yaml" \
+        --platform dgx_a100 \
+        --cluster $A100_CLUSTER \
+        --output-path "functional-test-job-dev-A100.yaml" \
+        ${RELEASE_ARGS[@]}
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment dev \
+        --platform dgx_h100 \
+        --cluster $H100_CLUSTER \
+        --output-path "functional-test-job-dev-H100.yaml" \
         ${RELEASE_ARGS[@]}
     - |
       export PYTHONPATH=$(pwd)
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
         ${ARGS[@]} \
         --environment lts \
-        --output-path "functional-test-job-lts.yaml" \
+        --platform dgx_a100 \
+        --cluster $A100_CLUSTER \
+        --output-path "functional-test-job-lts-A100.yaml" \
+        ${RELEASE_ARGS[@]}
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment lts \
+        --platform dgx_h100 \
+        --cluster $H100_CLUSTER \
+        --output-path "functional-test-job-lts-H100.yaml" \
         ${RELEASE_ARGS[@]}
   artifacts:
     paths:
-      - functional-test-job-lts.yaml
-      - functional-test-job-dev.yaml
+      - functional-test-job-lts-A100.yaml
+      - functional-test-job-lts-H100.yaml
+      - functional-test-job-dev-A100.yaml
+      - functional-test-job-dev-H100.yaml
       - tests/test_utils/local_recipes
 
 .functional_run:
-  needs: [functional:configure]
+  needs:
+    - functional:configure
+    - test:build_image
   extends: [.functional_tests_rules]
   trigger:
     include:
-      - artifact: functional-test-job-$ENVIRONMENT.yaml
+      - artifact: functional-test-job-$ENVIRONMENT-$CLUSTER.yaml
         job: functional:configure
     strategy: depend
   variables:
@@ -106,18 +135,37 @@ functional:configure:
     CI_MCORE_LTS_IMAGE: $CI_MCORE_LTS_IMAGE
     GITLAB_ENDPOINT: $GITLAB_ENDPOINT
     PARENT_PIPELINE_ID: $CI_PIPELINE_ID
+    DASHBOARD_ENDPOINT: $DASHBOARD_ENDPOINT
+    MCORE_MR_COMMIT: $MCORE_MR_COMMIT
+    MCORE_BACKWARDS_COMMIT: $MCORE_BACKWARDS_COMMIT
+    CLUSTER: $CLUSTER
+
   inherit:
     variables: true
 
-functional:run_lts:
+functional:run_lts_dgx_a100:
   extends: [.functional_run]
   variables:
     ENVIRONMENT: lts
+    CLUSTER: A100
 
-functional:run_dev:
+functional:run_lts_dgx_h100:
+  extends: [.functional_run]
+  variables:
+    ENVIRONMENT: lts
+    CLUSTER: H100
+
+functional:run_dev_dgx_a100:
   extends: [.functional_run]
   variables:
     ENVIRONMENT: dev
+    CLUSTER: A100
+
+functional:run_dev_dgx_h100:
+  extends: [.functional_run]
+  variables:
+    ENVIRONMENT: dev
+    CLUSTER: H100
 
 functional:run_nemo:
   extends: [.functional_tests_rules]
@@ -129,9 +177,8 @@ functional:run_nemo:
     variables: true
   variables:
     MCORE_COMMIT: $CI_COMMIT_SHA
-    TEST_LLM_MODULE: "True"
-    TEST_ALIGNER_MODULE: "False"
-    TEST_DATA_CURATOR_MODULE: "False"
+    TEST_NEMO2_MODULE: "True"
+    ALLOW_FAILURE_DEPENDENCY: "True"
     TESTS_TO_RUN_ON_THIS_COMMIT: nightly
   rules:
     - if: $FUNCTIONAL_TEST == "yes"
@@ -143,8 +190,10 @@ functional:x_notify:
   extends: [.functional_tests_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   needs:
-    - functional:run_lts
-    - functional:run_dev
+    - functional:run_lts_dgx_a100
+    - functional:run_dev_dgx_a100
+    - functional:run_lts_dgx_h100
+    - functional:run_dev_dgx_h100
   tags:
     - arch/amd64
     - env/prod
