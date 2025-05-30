@@ -180,7 +180,7 @@ class MegatronGenerate(Resource):
                 if beam_width is not None:
                     send_do_beam_search()  # Tell other ranks we're doing beam_search
                     response, response_seg, response_scores = beam_search_and_post_process(
-                        self.model,
+                        self.engine.text_generation_controller.inference_wrapped_model.model,
                         prompts=prompts,
                         tokens_to_generate=tokens_to_generate,
                         beam_size=beam_width,
@@ -210,7 +210,7 @@ class MegatronServer(object):
         self.app = Flask(__name__, static_url_path='')
         api = Api(self.app)
         api.add_resource(MegatronGenerate, '/api', resource_class_args=[model, args])
-        api.add_resource(MegatronCompletions, '/completions', resource_class_args=[model])
+        api.add_resource(MegatronCompletions, '/completions', resource_class_args=[model, args])
 
     def run(self, url, port):
         self.app.run(url, threaded=True, debug=False, port=port)

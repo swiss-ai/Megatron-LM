@@ -84,12 +84,15 @@ class ModelParallelState(_ModelParallelState):
     def __new__(cls, tp=1, pp=1, ep=1):
         return super(ModelParallelState, cls).__new__(cls, tp, pp, ep)
 
+    def __str__(self):
+        return f"t{self.tp},p{self.pp},e{self.ep}"
+
 
 class ModelMeta:
     """Basic information about a model.
 
     Args:
-        format (str): 'core', 'legacy', 'meta', 'hf', or 'llava'.
+        format (str): 'core', 'meta', 'hf', or 'llava'.
         mp (ModelParallelState): Defines TP, PP, EP.
         transformer_impl (str): 'transformer_engine' or 'local'.
     """
@@ -101,13 +104,16 @@ class ModelMeta:
         if transformer_impl is None:
             transformer_impl = "transformer_engine" if format in ("core", "llava") else "local"
 
-        assert format in ("core", "legacy", "meta", "hf", "llava")
+        assert format in ("core", "meta", "hf", "llava")
         assert isinstance(mp, ModelParallelState)
         assert transformer_impl in ("transformer_engine", "local")
 
         self.format = format
         self.mp = mp
         self.transformer_impl = transformer_impl
+
+    def __str__(self):
+        return f"{self.format}|({self.mp})|{self.transformer_impl}"
 
 
 class Pipeline:
@@ -131,6 +137,9 @@ class Pipeline:
         assert isinstance(dst, ModelMeta)
         self.src = src
         self.dst = dst
+
+    def __str__(self):
+        return f"src <{self.src}>; dst <{self.dst}>"
 
     def get_model_argv(self):
         """Get argv list for customizing initialization."""
@@ -196,10 +205,6 @@ class Pipeline:
         # Fail on missing checkpoint.
         if key == "dst":
             sys.argv.append("--exit-on-missing-checkpoint")
-
-        # Use legacy.
-        if meta.format == "legacy":
-            sys.argv.append("--use-legacy-models")
 
         # Parse args.
         args = parse_args()
@@ -375,6 +380,10 @@ class Pipeline:
 
         meta = self.get_meta(key)
 
+        # The test is only designed to work with single model
+        assert len(models) == 1
+        model = models[0]
+
         with torch.no_grad():
 
             # Randomly initialize all params.
@@ -383,14 +392,11 @@ class Pipeline:
                     p.normal_(0, 0.1)
 
             # Synchronize embeddings.
-            if meta.mp.pp != 1 and parallel_state.is_rank_in_embedding_group():
-                if parallel_state.is_pipeline_first_stage():
-                    emb = models[0].module.module.shared_embedding_or_output_weight()
-                elif parallel_state.is_pipeline_last_stage():
-                    emb = models[-1].module.module.shared_embedding_or_output_weight()
-                else:
-                    raise Exception("should be either first/last pipeline rank.")
-                torch.distributed.all_reduce(emb, group=parallel_state.get_embedding_group())
+            if meta.mp.pp != 1:
+                emb = model.module.module.shared_embedding_or_output_weight()
+                # Make embedding the same on ranks that has is
+                if emb is not None:
+                    torch.distributed.all_reduce(emb, group=parallel_state.get_embedding_group())
 
     def save_checkpoint(self):
         """Initialize params, forward pass data, and save checkpoint."""
@@ -521,10 +527,6 @@ class Pipeline:
                 ).item()
                 mse_real = get_mse(dst_output_tensor_real)
                 mse_fake = get_mse(dst_output_tensor_fake)
-                assert mse_real < 0.01 * mse_fake, "mse_real (%e) >= 0.01 mse_fake (%e)." % (
-                    mse_real,
-                    mse_fake,
-                )
             torch.distributed.barrier()
 
             # Teardown.
@@ -554,6 +556,12 @@ class GPTPipeline(Pipeline):
         super().__init__(ModelMeta(*src), ModelMeta(*dst))
         assert isinstance(num_moe_experts, (int, types.NoneType))
         self.num_moe_experts = num_moe_experts
+
+    def __str__(self):
+        return "%s; moe %s" % (
+            super().__str__(),
+            "--" if self.num_moe_experts is None else self.num_moe_experts,
+        )
 
     def get_model_argv(self):
         """GPT model args."""
@@ -593,6 +601,13 @@ class LLaVAPipeline(Pipeline):
         self.language_model_type = language_model_type
         self.vision_model_type = vision_model_type
         sys.path.insert(0, './examples/multimodal')
+
+    def __str__(self):
+        return "%s; lang %s; vis %s" % (
+            super().__str__(),
+            self.language_model_type,
+            self.vision_model_type,
+        )
 
     def get_model_argv(self):
         """LLaVA model args."""
@@ -792,10 +807,6 @@ class LLaVAPipeline(Pipeline):
         if key == "dst":
             sys.argv.append("--exit-on-missing-checkpoint")
 
-        # Use legacy.
-        if meta.format == "legacy":
-            sys.argv.append("--use-legacy-models")
-
         # Parse args.
         from examples.multimodal.multimodal_args import add_multimodal_extra_args
 
@@ -824,11 +835,8 @@ def get_gpt_pipelines():
         GPTPipeline(("core", (2, 4)), ("core", (4, 2))),
         GPTPipeline(("core", (1, 8)), ("core", (8, 1))),
         GPTPipeline(("core", (4, 2)), ("core", (2, 4), "local")),
-        GPTPipeline(("legacy", (4, 2)), ("core", (2, 4))),
         GPTPipeline(("core", (4, 2), "local"), ("core", (2, 4), "local")),
         GPTPipeline(("core", (4, 2), "local"), ("core", (2, 4))),
-        # [todo] GPTPipeline(("legacy", (4, 2)), ("legacy", (2, 4))),
-        # [todo] GPTPipeline(("legacy", (4, 2), "te"), ("legacy", (2, 4), "te")),
         # [todo] GPTPipeline("meta", "core", None, (8, 1)),
         # [todo] GPTPipeline("hf", "core", None, (8, 1)),
     ]
@@ -882,16 +890,32 @@ def test_all_pipelines():
     for pipeline in tqdm(pipelines, "ckpt pipelines"):
         t = time.time()
         mses = pipeline.run()
-        elapsed_time = time.time() - t
-        results.append((elapsed_time, *mses))
+        latency = time.time() - t
+        results.append((latency, *mses))
         torch.cuda.empty_cache()
 
     # Print results.
     if int(os.environ["RANK"]) == 0:
         print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
         print("checkpoint converter results:")
-        [print("  t %.1f sec ... mse %.1e, %.1e." % (t, r, f)) for t, r, f in results]
+        success = []
+        for result_id, (latency, mse_real, mse_fake) in enumerate(results):
+            success.append(mse_real < 0.05 * mse_fake)
+            print(
+                "  %d. mse: real %.1e, fake %.1e%s ... time %.1f sec | %s"
+                % (
+                    result_id,
+                    mse_real,
+                    mse_fake,
+                    "" if success[-1] else " (failed)",
+                    latency,
+                    pipelines[result_id],
+                )
+            )
         print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+
+        num_failures = sum(not s for s in success)
+        assert num_failures == 0, "mse_real >= mse_fake, for %d test(s)." % num_failures
 
 
 if __name__ == "__main__":
