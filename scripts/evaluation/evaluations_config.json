@@ -47,7 +47,7 @@
                 "/capstor/scratch/cscs/asolergi/main_run_70B_megatron/Megatron-LM/logs/Meg-Runs/main-runs-v1/apertus3-70b-512-nodes-1e-5lr/checkpoints-512-noOverlap"
             ],
             "model_size": 70,
-            "tokens_per_iter": 8388608,
+            "tokens_per_iter": "8388608:523519,16777216:",
             "evaluate_every": 60000,
             "start_eval_after_iter": 180000,
             "limit": 1000
