@@ -4,7 +4,7 @@ GPUS_PER_NODE=4
 DEF_MEGATRON_PATH=$(dirname $(dirname $( cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )))  # Grandparent of current file location.
 DEF_LOGS_ROOT=$PWD/eval-logs
 DEF_CONTAINER_PATH=/iopsstor/scratch/cscs/ahgele/ngc_pt_jan.toml
-DEF_ACCOUNT=a-a06
+DEF_ACCOUNT=a-infra01-1
 DEF_TOKENIZER=alehc/swissai-tokenizer
 
 ITERATIONS=(latest)
@@ -44,6 +44,7 @@ usage () {
 	echo "  --bs (int>0): Batch size used for inference (default=$BS)."
 	echo "  --attn-impl (choices={flash_attention_2,sdpa}): Attention implementation to use (default=$ATTN_IMPL)."
 	echo "  --iterations (int>0 | 'latest'): Comma-separated list of iteration to evaluate (default=$ITERATIONS)"
+	echo "  --bod: Adds BOD token"
 	echo "  --revisions: Only used when input is HF checkpoint. Comma-sperated list of HF revisions to try. Must be the same length as --iterations"
 	echo "  --tokens-per-iter (int>0): If specified with --iteration, the total consumed_tokens will be calculated by iteration*tokens_per_iter. Cannot be specified if consumed_tokens is also specified"
 	echo "  --consumed-tokens (int>0): When --iteration or --tokens-per-iter are not set, you need to specify this to set the total number of tokens the checkpoint has seen up to now."
@@ -115,6 +116,8 @@ while [[ $# -gt 0 ]]; do
 			TASKS=$2; shift 2;;
 		--bs)
 			BS=$2; shift 2;;
+		--bod)
+			BOD=true; shift;;
 		--attn-impl)
 			ATTN_IMPL=$2; shift 2;;
 		--limit)
@@ -204,7 +207,30 @@ if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ]; then
 		echo When using megatron checkpoints, you cannot set --consumed-tokens, please set --tokens-per-iter instead >&2
 		exit 1
 	fi
-	CONSUMED_TOKENS="\\\$((IT*$TOKENS_PER_ITER))"
+	read -r -d '' CONSUMED_TOKENS_CALCULATION <<- EOM
+	TOKENS_PER_ITER=$TOKENS_PER_ITER
+	if [[ \\\$TOKENS_PER_ITER = *,* ]]; then
+		CONSUMED_TOKENS=0
+		CONSUMED_ITERS=0
+		for SUBSTR in \\\${TOKENS_PER_ITER//,/ }; do
+			if (( CONSUMED_ITERS < IT )); then
+				TOK_PER_ITER=\"\\\$(echo \\\$SUBSTR | cut -d':' -f1)\"
+				MAX_ITER=\"\\\$(echo \\\$SUBSTR | cut -d':' -f2)\"
+				if [[ \\\$MAX_ITER = \"\" ]]; then
+					ITERS_THIS_BLOCK=\\\$(( IT - CONSUMED_ITERS ))
+				elif (( IT > MAX_ITER )); then
+					ITERS_THIS_BLOCK=\\\$(( MAX_ITER - CONSUMED_ITERS - 1 ))
+				else
+					ITERS_THIS_BLOCK=\\\$(( IT - CONSUMED_ITERS ))
+				fi
+				CONSUMED_ITERS=\\\$(( CONSUMED_ITERS + ITERS_THIS_BLOCK ))
+				CONSUMED_TOKENS=\\\$(( CONSUMED_TOKENS + TOK_PER_ITER*ITERS_THIS_BLOCK ))
+			fi
+		done
+	else
+		CONSUMED_TOKENS=\\\$(( IT*$TOKENS_PER_ITER ))
+	fi
+	EOM
 else
 	# The huggingface checkpoints can get CONSUMED_TOKENS either by --tokens-per-iter or --consumed-tokens
 	if [ -z ${CONSUMED_TOKENS+x} ]; then
@@ -212,7 +238,7 @@ else
 			echo Neither of --consumed-tokens or --tokens-per-iter set, aborting >&2
 			exit 1
 		fi
-		CONSUMED_TOKENS="\\\$((IT*$TOKENS_PER_ITER))"
+		CONSUMED_TOKENS_CALCULATION="\\\$CONSUMED_TOKENS=\\\$((IT*$TOKENS_PER_ITER))"
 	fi
 fi
 
@@ -292,12 +318,17 @@ else
 	fi
 
 	DP=$((GPUS_PER_NODE/(TP*PP)))
+	COMMON_MODEL_ARGS="pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL,dtype=$DTYPE"
+	if [[ $BOD = true ]]; then
+		COMMON_MODEL_ARGS="$COMMON_MODEL_ARGS,add_bos_token=True"
+	fi
+
 	if [[ $DP -eq 1 ]]; then  # Only use model parallel.
-		CMD_EVAL="WANDB_RESUME=allow WORLD_SIZE=1 MASTER_ADDR=localhost MASTER_PORT=25678 lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL,dtype=$DTYPE,parallelize=True $COMMON_EVAL_ARGS"
+		CMD_EVAL="WANDB_RESUME=allow WORLD_SIZE=1 MASTER_ADDR=localhost MASTER_PORT=25678 lm_eval --cache_requests true --model=hf --model_args=$COMMON_MODEL_ARGS,parallelize=True $COMMON_EVAL_ARGS"
 	elif (( TP*PP > 1 )); then  # Use data parallel and model parallel.
-		CMD_EVAL="WANDB_RESUME=allow accelerate launch --multi_gpu --num_processes $DP -m lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL,dtype=$DTYPE,parallelize=True $COMMON_EVAL_ARGS"
+		CMD_EVAL="WANDB_RESUME=allow accelerate launch --multi_gpu --num_processes $DP -m lm_eval --cache_requests true --model=hf --model_args=$COMMON_MODEL_ARGS,parallelize=True $COMMON_EVAL_ARGS"
 	else  # Only use data parallel.
-		CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL,dtype=$DTYPE $COMMON_EVAL_ARGS"
+		CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$COMMON_MODEL_ARGS $COMMON_EVAL_ARGS"
 	fi
 fi
 
@@ -314,7 +345,8 @@ do
 
 	IT=\\\${ITERATIONS[\\\$i]}
 	$MAYBE_GRAB_REVISION
-	CONSUMED_TOKENS=$CONSUMED_TOKENS
+	$CONSUMED_TOKENS_CALCULATION
+	echo CONSUMED_TOKENS=\\\$CONSUMED_TOKENS
 
 	$CMD_CONVERT
 	$CMD_SERVER
