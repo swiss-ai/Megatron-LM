@@ -367,8 +367,8 @@ cat > $SBATCH_PATH <<- EOM
 #SBATCH --mem=460000
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --output=$LOGS_DIR/${JOBNAME}_%j.out
-#SBATCH --error=$LOGS_DIR/${JOBNAME}_%j.err
+#SBATCH --output=$LOGS_DIR/${JOBNAME}.out
+#SBATCH --error=$LOGS_DIR/${JOBNAME}.err
 #SBATCH --time=11:59:00
 #SBATCH --exclusive
 #SBATCH --dependency=singleton
