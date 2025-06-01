@@ -48,8 +48,8 @@
             ],
             "model_size": 70,
             "tokens_per_iter": "8388608:523519,16777216:",
-            "evaluate_every": 60000,
-            "start_eval_after_iter": 180000,
+            "evaluate_every": 30000,
+            "start_eval_after_iter": 569999,
             "limit": 1000
         }
     }
