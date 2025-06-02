@@ -394,12 +394,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.recompute_pre_mlp_layernorm = False
         self.recompute_mlp = False
         if self.config.recompute_granularity == 'selective':
-            if "layernorm" in self.config.recompute_modules:
+            if "layernorm" in self.config.recompute_modules and not self.config.post_layer_norm:  # dhia TODO (no recompute if post-norm)
                 if not isinstance(self.input_layernorm, IdentityOp):
                     self.recompute_input_layernorm = True
                 if not isinstance(self.pre_mlp_layernorm, IdentityOp):
                     self.recompute_pre_mlp_layernorm = True
-            if "mlp" in self.config.recompute_modules:
+            if "mlp" in self.config.recompute_modules and not self.config.post_layer_norm: # dhia TODO (no recompute if post-norm)
 
                 if not isinstance(self.mlp, MoELayer):
                     self.recompute_mlp = True
@@ -494,6 +494,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         else:
             input_layernorm_output = self.input_layernorm(hidden_states)
 
+        if not self.config.post_layer_norm:
+            input_layernorm_output = self.input_layernorm(hidden_states)
+        else:
+            input_layernorm_output = hidden_states
+
         # Self attention.
         nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
@@ -508,13 +513,18 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             sequence_len_offset=sequence_len_offset,
         )
         nvtx_range_pop(suffix="self_attention")
+        attention_output, bias = attention_output_with_bias
 
-        if self.recompute_input_layernorm:
+        if self.recompute_input_layernorm:  # pre-norm for sure (dhia: TODO)
             # discard the output of the input layernorm and register the recompute
             # as a gradient hook of attention_output_with_bias[0]
             self.input_layernorm_checkpoint.discard_output_and_register_recompute(
                 attention_output_with_bias[0]
             )
+        
+        if self.config.post_layer_norm:
+            attention_output = self.input_layernorm(attention_output)
+            assert bias is None
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -553,13 +563,16 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         residual = hidden_states
 
         # Optional Layer norm post the cross-attention.
-        if self.recompute_pre_mlp_layernorm:
+        if self.recompute_pre_mlp_layernorm:  # pre-norm AND recompute (dhia: TODO)
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
                 self.pre_mlp_layernorm, hidden_states
             )
-        else:
+        elif not self.config.post_layer_norm: # pre-norm (w/o recompute)
             pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+        else: # post-norm
+            pre_mlp_layernorm_output = hidden_states
+
 
         return pre_mlp_layernorm_output, residual, context
 
@@ -581,9 +594,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             self.config.mlp_chunks_for_prefill > 1
             and inference_context is not None
             and not inference_context.is_decode_only()
+            and not self.config.post_layer_norm
         )
 
-        if self.recompute_mlp:
+        if self.recompute_mlp:    # pre-norm
             if self.config.fp8:
                 # import here to avoid circular import
                 from megatron.core.extensions.transformer_engine import te_checkpoint
@@ -599,7 +613,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias = tensor_parallel.checkpoint(
                     self.mlp, False, pre_mlp_layernorm_output
                 )
-        elif should_chunk_mlp_for_prefill:
+        elif should_chunk_mlp_for_prefill:  # pre-norm
             # Chunk input along sequence dimension
             num_chunks = min(self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0])
             chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
@@ -613,10 +627,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
             mlp_output_with_bias = (mlp_output, bias_output)
 
-        else:
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+        else: # pre-norm or post-norm (w/o recompute nor chunking)
+            mlp_output, bias = self.mlp(pre_mlp_layernorm_output)
+            if self.config.post_layer_norm:
+                mlp_output = self.pre_mlp_layernorm(mlp_output)
+            mlp_output_with_bias = (mlp_output, bias)
 
-        if self.recompute_pre_mlp_layernorm:
+
+        if self.recompute_pre_mlp_layernorm: # pre-norm (dhia: TODO)
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of mlp_output_with_bias[0]
             self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(

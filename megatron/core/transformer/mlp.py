@@ -25,6 +25,8 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+from megatron.training.activations import XIELU, XIPReLU, XIPReLUP
+from megatron.core.metrics_tracking import get_tracker
 
 
 # pylint: disable=missing-class-docstring
@@ -65,6 +67,19 @@ class MLP(MegatronModule):
         self.config: TransformerConfig = config
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
+        self.layer_number = None
+
+        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        if ffn_hidden_size is None:
+            if is_expert:
+                raise ValueError("MoE MLP requires `ffn_hidden_size`, but it was not provided.")
+            warnings.warn(
+                "MLP requires ffn_hidden_size, but it was not provided. Using \
+                    config.ffn_hidden_size by default.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            ffn_hidden_size = self.config.ffn_hidden_size
 
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         if ffn_hidden_size is None:
@@ -97,7 +112,14 @@ class MLP(MegatronModule):
             tp_group=tp_group,
         )
 
-        self.activation_func = self.config.activation_func
+        if self.config.activation_func == XIELU:
+            self.activation_func = XIELU(config=self.config)
+        elif self.config.activation_func == XIPReLU:
+            self.activation_func = XIPReLU(config=self.config)
+        elif self.config.activation_func == XIPReLUP:
+            self.activation_func = XIPReLUP(config=self.config)
+        else:
+            self.activation_func = self.config.activation_func
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
@@ -119,6 +141,9 @@ class MLP(MegatronModule):
         nvtx_range_push(suffix="linear_fc1")
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
+
+        tracker = get_tracker()
+        tracker.update(intermediate_parallel, "mlp_intermediate", self.layer_number - 1)
 
         nvtx_range_push(suffix="activation")
         if self.config.bias_activation_fusion:
@@ -171,11 +196,14 @@ class MLP(MegatronModule):
 
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
+        tracker.update(intermediate_parallel, "mlp_post_act", self.layer_number - 1)
         output, output_bias = self.linear_fc2(intermediate_parallel)
         nvtx_range_pop(suffix="linear_fc2")
 
         if per_token_scale is not None:
             assert output_bias is None, "Bias is not supported with per_token_scale"
+
+        tracker.update(output, "mlp_out", self.layer_number - 1)
 
         return output, output_bias
 
@@ -192,6 +220,9 @@ class MLP(MegatronModule):
                         sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
+
+    def set_layer_number(self, layer_number: int):
+        self.layer_number = layer_number
 
 
 # pylint: disable=missing-function-docstring
@@ -274,7 +305,7 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
                 )
             if flattened_range.stop > chunk_numel:
                 # Non-empty `v` chunk
-                tensor_v = t[-(flattened_range.stop - chunk_numel) :]
+                tensor_v = t[-(flattened_range.stop - chunk_numel):]
                 flattened_range_v = slice(
                     max(chunk_numel, flattened_range.start) - chunk_numel,
                     flattened_range.stop - chunk_numel,

@@ -93,6 +93,8 @@ class GPTModel(LanguageModule):
         seq_len_interpolation_factor: Optional[float] = None,
         mtp_block_spec: Optional[ModuleSpec] = None,
         vp_stage: Optional[int] = None,
+        final_layernorm: bool = True,
+        input_embeddings_multiplier: float = 1.0,
     ) -> None:
         super().__init__(config=config)
 
@@ -113,6 +115,8 @@ class GPTModel(LanguageModule):
             self.position_embedding_type = self.config.position_embedding_type
         else:
             self.position_embedding_type = position_embedding_type
+        self.final_layernorm = final_layernorm
+        self.input_embeddings_multiplier = input_embeddings_multiplier
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -174,6 +178,7 @@ class GPTModel(LanguageModule):
             pre_process=self.pre_process,
             post_process=self.post_process,
             vp_stage=vp_stage,
+            final_layer_norm=self.final_layernorm,
         )
 
         if self.mtp_process:
@@ -270,6 +275,8 @@ class GPTModel(LanguageModule):
             pass
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            if self.input_embeddings_multiplier != 1.0:
+                decoder_input = decoder_input*self.input_embeddings_multiplier
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor

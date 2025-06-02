@@ -39,7 +39,7 @@ from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
 
 from ...utils import get_torch_version, is_torch_min_version
-from ..core import CheckpointingException
+from ..core import CheckpointingException, OldXieluException
 from ..dict_utils import nested_values
 from ..mapping import (
     ShardedBase,
@@ -568,6 +568,9 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
                     expected_shape = sh_ten.global_shape
                     if loaded_shape == expected_shape:
                         continue
+                if sh_ten.key in ["decoder.layers.mlp.activation_func.alpha_p",
+                                  "decoder.layers.mlp.activation_func.alpha_n"]:
+                    raise OldXieluException("Old xielu checkpoint encountered")
                 _msg = (
                     f'Global shape mismatch for loaded ({loaded_shape})'
                     f' and expected ({expected_shape}) tensor'

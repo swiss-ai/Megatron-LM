@@ -32,6 +32,7 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+from megatron.core.metrics_tracking import get_tracker
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
@@ -900,8 +901,16 @@ class SelfAttention(Attention):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
+        tracker = get_tracker()
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+        true_layer_number = self.layer_number + pp_rank*self.config.num_layers//pp_size
+        tracker.update(hidden_states, "qkv_input", true_layer_number - 1)
+
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         mixed_qkv, _ = self.linear_qkv(hidden_states)
+
+        tracker.update(mixed_qkv, "qkv", true_layer_number - 1)
 
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
@@ -939,9 +948,11 @@ class SelfAttention(Attention):
 
         if self.q_layernorm is not None:
             query = self.q_layernorm(query)
+        tracker.update(query, "q", true_layer_number - 1)
 
         if self.k_layernorm is not None:
             key = self.k_layernorm(key)
+        tracker.update(key, "k", true_layer_number - 1)
 
         if self.config.test_mode:
             self.run_realtime_tests()

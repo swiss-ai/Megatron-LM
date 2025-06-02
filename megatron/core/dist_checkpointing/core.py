@@ -18,6 +18,10 @@ class CheckpointingException(Exception):
     pass
 
 
+class OldXieluException(ValueError):
+    """Raised when an old Xielu checkpoint is encountered"""
+
+
 @dataclass
 class CheckpointingConfig:
     """Documents backends used in the checkpoint.
