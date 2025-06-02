@@ -6,7 +6,6 @@ import os
 import sys
 import torch
 
-from megatron.core import Timers
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator, unset_num_microbatches_calculator
 from megatron.training import dist_signal_handler
 from megatron.training.tokenizer import build_tokenizer
@@ -237,6 +236,7 @@ def _set_adlr_autoresume(args):
 
 def _set_timers(args):
     """Initialize timers."""
+    from megatron.core.utils import Timers
     global _GLOBAL_TIMERS
     _ensure_var_is_not_initialized(_GLOBAL_TIMERS, 'timers')
     _GLOBAL_TIMERS = Timers(args.timing_log_level, args.timing_log_option)

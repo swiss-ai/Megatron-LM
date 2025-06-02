@@ -25,10 +25,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
 )
 from megatron.core.process_groups_config import ModelCommProcessGroups
-from megatron.core.tensor_parallel.layers import (
-    _initialize_affine_weight_cpu,
-    set_tensor_model_parallel_attributes,
-)
+from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
@@ -484,6 +481,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         )
 
         if config.use_cpu_initialization:
+            from megatron.core.tensor_parallel.layers import _initialize_affine_weight_cpu
             output_size_per_partition = divide(output_size, self.tp_size)
             _ = _initialize_affine_weight_cpu(
                 self.weight,
@@ -583,6 +581,7 @@ class TEColumnParallelLinear(TELinear):
         )
 
         if config.use_cpu_initialization:
+            from megatron.core.tensor_parallel.layers import _initialize_affine_weight_cpu
             output_size_per_partition = divide(output_size, world_size)
             _ = _initialize_affine_weight_cpu(
                 self.weight,
@@ -669,6 +668,7 @@ class TERowParallelLinear(TELinear):
             world_size = tp_group.size()
             rank = tp_group.rank()
             input_size_per_partition = divide(input_size, world_size)
+            from megatron.core.tensor_parallel.layers import _initialize_affine_weight_cpu
             self.master_weight = _initialize_affine_weight_cpu(
                 self.weight,
                 output_size,

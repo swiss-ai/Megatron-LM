@@ -7,7 +7,8 @@ from typing import List, Optional, Union
 import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams, mpu, parallel_state, tensor_parallel
+from megatron.core.inference_params import InferenceParams
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_context
@@ -255,6 +256,7 @@ def get_mtp_layer_offset(config: TransformerConfig) -> int:
 
 def get_mtp_num_layers_to_build(config: TransformerConfig) -> int:
     """Get the number of MTP layers to build."""
+    from megatron.core import mpu
     # Currently, we only support put all of MTP layers on the last pipeline stage.
     if mpu.is_pipeline_last_stage():
         return config.mtp_num_layers if config.mtp_num_layers else 0
