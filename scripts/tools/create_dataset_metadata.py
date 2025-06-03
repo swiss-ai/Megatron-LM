@@ -36,12 +36,15 @@ class Metadata:
         return mapping
 
     def remove_dataset(self, dataset_to_remove: str):
-        assert self.input_datasets.count(dataset_to_remove) == 1, "Ambiguous remove"
+        assert self.input_datasets.count(dataset_to_remove) == 1, f"Ambiguous remove, {self.input_datasets.count(dataset_to_remove) = }"
 
         metadata_mask = ~np.isin(
             self.dataset_index,
-            self.unwrapped_input_datasets_mapping[dataset_to_remove]
+            np.array(list(self.unwrapped_input_datasets_mapping[dataset_to_remove]))
         )
+
+        fraction = (~metadata_mask).sum() / len(metadata_mask)
+        print(f"Removing dataset that had {fraction * 100:g}% portion in the data mix")
 
         # remove needed datasets
         self.sample_index = self.sample_index[metadata_mask]
@@ -56,10 +59,12 @@ class Metadata:
         self.input_datasets.remove(dataset_to_remove)
 
         new_unwrapped_input_datasets = self.unwrapped_input_datasets
-        new_unwrapped_input_datasets = self.unwrapped_input_datasets_mapping
+        new_unwrapped_input_datasets_remap = {
+            v: i for i , v in enumerate(new_unwrapped_input_datasets)
+        }
 
         metadata_dataset_mapping = {
-            old_i: new_unwrapped_input_datasets[old] for old_i, old in enumerate(old_unwrapped_input_datasets)
+            old_i: new_unwrapped_input_datasets_remap[old] for old_i, old in enumerate(old_unwrapped_input_datasets)
             if not old.startswith(dataset_to_remove)
         }
         self.dataset_index = np.vectorize(metadata_dataset_mapping.__getitem__)(self.dataset_index)
@@ -97,7 +102,7 @@ class Metadata:
 
         unwrapped_new_datasets = create_data_prefix([dataset])
         new_megatron_datasets = [
-            self.create_megatron_dataset(i) for i in unwrapped_new_datasets
+            self.create_megatron_dataset(i) for i in tqdm(unwrapped_new_datasets, leave=False, desc="Creating megatron datasets")
         ]
         new_datasets_sizes = list(map(len, new_megatron_datasets))
         new_datasets_total_samples = sum(new_datasets_sizes)
@@ -107,7 +112,7 @@ class Metadata:
 
         target_fraction = new_datasets_total_samples / (new_datasets_total_samples + num_old_megetron_samples)
 
-        print(f"Old dataset has {num_old_megetron_samples} samples, new has {new_datasets_total_samples}. Target fraction of samples: {target_fraction}")
+        print(f"Old dataset has {num_old_megetron_samples} samples, new has {new_datasets_total_samples}. Target fraction of samples: {target_fraction*100:g}%")
 
         new_datasets_insert_material = np.concatenate(
             [
@@ -143,10 +148,10 @@ class Metadata:
 
         self.dataset_index = new_dataset_index
         self.sample_index = new_sample_index
-        self.input_datasets += unwrapped_new_datasets
+        self.input_datasets += [dataset]
 
         real_prob = (self.dataset_index >= num_old_datasets).sum() / len(self.dataset_index)
-        print(f"New dataset real probability: {real_prob}, target probability: {real_prob}, diff: {real_prob - real_prob:g}")
+        print(f"New dataset real probability: {real_prob*100:g}%, target probability: {real_prob*100:g}%, diff: {real_prob - target_fraction:g}")
         print(f"Total samples: {len(self)}")
 
     def save(self, path):
