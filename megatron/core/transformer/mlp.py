@@ -25,7 +25,7 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
-from megatron.training.activations import XIELU, XIPReLU, XIPReLUP
+# from megatron.training.activations import XIELU, XIPReLU, XIPReLUP
 from megatron.core.metrics_tracking import get_tracker
 
 
@@ -112,14 +112,16 @@ class MLP(MegatronModule):
             tp_group=tp_group,
         )
 
-        if self.config.activation_func == XIELU:
-            self.activation_func = XIELU(config=self.config)
-        elif self.config.activation_func == XIPReLU:
-            self.activation_func = XIPReLU(config=self.config)
-        elif self.config.activation_func == XIPReLUP:
-            self.activation_func = XIPReLUP(config=self.config)
-        else:
-            self.activation_func = self.config.activation_func
+        # if self.config.activation_func == XIELU:
+        #     self.activation_func = XIELU(config=self.config)
+        # elif self.config.activation_func == XIPReLU:
+        #     self.activation_func = XIPReLU(config=self.config)
+        # elif self.config.activation_func == XIPReLUP:
+        #     self.activation_func = XIPReLUP(config=self.config)
+        # else:
+        #     self.activation_func = self.config.activation_func
+        if isinstance(self.config.activation_func, type):
+            self.activation_func = self.config.activation_func(config=self.config)
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,

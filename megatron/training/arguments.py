@@ -29,6 +29,7 @@ from megatron.core.transformer.heterogeneous.heterogeneous_config import (
 )
 from megatron.core.utils import (
     get_torch_version,
+    is_torch_min_version,
 )
 from megatron.training.activations import squared_relu, XIELU, XIPReLU, XIPReLUP
 from megatron.training.utils import get_device_arch_version, update_use_dist_ckpt, print_rank_0
