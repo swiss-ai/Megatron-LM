@@ -1281,7 +1281,7 @@ def setup_model_and_optimizer(
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
-        args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
+        args.iteration, args.num_floating_point_operations_so_far, args.tokens_so_far = load_checkpoint(
             model,
             optimizer,
             opt_param_scheduler,
