@@ -414,7 +414,7 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 	cd \\\$REPOS_PATH
 	git clone https://github.com/swiss-ai/transformers.git
 	cd transformers
-	git checkout swissai-model
+	git checkout main
 	python -m pip install -e .
 	cd ..
 	git clone https://github.com/swiss-ai/lm-evaluation-harness.git
