@@ -1,0 +1,14 @@
+{
+    "sequence_length": 4096,
+    "split": "train",
+    "num_dataset_builder_threads": 1,
+    "path_to_cache": "/iopsstor/scratch/cscs/alexdremov/exp_indices/cache",
+    "mmap_bin_files": true,
+    "reset_position_ids": true,
+    "reset_attention_mask": true,
+    "eod_mask_loss": true,
+    "create_attention_mask": true,
+    "goldfish_loss": true,
+    "goldfish_k": 50,
+    "goldfish_h": 50
+}
