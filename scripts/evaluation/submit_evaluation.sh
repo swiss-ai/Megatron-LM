@@ -4,7 +4,7 @@ GPUS_PER_NODE=4
 DEF_MEGATRON_PATH=$(dirname $(dirname $( cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )))  # Grandparent of current file location.
 DEF_LOGS_ROOT=$PWD/eval-logs
 DEF_CONTAINER_PATH=/iopsstor/scratch/cscs/ahgele/ngc_pt_jan.toml
-DEF_ACCOUNT=a-a06
+DEF_ACCOUNT=a-infra01-1
 DEF_TOKENIZER=alehc/swissai-tokenizer
 
 ITERATIONS=(latest)
@@ -36,6 +36,7 @@ usage () {
 	echo "  --name: Name of the eval run. If not set, the path will be used as name"
 	echo "  --size (choices={1, 3, 8, 70}): The size of the checkpoint to evaluate. If not set, --tp and --pp should be specified. This only sets --tp and --pp for you."
 	echo "  --convert-to-hf: When set, if a megatron checkpoint is given, the model will be converted to HF."
+	echo "  --hf-temp-dir: Use as a base directory for HF converted checkpoints. Otherwise uses $SCRATCH/hf_checkpoints."
 	echo "  --tasks: lm-eval-harness tasks to run (default=$TASKS)."
 	echo "  --limit (int>0 or 'null'): lm-eval-harness limit samples per task (default=$LIMIT)."
 	echo "  --tp (int>0): Target TP size for inference. Ignored if --size is set, required otherwise."
@@ -43,12 +44,15 @@ usage () {
 	echo "  --bs (int>0): Batch size used for inference (default=$BS)."
 	echo "  --attn-impl (choices={flash_attention_2,sdpa}): Attention implementation to use (default=$ATTN_IMPL)."
 	echo "  --iterations (int>0 | 'latest'): Comma-separated list of iteration to evaluate (default=$ITERATIONS)"
+	echo "  --bod: Adds BOD token"
 	echo "  --revisions: Only used when input is HF checkpoint. Comma-sperated list of HF revisions to try. Must be the same length as --iterations"
 	echo "  --tokens-per-iter (int>0): If specified with --iteration, the total consumed_tokens will be calculated by iteration*tokens_per_iter. Cannot be specified if consumed_tokens is also specified"
 	echo "  --consumed-tokens (int>0): When --iteration or --tokens-per-iter are not set, you need to specify this to set the total number of tokens the checkpoint has seen up to now."
 	echo "  --wandb-project"
 	echo "  --wandb-entity"
 	echo "  --wandb-id"
+	echo "  --logs-root: Where the eval logs are saved"
+	echo "  --container-path: Where the container .toml file is stored (You may need to be the owner of this for now)"
 	echo ""
 	echo "Variables:"
 	echo "  MEGATRON_PATH: Megatron root (default=$DEF_MEGATRON_PATH)."
@@ -103,7 +107,7 @@ while [[ $# -gt 0 ]]; do
 				PP=2
 				CONVERT_MP=4
 			else
-				echo Unknown size $2. Choices={1, 8, 70}. >&2
+				echo Unknown size $2. Choices={1, 3, 8, 70}. >&2
 				exit 1
 			fi
 			shift 2;;
@@ -112,6 +116,8 @@ while [[ $# -gt 0 ]]; do
 			TASKS=$2; shift 2;;
 		--bs)
 			BS=$2; shift 2;;
+		--bod)
+			BOD=true; shift;;
 		--attn-impl)
 			ATTN_IMPL=$2; shift 2;;
 		--limit)
@@ -120,6 +126,8 @@ while [[ $# -gt 0 ]]; do
 			NAME=$2; shift 2;;
 		--convert-to-hf)
 			CONVERT_TO_HF=true; shift;;
+		--hf-temp-dir)
+			HF_TEMP_DIR=$2; shift 2;;
 		--iterations)
 			IFS=',' read -ra ITERATIONS <<< "$2"; shift 2;;
 		--revisions)
@@ -134,6 +142,10 @@ while [[ $# -gt 0 ]]; do
 			WANDB_ENTITY=$2; shift 2;;
 		--wandb-id)
 			WANDB_ID=$2; shift 2;;
+		--logs-root)
+			LOGS_ROOT=$2; shift 2;;
+		--container-path)
+			CONTAINER_PATH=$2; shift 2;;
 
 		--tp)
 			if [ -z ${TP+x} ]; then  # check if undef to ignore --tp if --size is set.
@@ -164,6 +176,10 @@ if [ -z ${PP+x} ]; then
 	exit 1
 fi
 
+if [ -z ${HF_TEMP_DIR+x} ]; then
+	HF_TEMP_DIR=$SCRATCH/hf_checkpoints
+fi
+
 # Build eval args depending on this scripts args.
 if [ $LIMIT != null ]; then
 	LIMIT_ARGS="--limit=$LIMIT"
@@ -191,7 +207,30 @@ if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ]; then
 		echo When using megatron checkpoints, you cannot set --consumed-tokens, please set --tokens-per-iter instead >&2
 		exit 1
 	fi
-	CONSUMED_TOKENS="\\\$((IT*$TOKENS_PER_ITER))"
+	read -r -d '' CONSUMED_TOKENS_CALCULATION <<- EOM
+	TOKENS_PER_ITER=$TOKENS_PER_ITER
+	if [[ \\\$TOKENS_PER_ITER = *,* ]]; then
+		CONSUMED_TOKENS=0
+		CONSUMED_ITERS=0
+		for SUBSTR in \\\${TOKENS_PER_ITER//,/ }; do
+			if (( CONSUMED_ITERS < IT )); then
+				TOK_PER_ITER=\"\\\$(echo \\\$SUBSTR | cut -d':' -f1)\"
+				MAX_ITER=\"\\\$(echo \\\$SUBSTR | cut -d':' -f2)\"
+				if [[ \\\$MAX_ITER = \"\" ]]; then
+					ITERS_THIS_BLOCK=\\\$(( IT - CONSUMED_ITERS ))
+				elif (( IT > MAX_ITER )); then
+					ITERS_THIS_BLOCK=\\\$(( MAX_ITER - CONSUMED_ITERS - 1 ))
+				else
+					ITERS_THIS_BLOCK=\\\$(( IT - CONSUMED_ITERS ))
+				fi
+				CONSUMED_ITERS=\\\$(( CONSUMED_ITERS + ITERS_THIS_BLOCK ))
+				CONSUMED_TOKENS=\\\$(( CONSUMED_TOKENS + TOK_PER_ITER*ITERS_THIS_BLOCK ))
+			fi
+		done
+	else
+		CONSUMED_TOKENS=\\\$(( IT*$TOKENS_PER_ITER ))
+	fi
+	EOM
 else
 	# The huggingface checkpoints can get CONSUMED_TOKENS either by --tokens-per-iter or --consumed-tokens
 	if [ -z ${CONSUMED_TOKENS+x} ]; then
@@ -199,7 +238,9 @@ else
 			echo Neither of --consumed-tokens or --tokens-per-iter set, aborting >&2
 			exit 1
 		fi
-		CONSUMED_TOKENS="\\\$((IT*$TOKENS_PER_ITER))"
+		CONSUMED_TOKENS_CALCULATION="\\\$CONSUMED_TOKENS=\\\$((IT*$TOKENS_PER_ITER))"
+  	else
+   		CONSUMED_TOKENS_CALCULATION="\\\$CONSUMED_TOKENS=$CONSUMED_TOKENS"
 	fi
 fi
 
@@ -221,9 +262,9 @@ if [ ! -z ${WANDB_ENTITY+x} ] || [ ! -z ${WANDB_PROJECT+x} ] || [ ! -z ${WANDB_I
 	WANDB_ARGS="--wandb_args entity=$WANDB_ENTITY,project=$WANDB_PROJECT,id=$WANDB_ID,resume=allow,step=\\\$IT,consumed_tokens=\\\$CONSUMED_TOKENS"
 	read -r -d '' WANDB_COMMAND <<- EOM
 	# Wandb sync just in case wandb died in lm-harness.
-	for path in $WANDB_DIR/wandb/run-*-$WANDB_ID; do
-		WANDB_RESUME=allow python -m wandb sync -e $WANDB_ENTITY -p $WANDB_PROJECT --id $WANDB_ID \\\$path
-	done
+	# for path in $WANDB_DIR/wandb/run-*-$WANDB_ID; do
+	# 	WANDB_RESUME=allow python -m wandb sync -e $WANDB_ENTITY -p $WANDB_PROJECT --id $WANDB_ID \\\$path
+	# done
 
 	# Update eval_table.
 	cd $MEGATRON_PATH
@@ -232,7 +273,7 @@ if [ ! -z ${WANDB_ENTITY+x} ] || [ ! -z ${WANDB_PROJECT+x} ] || [ ! -z ${WANDB_I
 fi
 
 # Some useful variables.
-JOBNAME=ev_$NAME-debug2
+JOBNAME=$NAME
 ENDPOINT_PORT=5000
 
 COMMON_EVAL_ARGS="--trust_remote_code --batch_size=$BS --tasks=$TASKS --output=$EVAL_DIR/eval_\$SLURM_JOBID --max_batch_size 256 $LIMIT_ARGS $WANDB_ARGS"
@@ -257,15 +298,15 @@ if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ] && [ $CONVERT_TO_HF
 	CMD_EVAL="WANDB_RESUME=allow lm_eval --model=local-completions --model_args=base_url=http://localhost:5000/completions,tokenized_requests=False,tokenizer=$TOKENIZER,num_concurrent=0,timeout=43200,max_retries=1,max_length=4096 $COMMON_EVAL_ARGS"
 else
 	if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ]; then
-		echo Megatron checkpoint detected!
-		echo Checkpoint will be converted to HF
+		# echo Megatron checkpoint detected!
+		# echo Checkpoint will be converted to HF
 
 		read -r -d '' CMD_CONVERT <<- EOM
 		# Convert from megatron to HF.
 		cd $MEGATRON_PATH
 		export PYTHONPATH=$MEGATRON_PATH:\\\$PYTHONPATH
 		torchrun --nproc-per-node $CONVERT_MP scripts/conversion/torchdist_2_torch.py --bf16 --load=$CHECKPOINT_PATH --ckpt-step=\\\$IT --ckpt-convert-save=\\\$TORCH_NODIST_PATH --pipeline-model-parallel-size $CONVERT_MP
-		python tools/checkpoint/convert.py --model-type=GPT --loader=core --saver=llama_hf --load-dir=\\\$TORCH_NODIST_PATH/torch --save-dir=\\\$HF_TEMP_PATH --hf-tokenizer=$TOKENIZER
+		python tools/checkpoint/convert.py --model-type=GPT --loader=core --saver=swissai_hf --load-dir=\\\$TORCH_NODIST_PATH/torch --save-dir=\\\$HF_TEMP_PATH --hf-tokenizer=$TOKENIZER
 		EOM
 		HF_CHECKPOINT_PATH=\\\$HF_TEMP_PATH
 	else
@@ -279,12 +320,17 @@ else
 	fi
 
 	DP=$((GPUS_PER_NODE/(TP*PP)))
+	COMMON_MODEL_ARGS="pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL,dtype=$DTYPE"
+	if [[ $BOD = true ]]; then
+		COMMON_MODEL_ARGS="$COMMON_MODEL_ARGS,add_bos_token=True"
+	fi
+
 	if [[ $DP -eq 1 ]]; then  # Only use model parallel.
-		CMD_EVAL="WANDB_RESUME=allow WORLD_SIZE=1 MASTER_ADDR=localhost MASTER_PORT=25678 lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL,dtype=$DTYPE,parallelize=True $COMMON_EVAL_ARGS"
+		CMD_EVAL="WANDB_RESUME=allow WORLD_SIZE=1 MASTER_ADDR=localhost MASTER_PORT=25678 lm_eval --cache_requests true --model=hf --model_args=$COMMON_MODEL_ARGS,parallelize=True $COMMON_EVAL_ARGS"
 	elif (( TP*PP > 1 )); then  # Use data parallel and model parallel.
-		CMD_EVAL="WANDB_RESUME=allow accelerate launch --multi_gpu --num_processes $DP -m lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL,dtype=$DTYPE,parallelize=True $COMMON_EVAL_ARGS"
+		CMD_EVAL="WANDB_RESUME=allow accelerate launch --multi_gpu --num_processes $DP -m lm_eval --cache_requests true --model=hf --model_args=$COMMON_MODEL_ARGS,parallelize=True $COMMON_EVAL_ARGS"
 	else  # Only use data parallel.
-		CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL,dtype=$DTYPE $COMMON_EVAL_ARGS"
+		CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$COMMON_MODEL_ARGS $COMMON_EVAL_ARGS"
 	fi
 fi
 
@@ -294,14 +340,15 @@ ITERATIONS=(${ITERATIONS[@]})
 $MAYBE_REVISION_CMD
 for (( i=0; i<\\\${#ITERATIONS[@]}; i++ ));
 do
-	rm -rf \\\$HF_TEMP_PATH
-	mkdir \\\$HF_TEMP_PATH
+	# rm -rf \\\$HF_TEMP_PATH
+	# mkdir \\\$HF_TEMP_PATH
 	rm -rf \\\$TORCH_NODIST_PATH
 	mkdir \\\$TORCH_NODIST_PATH
 
 	IT=\\\${ITERATIONS[\\\$i]}
 	$MAYBE_GRAB_REVISION
-	CONSUMED_TOKENS=$CONSUMED_TOKENS
+	$CONSUMED_TOKENS_CALCULATION
+	echo CONSUMED_TOKENS=\\\$CONSUMED_TOKENS
 
 	$CMD_CONVERT
 	$CMD_SERVER
@@ -314,7 +361,7 @@ EOM
 # Now let's prepare the sbatch.
 cat > $SBATCH_PATH <<- EOM
 #!/bin/bash
-#SBATCH --account=a-a06
+#SBATCH --account=$ACCOUNT
 #SBATCH --cpus-per-task=288
 #SBATCH --gres=gpu:4
 #SBATCH --environment=$CONTAINER_PATH
@@ -322,9 +369,9 @@ cat > $SBATCH_PATH <<- EOM
 #SBATCH --mem=460000
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --output=$LOGS_DIR/${JOBNAME}_%j.out
-#SBATCH --error=$LOGS_DIR/${JOBNAME}_%j.err
-#SBATCH --time=8:00:00
+#SBATCH --output=$LOGS_DIR/${JOBNAME}.out
+#SBATCH --error=$LOGS_DIR/${JOBNAME}.err
+#SBATCH --time=11:59:00
 #SBATCH --exclusive
 #SBATCH --dependency=singleton
 
@@ -339,16 +386,26 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 	export HF_HOME=$SCRATCH/huggingface
 	set -e
 
+	# Create HF conversion dir
+	export HF_TEMP_PATH=$HF_TEMP_DIR/$JOBNAME
+	rm -rf \\\$HF_TEMP_PATH
+	mkdir -p \\\$HF_TEMP_PATH
+	chmod -R 755 \\\$HF_TEMP_PATH
+
 	# Create tempdirs.
 	cd
 	mkdir -p $SCRATCH/.tmp
-	HF_TEMP_PATH=\\\$(mktemp -d -p $SCRATCH/.tmp)  # To store hf conversion (if needed).
+	# HF_TEMP_PATH=\\\$(mktemp -d -p $SCRATCH/.tmp)  # To store hf conversion (if needed).
 	TORCH_NODIST_PATH=\\\$(mktemp -d -p $SCRATCH/.tmp)  # To store torch no dist checkpoint converted (if needed).
 	REPOS_PATH=\\\$(mktemp -d -p $SCRATCH/.tmp)  # To git clone repos.
+	SUCCESS=0
 	function cleanup {
-		rm -rf \\\$HF_TEMP_PATH
+		# rm -rf \\\$HF_TEMP_PATH
 		rm -rf \\\$TORCH_NODIST_PATH
 		rm -rf \\\$REPOS_PATH
+		if [ \\\$SUCCESS -eq 0 ]; then
+			echo Evaluation failed.
+		fi
 	}
 	trap cleanup EXIT
 	echo HF TEMP PATH: \\\$HF_TEMP_PATH
@@ -357,17 +414,20 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 	cd \\\$REPOS_PATH
 	git clone https://github.com/swiss-ai/transformers.git
 	cd transformers
-	git checkout swissai-model
+	git checkout main
 	python -m pip install -e .
 	cd ..
 	git clone https://github.com/swiss-ai/lm-evaluation-harness.git
 	cd lm-evaluation-harness
-	git checkout retry-download
+	git checkout new-include
 	python -m pip install -e .[api]
 
 	$CMD_LOOP
 
 	$WANDB_COMMAND
+
+	SUCCESS=1
+	echo Evaluation finished.
 "
 EOM
 
@@ -377,4 +437,4 @@ echo $OUT
 
 IFS=' ' read -ra CHUNKS <<< $OUT
 JOBID=${CHUNKS[-1]}
-echo Logs go to: $LOGS_DIR/${JOBNAME}_$JOBID.out
+# echo Logs go to: $LOGS_DIR/${JOBNAME}.out

@@ -8,7 +8,16 @@ import wandb
 import numpy as np
 from tqdm import tqdm
 
-MULTILINGUAL_TASKS = ["global_mmlu", "xcopa", "xnli", "xwinograd", "pawsx", "m_hellaswag", "m_arc"]
+MULTILINGUAL_TASKS = [
+    "include_base_44",
+    "global_mmlu",
+    "xcopa",
+    "xnli",
+    "xwinograd",
+    "pawsx",
+    "m_hellaswag",
+    "m_arc",
+]
 ENGLISH_TASKS = [
     "hellaswag",
     "arc_easy",

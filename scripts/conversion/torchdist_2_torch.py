@@ -6,7 +6,6 @@ from megatron.core.enums import ModelType
 from megatron.training.training import setup_model_and_optimizer
 from megatron.training.initialize import initialize_megatron
 from megatron.training.global_vars import get_args
-# from megatron.training.utils import unwrap_model
 from pretrain_gpt import model_provider
 
 
