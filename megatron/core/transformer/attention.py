@@ -21,6 +21,8 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_pipeline_model_parallel_rank,
+    get_pipeline_model_parallel_world_size,
 )
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.module import MegatronModule
@@ -902,8 +904,8 @@ class SelfAttention(Attention):
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
         tracker = get_tracker()
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-        pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+        pp_rank = get_pipeline_model_parallel_rank()
+        pp_size = get_pipeline_model_parallel_world_size()
         true_layer_number = self.layer_number + pp_rank*self.config.num_layers//pp_size
         tracker.update(hidden_states, "qkv_input", true_layer_number - 1)
 
