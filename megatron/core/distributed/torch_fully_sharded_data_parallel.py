@@ -1,16 +1,18 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from typing import List
+from typing import Optional, Set
 
 import torch
 
 try:
     from torch.distributed import DeviceMesh
-    from torch.distributed._composable.fsdp import fully_shard
+    from torch.distributed.fsdp import fully_shard
 
     HAVE_FSDP = True
 except ImportError:
     HAVE_FSDP = False
+
+from torch.distributed import ProcessGroup
 
 from megatron.core.fp8_utils import is_float8tensor
 
@@ -32,11 +34,11 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
     Args:
         config: Transformer config object.
-        ddp_config: DistributedDataParallel config object.
+        ddp_config: TorchDistributedDataParallel config object.
         module: Underlying model.
-        sub_modules_to_wrap: List of sub_modules to shard with FSDP.
+        sub_modules_to_wrap: Set of sub_modules to shard with FSDP.
             Parameters within each sub_module will be all-gathered just-in-time.
-            The default list includes the following submodules derived from the
+            The default set includes the following submodules derived from the
             GPT model architecture:
                 TransformerLayer (all Transformer layers)
                 LanguageModelEmbedding (initial embedding layer)
@@ -45,6 +47,9 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
             User can set _fsdp_modules attribute on submodules to set additional
             submodules to shard with FSDP.
+        process_group: Optional ProcessGroup to use for distributed operations.
+            If None (default), the data parallel process group will be obtained from
+            parallel_state.get_data_parallel_group(with_context_parallel=True).
     """
 
     def __init__(
@@ -52,12 +57,13 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         config: TransformerConfig,
         ddp_config: DistributedDataParallelConfig,
         module: torch.nn.Module,
-        sub_modules_to_wrap: List[torch.nn.Module] = [
+        sub_modules_to_wrap: Set[torch.nn.Module] = {
             TransformerLayer,
             LanguageModelEmbedding,
             RotaryEmbedding,
             tensor_parallel.ColumnParallelLinear,
-        ],
+        },
+        process_group: Optional[ProcessGroup] = None,
     ):
 
         assert (
@@ -65,12 +71,19 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         ), 'TorchFullyShardedDataParallel requires PyTorch >= 2.4.0 with FSDP 2 support.'
 
         super().__init__(config=config, module=module)
-        self.data_parallel_group = parallel_state.get_data_parallel_group(
-            with_context_parallel=True
-        )
 
-        self.device_mesh = DeviceMesh.from_group(self.data_parallel_group, "cuda")
-        kwargs = {"mesh": self.device_mesh}
+        if process_group is None:
+            self.process_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        else:
+            self.process_group = process_group
+
+        self.device_mesh = DeviceMesh.from_group(self.process_group, "cuda")
+        kwargs = {
+            "mesh": self.device_mesh,
+            "reshard_after_forward": getattr(ddp_config, "reshard_after_forward", True),
+        }
+
+        self.ddp_config = ddp_config
 
         def save_custom_attrs(module):
             custom_attrs = {}

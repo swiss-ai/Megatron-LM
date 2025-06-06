@@ -31,12 +31,13 @@ from megatron.training import get_args
 from megatron.training import get_tokenizer
 from megatron.training.checkpointing import load_checkpoint
 from megatron.core import mpu
+import json
 from megatron.training.initialize import initialize_megatron
 from megatron.training import get_model
 import asyncio
 from typing import AsyncIterator, List
 
-from .utils import add_common_inference_args, build_requests
+from examples.inference.gpt.utils import add_common_inference_args, build_requests
 
 
 def add_static_inference_args(parser):
@@ -50,6 +51,7 @@ def add_static_inference_args(parser):
         help='Max number of prompts to process at once'
     )
     group.add_argument("--stream", action="store_true", default=False, help="Stream output tokens")
+    group.add_argument("--output-path", type=str, default='/tmp', help="Path to save generations as JSON")
 
     return parser
 
@@ -57,7 +59,7 @@ def add_static_inference_args(parser):
 def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInferenceEngine:
     """Utility to get the relevant backend for running inference
 
-    This function will automatically chose the TRTLLMBackend when possible, and if not revert to Mcore backend if the user does not specify any backends. TRT LLM Backend is not implmented yet.
+    This function will automatically choose the TRTLLMBackend when possible, and if not revert to Mcore backend if the user does not specify any backends. TRT LLM Backend is not implmented yet.
 
     Args:
         args (Namespace): The user arguments parsed from command line
@@ -76,6 +78,7 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInfere
         padded_vocab_size=args.padded_vocab_size,
         inference_max_requests=args.inference_max_requests,
         inference_max_seq_length=args.inference_max_seq_length,
+        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill
     )
 
     inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
@@ -141,7 +144,7 @@ def main():
 
     # Set up model and load checkpoint
     model = get_model(model_provider, wrap_with_ddp=False)
-    load_checkpoint(model, None, None)
+    load_checkpoint(model, None, None, strict=False)
     model = model[0]
 
     args = get_args()
@@ -154,6 +157,7 @@ def main():
         top_p=args.top_p,
         return_log_probs=args.return_log_probs,
         num_tokens_to_generate=args.num_tokens_to_generate,
+        top_n_logprobs=args.top_n_logprobs,
     )
 
     requests = build_requests(args, get_tokenizer())
@@ -177,14 +181,26 @@ def main():
     if torch.distributed.get_rank() == 0:
         for idx, result in enumerate(results):
             print(f' \n------------- RESULT FOR PROMPT {idx} --------------- ')
-            result = {
+            result_dict = {
                 'id': result.request_id,
                 'input_prompt': result.prompt,
                 'generated_text': result.generated_text,
                 'generated_tokens': result.generated_tokens,
                 'latency': latency,
             }
-            print(result)
+            if sampling_params.top_n_logprobs > 0 :
+                result_dict['generated_top_n_logprobs'] = result.generated_top_n_logprobs
+            if sampling_params.return_log_probs:
+                response_logprobs = result.prompt_log_probs + result.generated_log_probs
+                result_dict["logprobs"] = response_logprobs
+
+        # Write results to JSON. Primarily used for functional testing.
+        if args.output_path:
+            # Tensors cannot be serialized so we move these to CPU
+            result_dict['generated_tokens'] = result_dict['generated_tokens'].cpu().numpy().tolist()
+            results_as_json = json.dumps(result_dict)
+            with open(args.output_path, 'w') as f:
+                json.dump(results_as_json, f)
 
     # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:

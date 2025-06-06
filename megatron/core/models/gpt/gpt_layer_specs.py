@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
-from typing import Optional
+from typing import Optional, Union
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
@@ -16,7 +16,14 @@ from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
     MLASelfAttentionSubmodules,
 )
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlockSubmodules,
+    get_mtp_layer_offset,
+    get_mtp_layer_spec,
+    get_mtp_num_layers_to_build,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
     get_num_layers_to_build,
@@ -71,6 +78,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     qknorm_impl: str = 'te',
     post_layer_norm: bool = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
+    qk_l2_norm: Optional[bool] = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -82,6 +90,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
+        qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
 
     Returns:
         ModuleSpec: Module specification with TE modules
@@ -102,6 +111,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     )
 
     if multi_latent_attention:
+        assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
@@ -178,8 +188,12 @@ def get_gpt_layer_with_transformer_engine_spec(
                         linear_qkv=linear_qkv,
                         core_attention=TEDotProductAttention,
                         linear_proj=TERowParallelLinear,
-                        q_layernorm=qk_norm if qk_layernorm else IdentityOp,
-                        k_layernorm=qk_norm if qk_layernorm else IdentityOp,
+                        q_layernorm=(
+                            L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
+                        ),
+                        k_layernorm=(
+                            L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
+                        ),
                     ),
                 ),
                 input_layernorm=input_layernorm,
@@ -199,6 +213,7 @@ def get_gpt_layer_local_spec(
     fp8: Optional[str] = None,  # pylint: disable=unused-arguments
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     normalization: Optional[str] = None,
+    qk_l2_norm: Optional[bool] = False,
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -210,6 +225,7 @@ def get_gpt_layer_local_spec(
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
+        qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
 
     Returns:
         ModuleSpec: Module specification with Megatron-Core modules
@@ -234,6 +250,7 @@ def get_gpt_layer_local_spec(
     )
 
     if multi_latent_attention:
+        assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
@@ -271,8 +288,12 @@ def get_gpt_layer_local_spec(
                         linear_qkv=ColumnParallelLinear,
                         core_attention=DotProductAttention,
                         linear_proj=RowParallelLinear,
-                        q_layernorm=LNImpl if qk_layernorm else IdentityOp,
-                        k_layernorm=LNImpl if qk_layernorm else IdentityOp,
+                        q_layernorm=(
+                            L2Norm if qk_l2_norm else (LNImpl if qk_layernorm else IdentityOp)
+                        ),
+                        k_layernorm=(
+                            L2Norm if qk_l2_norm else (LNImpl if qk_layernorm else IdentityOp)
+                        ),
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
@@ -352,7 +373,11 @@ def get_mlp_module_spec(
 
 
 def get_gpt_decoder_block_spec(
-    config: TransformerConfig, use_transformer_engine: bool, normalization: Optional[str] = None
+    config: TransformerConfig,
+    use_transformer_engine: bool,
+    normalization: Optional[str] = None,
+    qk_l2_norm: Optional[bool] = False,
+    vp_stage: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     if use_transformer_engine:
@@ -368,6 +393,7 @@ def get_gpt_decoder_block_spec(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+            qk_l2_norm=qk_l2_norm,
         )
         if use_transformer_engine
         else get_gpt_layer_local_spec(
@@ -377,6 +403,7 @@ def get_gpt_decoder_block_spec(
             multi_latent_attention=config.multi_latent_attention,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             normalization=normalization,
+            qk_l2_norm=qk_l2_norm,
         )
     )
     moe_layer_spec = (
@@ -386,6 +413,7 @@ def get_gpt_decoder_block_spec(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+            qk_l2_norm=qk_l2_norm,
         )
         if use_transformer_engine
         else get_gpt_layer_local_spec(
@@ -395,6 +423,7 @@ def get_gpt_decoder_block_spec(
             multi_latent_attention=config.multi_latent_attention,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             normalization=normalization,
+            qk_l2_norm=qk_l2_norm,
         )
     )
 
@@ -430,11 +459,49 @@ def get_gpt_decoder_block_spec(
 
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
-    offset = get_transformer_layer_offset(config)
-    num_layers_to_build = get_num_layers_to_build(config)
+    offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+    num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
     layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     # Block spec.
     block_spec = TransformerBlockSubmodules(layer_specs=layer_specs, layer_norm=layer_norm_impl)
 
     return block_spec
+
+
+def get_gpt_mtp_block_spec(
+    config: TransformerConfig,
+    spec: Union[TransformerBlockSubmodules, ModuleSpec],
+    use_transformer_engine: bool,
+) -> MultiTokenPredictionBlockSubmodules:
+    """GPT Multi-Token Prediction (MTP) block spec."""
+    num_layers_to_build = get_mtp_num_layers_to_build(config)
+    if num_layers_to_build == 0:
+        return None
+
+    if isinstance(spec, TransformerBlockSubmodules):
+        # get the spec for the last layer of decoder block
+        transformer_layer_spec = spec.layer_specs[-1]
+    elif isinstance(spec, ModuleSpec) and spec.module == TransformerLayer:
+        transformer_layer_spec = spec
+    else:
+        raise ValueError(f"Invalid spec: {spec}")
+
+    mtp_layer_spec = get_mtp_layer_spec(
+        transformer_layer_spec=transformer_layer_spec, use_transformer_engine=use_transformer_engine
+    )
+    mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
+    mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
+
+    offset = get_mtp_layer_offset(config)
+    # split the mtp layer specs to only include the layers that are built in this pipeline stage.
+    mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]
+    if len(mtp_layer_specs) > 0:
+        assert (
+            len(mtp_layer_specs) == config.mtp_num_layers
+        ), +f"currently all of the mtp layers must stage in the same pipeline stage."
+        mtp_block_spec = MultiTokenPredictionBlockSubmodules(layer_specs=mtp_layer_specs)
+    else:
+        mtp_block_spec = None
+
+    return mtp_block_spec

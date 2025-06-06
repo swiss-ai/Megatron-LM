@@ -7,9 +7,11 @@ Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly inte
   - Enable TP for MLA and DeepSeek-V3
   - Support aux-loss-free load balancing strategy
   - Support node-limited routing
+  - Support Multi-Token Prediction (MTP)
 - **Support DeepSeek's DeepEP for efficient token dispatching and combining**
 - Add fusion for token permutation and unpermutation
 - Support Uneven virtual pipeline parallel split
+- Support output-discarding checkpointing on some submodules
 
 ### Parallelism
 - **Expert Parallelism**
@@ -149,6 +151,16 @@ The `AllGather` and `ReduceScatter` communications in the shared experts are ove
 The `MLP` computation part in the shared experts are overlapped with the `AlltoAll` communications in the dispatcher.
 Both the forward and the backward pass can overlap. But to get the overlapping in the backward pass, the PyTorch version should `>= 2.2.0`.
 
+### Checkpointing
+A new output-discarding checkpointing method is also supported. This method discards the output memory of certain submodules during the forward pass and recomputes them during the backward pass, which can save memory compared to standard checkpointing. This can be enabled for specific submodules using the `--recompute-granularity selective --recompute-modules [submodule1, submodule2, ...]` argument. The supported submodules are:
+
+* `moe_act`: Recompute the GroupedMLP activation function.
+* `layernorm`: Recompute the input_layernorm and pre_mlp_layernorm (when they are not `IdentityOp`).
+* `mla_up_proj`: Recompute the MLA up projection and RoPE applying parts.
+* `core_attn`: Recompute the core attention submodule (uses standard checkpointing rather than output-discarding).
+* `mlp`: Recompute the dense MLP submodule (uses standard checkpointing rather than output-discarding) which is useful for hybrid-models like DeepSeek-V3.
+* `moe`: Recompute the MoE layer submodule (uses standard checkpointing rather than output-discarding).
+
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
 
@@ -191,7 +203,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --expert-tensor-parallel-size | Degree of tensor model parallelism of expert layer. Default is same to --tensor-model-parallel-size. |
 | --moe-layer-freq | Frequency between MoE layers and Dense layers. Accepts either: 1) An integer N for 1:N ratio (one expert layer for every N-1 dense layers), 2) A string "N" for the same ratio, or 3) A string with Python list expression for custom patterns like `([1]*3+[0]*1)*3` which gives [1,1,1,0,1,1,1,0,1,1,1,0] where 1=expert layer and 0=dense layer. Examples: `([0]+[1]*23)` for 1 dense layer followed by 23 experts layers, `([1]*3+[0]*2)*2` for three expert layers followed by two dense layers, repeated twice. Default is 1. |
 | --moe-grouped-gemm | When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine. |
-| --moe-router-load-balancing-type | Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss". |
+| --moe-router-load-balancing-type | Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2 and DeepSeekV3, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss". |
 | --moe-router-dtype | Data type for routing computation and expert output weighted averaging. Options are 'fp32' and 'fp64'. This can improve numerical stability, particularly when using a large number of experts. The throughput/memory impact should be negligible when used with --moe-permute-fusion. Default is None (no dtype promotion). |
 | --moe-router-topk | Number of experts to route to for each token. The default is 2. |  
 | --moe-router-score-function | Score function for MoE routing. Can be "softmax" or "sigmoid". Default is "softmax". |
@@ -201,6 +213,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-router-topk-scaling-factor | Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling. |
 | --moe-router-enable-expert-bias | TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy. The routing decision is based on the sum of the routing scores and the expert bias. See https://arxiv.org/abs/2408.15664 for details. |
 | --moe-router-bias-update-rate | The expert bias is updated based on the number of assigned tokens to each expert in a global batch, where the bias is increased for experts with less assigned tokens and decreased for experts with more assigned tokens. Default is 1e-3 same as that used in DeepSeekV3. |
+| --moe-router-force-load-balancing | (Experimental) Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only! |
 | --moe-aux-loss-coeff | Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended. Default is 0.0. |
 | --moe-z-loss-coeff | Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended. Default is None. |
 | --moe-input-jitter-eps | Add noise to the input tensor by applying jitter with a specified epsilon value. Default is None. |

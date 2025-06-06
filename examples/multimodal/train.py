@@ -223,7 +223,7 @@ def scaled_loss_func(loss_mask, output_tensor):
         loss_list[idx] = loss_list[idx] * math.sqrt(num_valid_labels_list[idx]) / base_num
 
     # Some ranks may not get loss tokens due to Context Parallel Sharding
-    if len(loss_list) > 0
+    if len(loss_list) > 0:
         total_loss = torch.stack(loss_list).sum()
         total_tokens = torch.ones_like(total_loss)
     elif len(loss_list) == 0 and args.context_parallel_size > 1:
@@ -232,53 +232,23 @@ def scaled_loss_func(loss_mask, output_tensor):
     else:
         raise RuntimeError("loss_list for loss scaling per conversation unexpectedly got empty list")
 
-    loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
+    num_tokens = total_tokens.clone().detach().to(torch.int)
+    reporting_loss = torch.cat([total_loss.clone().detach().view(1), num_tokens.view(1)])
 
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
-
-    reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
-
-    local_num_tokens = loss[1].clone().detach().to(torch.int)
-
-    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
-    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
-    # on loss[0] fixes this
-    return (
-        loss[0].clone(),
-        local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])},
-    )
+    return (total_loss, num_tokens, {'lm loss': reporting_loss})
 
 
 def loss_func(loss_mask, output_tensor):
     args = get_args()
 
-    losses = output_tensor.float()
-
+    losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.contiguous().view(-1).float()
+    loss = torch.sum(losses * loss_mask)
 
-    total_tokens = loss_mask.sum()
-    total_loss = torch.sum(losses.view(-1) * loss_mask)
-    loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
+    num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+    reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
 
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
-
-    reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
-
-    local_num_tokens = loss[1].clone().detach().to(torch.int)
-
-    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
-    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
-    # on loss[0] fixes this
-    return (
-        loss[0].clone(),
-        local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])}
-    )
+    return (loss, num_tokens, {'lm loss': reporting_loss})
 
 
 def forward_step(data_iterator, model: LLaVAModel):
@@ -370,48 +340,49 @@ def run_online_eval(model):
         return []
 
     from config import EvaluationConfig
-    from run_text_generation import generate_and_write_samples
+    # Import the common evaluation functions
+    from run_text_generation import get_evaluation_configs, run_evaluation_loop
 
-    with open(args.online_evaluation_config, "r") as f:
-        config_dict = yaml.safe_load(f)
-
-    config = EvaluationConfig(**config_dict)
+    # Use the common config loading function
+    configs = get_evaluation_configs(config_path=args.online_evaluation_config)
 
     # The inference code assumes the first rank is the leader.
     # Tensorboard writer is on the last rank.
     # We must write to a storage space that all ranks see.
     output_dir = os.path.join(args.save, "online_eval")
     os.makedirs(output_dir, exist_ok=True)
-    config.output_path = os.path.join(output_dir, args.language_model_type)
+    
+    # Use the common evaluation loop
+    scores = run_evaluation_loop(model[0].module, configs, output_dir_override=output_dir, print_output=False)
 
-    # The actual generation.
-    generate_and_write_samples(model[0].module, config, print_output=False)
-
-    # Make sure the first rank is done writing so that the last rank can run eval.
-    torch.distributed.barrier()
-
-    if not is_last_rank():
-        return []
-
-    # Run evaluation.
-    if config.task == "TextVQA":
-        from evaluate_textvqa import textvqa_eval
-
-        avg_acc = textvqa_eval(config.output_path)
-
-        return [{"TextVQA accuracy": avg_acc}]
-    else:
-        raise NotImplementedError(f"online evaluation of {config.task} not implemented yet")
+    return [scores]
 
 
-def write_online_eval_to_tensorboard(data, iteration, writer):
-    """Write online evaluation data to Tensorboard."""
+def write_eval_to_tensorboard(data, iteration, writer, walltime=None):
+    """Write evaluation data to Tensorboard."""
     if not writer:
         return
 
     for item in data:
         for k, v in item.items():
-            writer.add_scalar(k, v, iteration)
+            writer.add_scalar(k, v, iteration, walltime=walltime)
+
+
+def write_online_eval_to_tensorboard(data, iteration, writer, walltime=None):
+    """Write online evaluation data to Tensorboard."""
+    import shutil
+    args = get_args()
+
+    # Define source and destination directories
+    source_dir = os.path.join(args.save, "online_eval")
+    destination_dir = os.path.join(args.save, f"online_eval_{iteration}")
+    if os.path.exists(source_dir):
+        print("Moving online eval data from", source_dir, "to", destination_dir)
+
+        # Move the directory (back up the generation)
+        shutil.move(source_dir, destination_dir)
+
+    write_eval_to_tensorboard(data, iteration, writer, walltime)
 
 
 if __name__ == "__main__":

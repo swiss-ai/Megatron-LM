@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
+import json
 from typing import Union
 
 import tensorrt_llm
@@ -13,6 +13,7 @@ from megatron.core.export.model_type import ModelType
 from megatron.core.export.trtllm.engine_builder.trtllm_engine_builder import TRTLLMEngineBuilder
 from megatron.core.export.trtllm.model_to_trllm_mapping.default_conversion_dict import (
     DEFAULT_CONVERSION_DICT,
+    NEMOTRON_NAS_CONVERSION_DICT,
 )
 from megatron.core.export.trtllm.trt_model_config import TRT_MODEL_CONFIG
 from megatron.core.export.trtllm.trt_model_type import TRT_MODEL_TYPE_STRING
@@ -25,6 +26,7 @@ from megatron.core.export.trtllm.trtllm_weights_converter.distributed_trtllm_mod
 from megatron.core.export.trtllm.trtllm_weights_converter.single_device_trtllm_model_weights_converter import (
     SingleDeviceTRTLLMModelWeightsConverter,
 )
+from megatron.core.export.trtllm.trtllm_weights_converter.utils import is_gated_activation
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -33,6 +35,7 @@ class TRTLLMHelper:
 
     def __init__(
         self,
+        *,
         transformer_config: TransformerConfig,
         model_type: ModelType,
         trtllm_conversion_dict: dict = {},
@@ -40,6 +43,7 @@ class TRTLLMHelper:
         max_position_embeddings: int = None,
         rotary_percentage: int = 1.0,
         rotary_base: int = 10000,
+        rope_scaling_factor: float = 8.0,
         moe_tp_mode: int = 2,
         multi_query_mode: bool = False,
         activation: str = "gelu",
@@ -72,6 +76,8 @@ class TRTLLMHelper:
         self.transformer_config = transformer_config
         self.model_type = model_type
         self.trtllm_conversion_dict = DEFAULT_CONVERSION_DICT.copy()
+        if model_type == ModelType.nemotron_nas:
+            self.trtllm_conversion_dict.update(NEMOTRON_NAS_CONVERSION_DICT)
         self.trtllm_conversion_dict.update(trtllm_conversion_dict)
         assert position_embedding_type in [
             'learned_absolute',
@@ -81,6 +87,7 @@ class TRTLLMHelper:
         self.max_position_embeddings = max_position_embeddings
         self.rotary_percentage = rotary_percentage
         self.rotary_base = rotary_base
+        self.rope_scaling_factor = rope_scaling_factor
         self.moe_tp_mode = moe_tp_mode
         self.multi_query_mode = multi_query_mode
         self.activation = activation
@@ -142,7 +149,7 @@ class TRTLLMHelper:
             'hidden_act': hidden_act,
             'use_parallel_embedding': export_config.use_parallel_embedding,
             'embedding_sharding_dim': 0,
-            'share_embedding_table': export_config.use_embedding_sharing,
+            'share_embedding_table': self.share_embeddings_and_output_weights,
             'quantization': {
                 'quant_algo': "FP8" if fp8_quantized else None,
                 'kv_cache_quant_algo': "FP8" if fp8_kvcache else None,
@@ -179,6 +186,13 @@ class TRTLLMHelper:
                 "factor": float(self.seq_len_interpolation_factor),
             }
 
+        if self.model_type == ModelType.nemotron_nas:
+            hf_config_dict = json.loads(
+                self.transformer_config.heterogeneous_layers_config_encoded_json
+            )
+            config["block_configs"] = hf_config_dict["block_configs"]
+            config["rotary_scaling"] = {"type": "llama3", "factor": self.rope_scaling_factor}
+
         config_cls = TRT_MODEL_CONFIG[self.model_type]
         return config_cls(**config)
 
@@ -204,7 +218,7 @@ class TRTLLMHelper:
         mock_scales_dict = TRTLLMLayers.rename_input_layer_names_to_trtllm_layer_names(
             mock_scales_dict, self.trtllm_conversion_dict, False
         )
-        split_gated_activation = self.activation in ["swiglu", "geglu", "fast-swiglu", "fast-geglu"]
+        split_gated_activation = is_gated_activation(self)
 
         scales = {}
         for key, val in mock_scales_dict.items():
@@ -275,7 +289,12 @@ class TRTLLMHelper:
 
         if on_device_distributed_conversion:
             assert vocab_size is not None, "Need to pass in vocab_size for on device"
-            supported_model = self.model_type in [ModelType.gpt, ModelType.gptnext, ModelType.llama]
+            supported_model = self.model_type in [
+                ModelType.gpt,
+                ModelType.gptnext,
+                ModelType.llama,
+                ModelType.nemotron_nas,
+            ]
             assert (
                 supported_model
             ), "On device conversion only supported for model types gptnext and llama"
@@ -301,9 +320,6 @@ class TRTLLMHelper:
             return [trtllm_model_weights_on_device], [trtllm_model_config]
 
         else:
-            assert not (
-                self.share_embeddings_and_output_weights and not export_config.use_embedding_sharing
-            ), "Found share_embeddings_and_output_weights is True in the model. So set export_config.use_embedding_sharing to True"
             assert (
                 vocab_size is None
             ), "Vocab size is inferred from the input layer for cpu conversion. So leave it as None"
@@ -393,7 +409,6 @@ class TRTLLMHelper:
             inference_pp_size=self.weights_converter.inference_pp_size,
             inference_tp_size=self.weights_converter.inference_tp_size,
             use_parallel_embedding=True,
-            use_embedding_sharing=self.share_embeddings_and_output_weights,
         )
 
         world_size = export_config.inference_tp_size * export_config.inference_pp_size

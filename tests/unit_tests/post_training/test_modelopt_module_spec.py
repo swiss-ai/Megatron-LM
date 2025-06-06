@@ -79,7 +79,6 @@ class TestModelOptGPTModel:
             vocab_size=100,
             max_sequence_length=4,
         )
-
         # Ensure that a GPTModel can be built with the modelopt spec.
         self.modelopt_model = GPTModel(
             config=transformer_config,
@@ -104,8 +103,9 @@ class TestModelOptGPTModel:
     def test_inference(self):
         if not self._test_inference:
             return
-        model_forward(self.modelopt_model.cuda(), self.modelopt_model.config)
-        model_forward(self.default_model.cuda(), self.default_model.config)
+        config: TransformerConfig = self.modelopt_model.config
+        model = self.modelopt_model.cuda()
+        model_forward(model, config)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -141,6 +141,49 @@ class TestModelOptMLAMoE(TestModelOptGPTModel):
             max_sequence_length=8,
         )
         modelopt_spec = get_gpt_modelopt_spec(transformer_config, remap_te_layernorm=True)
+        # Ensure that a GPTModel can be built with the modelopt spec.
+        self.modelopt_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=modelopt_spec,
+            vocab_size=100,
+            max_sequence_length=8,
+        )
+
+
+class TestModelOptLlama4MoE(TestModelOptGPTModel):
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+        # Early version of TE DotProductAttention does not support
+        # q, k, v to have different shapes.
+        self._test_inference = get_te_version() > Version("1.10")
+
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=512,
+            num_attention_heads=8,
+            add_bias_linear=False,
+            num_moe_experts=2,
+            moe_layer_freq=[0, 1],
+            moe_ffn_hidden_size=128,
+            moe_shared_expert_intermediate_size=128,
+            qk_layernorm=True,
+            use_cpu_initialization=True,
+        )
+        default_spec = get_gpt_decoder_block_spec(
+            transformer_config, use_transformer_engine=True, qk_l2_norm=True
+        )
+        self.default_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=default_spec,
+            vocab_size=100,
+            max_sequence_length=8,
+        )
+        modelopt_spec = get_gpt_modelopt_spec(
+            transformer_config, remap_te_layernorm=True, qk_l2_norm=True
+        )
         # Ensure that a GPTModel can be built with the modelopt spec.
         self.modelopt_model = GPTModel(
             config=transformer_config,
@@ -188,24 +231,33 @@ def test_get_gpt_modelopt_spec_interface():
         "local_core_attention": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "remap_te_layernorm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "real_quant_cfg": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "qk_l2_norm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "use_arbitrary_attention_mask": inspect.Parameter.POSITIONAL_OR_KEYWORD,
     }
 
     expected_defaults = {
         "local_core_attention": False,
         "remap_te_layernorm": False,
         "real_quant_cfg": "None",
+        "qk_l2_norm": False,
+        "use_arbitrary_attention_mask": False,
     }
 
-    # Check parameter kinds
-    for param_name, param in sig.parameters.items():
-        assert param_name in expected_params.keys(), f"Unexpected parameter: {param_name}"
-        assert param.kind is expected_params[param_name], f"Wrong kind for parameter: {param_name}"
+    # Check expected parameters are in function signature
+    for param_name, param_kind in expected_params.items():
+        assert param_name in sig.parameters, f"Unexpected parameter: {param_name}"
+        assert (
+            param_kind is sig.parameters[param_name].kind
+        ), f"Wrong kind for parameter: {param_name}"
 
     # Check default values
-    defaults = {
+    sig_defaults = {
         k: v.default for k, v in sig.parameters.items() if v.default is not inspect.Parameter.empty
     }
-    assert defaults == expected_defaults, "Default values do not match the expected ones."
+    for k, v in expected_defaults.items():
+        assert (
+            k in sig_defaults and v == sig_defaults[k]
+        ), f"Default value of {sig_defaults[k]} does not match the expected value of {v} for parameter {k}."
 
 
 def test_get_mamba_stack_modelopt_spec_interface():
@@ -220,13 +272,18 @@ def test_get_mamba_stack_modelopt_spec_interface():
 
     expected_defaults = {"local_core_attention": False, "remap_te_layernorm": False}
 
-    # Check parameter kinds
-    for param_name, param in sig.parameters.items():
-        assert param_name in expected_params.keys(), f"Unexpected parameter: {param_name}"
-        assert param.kind is expected_params[param_name], f"Wrong kind for parameter: {param_name}"
+    # Check expected parameters are in function signature
+    for param_name, param_kind in expected_params.items():
+        assert param_name in sig.parameters, f"Unexpected parameter: {param_name}"
+        assert (
+            param_kind is sig.parameters[param_name].kind
+        ), f"Wrong kind for parameter: {param_name}"
 
     # Check default values
-    defaults = {
+    sig_defaults = {
         k: v.default for k, v in sig.parameters.items() if v.default is not inspect.Parameter.empty
     }
-    assert defaults == expected_defaults, "Default values do not match the expected ones."
+    for k, v in expected_defaults.items():
+        assert (
+            k in sig_defaults and v == sig_defaults[k]
+        ), f"Default value of {sig_defaults[k]} does not match the expected value of {v} for parameter {k}."

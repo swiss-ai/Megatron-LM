@@ -67,12 +67,43 @@ class DistributedDataParallelConfig:
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
 
-    suggested_communication_unit_size: int = 400_000_000
-    """When batch communication is needed across multiple buckets, 
-        this environment variable guides the size of communication unit size."""
+    suggested_communication_unit_size: int = None
+    """Specifies the number of elements to communicate at once during
+      FSDP (Fully Sharded Data Parallel) operations. 
+      This flag also affects FSDP all-gather prefetch behavior. Setting a larger
+      value increases the communication buffer size, while a smaller value
+      disables prefetching and may degrade performance. Adjust this value
+      based on your system's memory and performance requirements."""
 
     preserve_fp32_weights: bool = True
     """If true, preserve fp32 weights in the custom FSDP ParamAndGradBuffer."""
 
     keep_fp8_transpose_cache_when_using_custom_fsdp: bool = False
     """If true, keep the fp8 transpose cache when using custom FSDP."""
+
+    nccl_ub: bool = False
+    """If true, allocate and register NCCL userbuffer for param and grad buffer.
+      This flag enables SM efficient nccl algorithm that could improve the performance
+      of FSDP and DP with comm_overlap. This flag will be much more effective when used
+      together with sharp. 
+      The follwoing will be the expected number of SM usage for various cases.
+      (Note that this is just a reference number and the number of SM usage could vary 
+      on message size, communication domain size and nccl version.)
+      ----------------------------------------------------------
+      | Communication domain | use_sharp | SM usage of "AG/RS" |
+      |----------------------|-----------|---------------------|
+      | NVL                  | N/A       | 4 / 5               |
+      | NVL+IB               | False     | 16 / 16             |
+      | NVL+IB               | True      | 6 / 6               |
+      | IB                   | False     | 1 / 4               |
+      | IB                   | True      | 1 / 1               |
+      ----------------------------------------------------------
+    """
+
+    fsdp_double_buffer: bool = False
+    """If true, use persistently allocated double buffers for the 
+      temporary memory needed in the custom FSDP communications.
+      This option will cause additional memory overhead, however, it is necessary for
+      to register user buffer (nccl_ub=True) for the custom FSDP. 
+      This option will be automatically set to True when nccl_ub=True.
+   """

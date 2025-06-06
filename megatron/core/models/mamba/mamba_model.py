@@ -10,10 +10,11 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.utils import deprecate_inference_params
+from megatron.core.utils import WrappedTensor, deprecate_inference_params
 
 
 class MambaModel(LanguageModule):
@@ -47,6 +48,7 @@ class MambaModel(LanguageModule):
         seq_len_interpolation_factor (Optional[float], optional): scale of linearly
             interpolating RoPE for longer sequences. The value must be a float larger than 1.0.
              Defaults to None.
+        model_comm_pgs (ModelCommProcessGroups, optional): Model communication process groups.
     """
 
     def __init__(
@@ -67,7 +69,9 @@ class MambaModel(LanguageModule):
         position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'none',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
+        scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ) -> None:
         super().__init__(config=config)
 
@@ -87,6 +91,11 @@ class MambaModel(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
 
+        if model_comm_pgs is None:
+            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(
+                required_pgs=['tp', 'pp', 'cp', 'tp_cp', 'ep', 'expt_tp', 'tp_ep', 'expt_dp']
+            )
+
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
@@ -97,6 +106,8 @@ class MambaModel(LanguageModule):
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
+                scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
+                tp_group=model_comm_pgs.tp,
             )
 
         if self.position_embedding_type == 'rope':
@@ -106,6 +117,7 @@ class MambaModel(LanguageModule):
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
                 use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=model_comm_pgs.cp,
             )
 
         self.decoder = build_module(
@@ -117,6 +129,7 @@ class MambaModel(LanguageModule):
             hybrid_override_pattern=self.hybrid_override_pattern,
             post_process=self.post_process,
             dtype=config.params_dtype,
+            model_comm_pgs=model_comm_pgs,
         )
 
         # Output
@@ -131,6 +144,7 @@ class MambaModel(LanguageModule):
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
+                tp_group=model_comm_pgs.tp,
             )
 
         if self.pre_process or self.post_process:
@@ -191,6 +205,12 @@ class MambaModel(LanguageModule):
                 inference_context, self.decoder, decoder_input, self.config
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+
+        # Wrap decoder_input to allow the decoder (MambaBlock) to delete the
+        # reference held by this caller function, enabling early garbage collection
+        # for inference.
+        if inference_context is not None and not self.training:
+            decoder_input = WrappedTensor(decoder_input)
 
         # The following assert will currently fail when running inference.
         # Commented out for now.

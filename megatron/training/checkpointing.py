@@ -24,10 +24,10 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import \
     FullyParallelSaveStrategyWrapper, FullyParallelLoadStrategyWrapper
 from megatron.core.dist_checkpointing.core import OldXieluException
 from megatron.core.num_microbatches_calculator import update_num_microbatches
-from megatron.core.fp8_utils import is_float8tensor
+from megatron.core.fp8_utils import is_float8tensor, dequantize_fp8_tensor
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from .async_utils import schedule_async_save, is_empty_async_queue
-from .global_vars import get_args, get_one_logger
+from .global_vars import get_args
 from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank
 from ..core.dist_checkpointing.serialization import \
     get_default_save_sharded_strategy
@@ -35,6 +35,9 @@ from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_succe
 from . import wandb_utils
 
 from . import ft_integration
+
+from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+
 
 # [ModelOpt]: Import
 try:
@@ -106,10 +109,22 @@ def check_checkpoint_args(checkpoint_args):
         _compare('pipeline_model_parallel_size')
 
 
+def isfile(filename) -> bool:
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        return msc.os.path.isfile(filename)
+    else:
+        return os.path.isfile(filename)
+
+
 def ensure_directory_exists(filename, check_parent=True):
     """Build filename's path if it does not already exists."""
     dirname = os.path.dirname(filename) if check_parent else filename
-    os.makedirs(dirname, exist_ok=True)
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        msc.os.makedirs(dirname, exist_ok=True)
+    else:
+        os.makedirs(dirname, exist_ok=True)
 
 
 def get_checkpoint_name(checkpoints_path, iteration, release=False,
@@ -173,7 +188,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
                                    pipeline_parallel=False,
                                    tensor_rank=0, pipeline_rank=0,
                                    expert_parallel=False, expert_rank=0)
-    if os.path.isfile(filename):
+    if isfile(filename):
         return filename
 
     # Look for checkpoint with no pipelining and expert parallelism
@@ -181,7 +196,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
                                    pipeline_parallel=False,
                                    tensor_rank=0, pipeline_rank=0,
                                    expert_parallel=True, expert_rank=0)
-    if os.path.isfile(filename):
+    if isfile(filename):
         return filename
 
     # Look for checkpoint with pipelining and no expert parallelism
@@ -189,7 +204,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
                                    pipeline_parallel=True,
                                    tensor_rank=0, pipeline_rank=0,
                                    expert_parallel=False, expert_rank=0)
-    if os.path.isfile(filename):
+    if isfile(filename):
         return filename
 
     # Look for checkpoint with pipelining and expert parallelism
@@ -197,7 +212,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
                                    pipeline_parallel=True,
                                    tensor_rank=0, pipeline_rank=0,
                                    expert_parallel=True, expert_rank=0)
-    if os.path.isfile(filename):
+    if isfile(filename):
         return filename
 
     # Look for a distributed checkpoint
@@ -220,8 +235,8 @@ def get_checkpoint_tracker_filename(checkpoints_path):
 def checkpoint_exists(checkpoints_path):
     if checkpoints_path is None:
         return False
-    load_step = 'latest_checkpointed_iteration.txt'
-    return os.path.exists(os.path.join(checkpoints_path, load_step))
+    path = get_checkpoint_tracker_filename(checkpoints_path)
+    return isfile(path)
 
 
 def read_metadata(tracker_filename):
@@ -229,7 +244,8 @@ def read_metadata(tracker_filename):
     # mark it as a release checkpoint.
     iteration = 0
     release = False
-    with open(tracker_filename, 'r') as f:
+
+    with open_file(tracker_filename, 'r') as f:
         metastring = f.read().strip()
         try:
             iteration = int(metastring)
@@ -525,7 +541,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                                            barrier=False)
         else:
             def iter_finalize_fn():
-                with open(tracker_filename, 'w') as f:
+                with open_file(tracker_filename, 'w') as f:
                     f.write(str(iteration))
                 print_rank_0(f'  successfully saved checkpoint from iteration {int(iteration):7d} to {args.save} '
                              f'[ t {(tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
@@ -665,7 +681,6 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
     for i in range(len(model)):
         key = "model"
         if len(model) > 1:
-            mpu.set_virtual_pipeline_model_parallel_rank(i)
             key = f"model{i}"
 
         model_sd = None
@@ -776,7 +791,7 @@ def _get_non_persistent_iteration(non_persistent_global_dir, args, checkpointing
         return -1
     elif args.non_persistent_ckpt_type == "global":
         tracker_filename = get_checkpoint_tracker_filename(non_persistent_global_dir)
-        if os.path.isfile(tracker_filename):
+        if isfile(tracker_filename):
             iteration, release = read_metadata(tracker_filename)
             if release:
                 raise RuntimeError('Non-persistent checkpoint can\'t be a release checkpoint')
@@ -860,8 +875,14 @@ def _load_global_dist_base_checkpoint(
 
 def _get_checkpoint_format(checkpoint_name):
     """Get the format of an existing checkpoint."""
-    is_torch_ckpt = any([f.startswith("mp_rank_0") for f in os.listdir(checkpoint_name)])
-    is_torch_dcp = os.path.exists(os.path.join(checkpoint_name, ".metadata"))
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        checkpoint_dir = msc.Path(checkpoint_name)
+        is_torch_ckpt = any([f.name.startswith("mp_rank_0") for f in checkpoint_dir.iterdir()])
+        is_torch_dcp = checkpoint_dir.joinpath(".metadata").exists()
+    else:
+        is_torch_ckpt = any([f.startswith("mp_rank_0") for f in os.listdir(checkpoint_name)])
+        is_torch_dcp = os.path.exists(os.path.join(checkpoint_name, ".metadata"))
 
     ckpt_format = None
     if dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name):
@@ -1106,7 +1127,10 @@ def load_args_from_checkpoint(
 
     _set_arg('num_experts', force=True)
     _set_arg('moe_layer_freq', force=True)
-    _set_arg('moe_ffn_hidden_size', force=True)
+    if getattr(checkpoint_args, 'num_experts', None) is not None:
+        _set_arg('moe_ffn_hidden_size', force=True)
+    else:
+        setattr(args, 'moe_ffn_hidden_size', None)
     _set_arg('moe_router_topk', force=True)
     _set_arg('moe_token_dispatcher_type', force=True)
     _set_arg('moe_router_pre_softmax', force=True)
@@ -1117,6 +1141,12 @@ def load_args_from_checkpoint(
     _set_arg('mamba_state_dim', force=True)
     _set_arg('mamba_head_dim', force=True)
     _set_arg('mamba_num_groups', force=True)
+    _set_arg('mamba_num_heads', force=True)
+    _set_arg('is_hybrid_model', force=True)
+
+    # Heterogeneous args.
+    _set_arg('heterogeneous_layers_config_path', force=True)
+    _set_arg('heterogeneous_layers_config_encoded_json', force=True)
 
     # Tokenizer args.
     _set_arg('tokenizer_type', force=True)
@@ -1168,7 +1198,7 @@ def fix_fp8_params_lose_precision_when_loading_dist_ckpt(state_dict):
         if key.startswith('model'):
             for _, sharded_tensor in state_dict[key].items():
                 if is_float8tensor(sharded_tensor.data):
-                    sharded_tensor.data = sharded_tensor.data.from_float8().cpu()
+                    sharded_tensor.data = dequantize_fp8_tensor(sharded_tensor.data).cpu()
 
 
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
@@ -1397,7 +1427,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             ddp_model[0].load_state_dict(state_dict['model'], strict=strict)
         else:
             for i in range(len(ddp_model)):
-                mpu.set_virtual_pipeline_model_parallel_rank(i)
                 ddp_model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
 
     # Fix up query/key/value matrix ordering if needed.
@@ -1540,7 +1569,8 @@ def load_biencoder_checkpoint(model, only_query_model=False,
     load_path = custom_load_path if custom_load_path is not None else args.load
 
     tracker_filename = get_checkpoint_tracker_filename(load_path)
-    with open(tracker_filename, 'r') as f:
+
+    with open_file(tracker_filename, 'r') as f:
         iteration = int(f.read().strip())
 
     checkpoint_name = get_checkpoint_name(load_path, iteration,

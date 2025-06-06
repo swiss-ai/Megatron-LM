@@ -10,6 +10,7 @@ from megatron.core.export.data_type import DataType
 from megatron.core.export.export_config import ExportConfig
 from megatron.core.export.trtllm.trtllm_layers import NON_TRANSFORMER_LAYERS_NAMES, TRTLLMLayers
 from megatron.core.export.trtllm.trtllm_layers import get_layer_name_without_prefix as suffix
+from megatron.core.export.trtllm.trtllm_weights_converter.utils import is_gated_activation
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -168,23 +169,22 @@ class SingleDeviceTRTLLMModelWeightsConverter:
 
             _add_to_trtllm_model_weights(val=val, layer_name=layer_name, split_type=None)
 
-        elif layer_name.endswith(
-            suffix(TRTLLMLayers.attention_dense_weight)
-        ) or layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_weight)):
+        elif (
+            layer_name.endswith(suffix(TRTLLMLayers.attention_dense_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.ffn_projection_weight))
+        ):
             split_vals = torch.chunk(val, self.export_config.inference_tp_size, axis=0)
             _add_to_trtllm_model_weights(
                 val=split_vals, layer_name=layer_name, split_type='tensor_split'
             )
 
-        elif layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_weight)) or layer_name.endswith(
-            suffix(TRTLLMLayers.mlp_fc_bias)
+        elif (
+            layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_bias))
+            or layer_name.endswith(suffix(TRTLLMLayers.ffn_fc_weight))
         ):
-            split_gated_activation = self.activation in [
-                "swiglu",
-                "geglu",
-                "fast-swiglu",
-                "fast-geglu",
-            ]
+            split_gated_activation = is_gated_activation(self)
             if split_gated_activation:
                 val, gate = torch.chunk(val, 2, axis=-1)
                 gate_layer_name = layer_name.replace("fc", "gate")
@@ -193,6 +193,14 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                     val=split_vals, layer_name=gate_layer_name, split_type='tensor_split'
                 )
 
+            split_vals = torch.chunk(val, self.export_config.inference_tp_size, axis=-1)
+            _add_to_trtllm_model_weights(
+                val=split_vals, layer_name=layer_name, split_type='tensor_split'
+            )
+
+        elif layer_name.endswith(suffix(TRTLLMLayers.ffn_linear_weight)) or layer_name.endswith(
+            suffix(TRTLLMLayers.attention_linear_weight)
+        ):
             split_vals = torch.chunk(val, self.export_config.inference_tp_size, axis=-1)
             _add_to_trtllm_model_weights(
                 val=split_vals, layer_name=layer_name, split_type='tensor_split'
