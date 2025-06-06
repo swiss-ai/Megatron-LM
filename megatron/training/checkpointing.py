@@ -1277,7 +1277,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             ckpt_tp_pp == run_tp_pp
             and not release
             and not args.finetune
-            and 'rerun_state_machine' in state_dict
         ):
             rerun_state_machine = get_rerun_state_machine()
             gen_sd_rerun_state = rerun_state_machine.state_dict(
