@@ -1060,6 +1060,9 @@ def validate_args(args, defaults={}):
             + f"The supported position embedding types are rope and none."
         )
 
+    if args.log_params_norm_per_param:
+        assert pipeline_model_parallel_size == 1, "--log-params-norm-per-param not supported with PP>1"
+
     # Print arguments.
     _print_args("arguments", args)
 
