@@ -245,7 +245,7 @@ class TransformerBlock(MegatronModule):
     ):
         super().__init__(config=config)
 
-        self.submodules = _get_block_submodules(config, spec)
+        self.submodules = _get_block_submodules(config, spec, vp_stage=vp_stage)
         self.final_layer_norm = final_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
