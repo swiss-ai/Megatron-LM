@@ -133,6 +133,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
                 rotary_percent=args.rotary_percent,
                 rotary_base=args.rotary_base,
                 rope_scaling=args.use_rope_scaling,
+                rope_scaling_factor=args.rope_scaling_factor,
                 final_layernorm=args.final_layernorm,
                 input_embeddings_multiplier=args.input_embeddings_multiplier,
             )
