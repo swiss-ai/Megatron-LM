@@ -557,7 +557,6 @@ class TransformerBlock(MegatronModule):
                 for l_no, layer in enumerate(self.layers):
                     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
                     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
-                    true_l_no = l_no + pp_rank*self.config.num_layers//pp_size
                     inner_fp8_context = (
                         get_fp8_context(self.config, layer.layer_number - 1)
                         if use_inner_fp8_context
@@ -577,7 +576,7 @@ class TransformerBlock(MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                         )
-                    tracker.update(hidden_states, "activation", true_l_no)
+                    tracker.update(hidden_states, "activation", layer.layer_number - 1)
 
                     if (
                         torch.is_grad_enabled()

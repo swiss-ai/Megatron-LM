@@ -1062,8 +1062,6 @@ def validate_args(args, defaults={}):
 
     if args.log_params_norm_per_param:
         assert args.pipeline_model_parallel_size == 1, "--log-params-norm-per-param not supported with PP>1"
-    if len(args.log_intermediate_metrics) > 0:
-        assert args.pipeline_model_parallel_size == 1, "intermediate metrics tracking not supported with PP>1"
 
     # Print arguments.
     _print_args("arguments", args)

@@ -1,4 +1,5 @@
 from typing import Iterator, Optional
+
 import torch
 
 from megatron.core import parallel_state
@@ -46,16 +47,17 @@ class Tracker:
         self.final_metrics_map = {metric: idx for idx, metric in enumerate(self.metrics)}
         self._inv_final_metrics_map = {idx: metric for metric, idx in self.final_metrics_map.items()}
 
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         self.local_gbs = self.args.global_batch_size//self.args.data_parallel_size
         self.local_layers = self.args.num_layers//self.args.pipeline_model_parallel_size
-        self.local_first_layer = self.local_layers*pp_rank
 
+        self._init_pp()
         self.reset()
 
     def reset(self):
-        self.current_mbs = 0
+        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
         shape = self.local_gbs, self.local_layers, len(self.intermediate_metrics_map), len(self.expected_names)
+
+        self.current_mbs = 0 if vp_size is None else [0 for _ in range(self.local_layers)]
         self.partial_results = torch.full(shape, torch.inf, dtype=torch.float32, device="cuda")
         self._shapes = torch.full((len(self.expected_names),), -1, dtype=torch.int64, device="cuda")
         self.gathered_final_metrics = None
@@ -77,14 +79,22 @@ class Tracker:
         mbs = x.size(1)
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         x = x.transpose(0, 1).reshape(mbs, -1)
-        batch_slice = slice(self.current_mbs*mbs, (self.current_mbs + 1)*mbs)
         name_idx = self.expected_names[name][0]
-        assert self.local_first_layer <= layer < pp_size*self.local_layers, f"({self.local_first_layer}, {layer}, {self.local_layers})"
-        assert (self.current_mbs + 1)*mbs <= self.local_gbs
         assert self._shapes[name_idx] == -1 or self._shapes[name_idx] == x.size(1)
-        self._shapes[name_idx] = x.size(1)
 
-        local_layer = layer - self.local_first_layer
+        if self._vp_map is None:  # i.e. no virtual pp.
+            assert 0 <= layer - self.local_first_layer < pp_size*self.local_layers, f"({self.local_first_layer}, {layer}, {self.local_layers})"
+            local_layer = layer - self.local_first_layer
+            current_mbs = self.current_mbs
+        else:
+            assert layer + 1 in self._inv_vp_map
+            local_layer = self._inv_vp_map[layer + 1]
+            current_mbs = self.current_mbs[local_layer]
+
+        assert (current_mbs + 1)*mbs <= self.local_gbs
+        self._shapes[name_idx] = x.size(1)
+        batch_slice = slice(current_mbs*mbs, (current_mbs + 1)*mbs)
+
         if "mean" in self.metrics:
             idx = (batch_slice, local_layer, self.intermediate_metrics_map["sum"], name_idx)
             self.partial_results[idx] = torch.sum(x, dim=1).float()
@@ -106,8 +116,12 @@ class Tracker:
                 amax = torch.amax(absx)
                 self.partial_results[idx] = torch.count_nonzero(absx == amax)
 
-        if torch.all(~torch.isinf(self.partial_results[batch_slice, :, :, :])):
-            self.current_mbs += 1
+        if self._vp_map is None:
+            if torch.all(~torch.isinf(self.partial_results[batch_slice, :, :, :])):
+                self.current_mbs += 1
+        else:
+            if torch.all(~torch.isinf(self.partial_results[batch_slice, local_layer, :, :])):
+                self.current_mbs[local_layer] += 1
 
     @torch.no_grad()
     def aggregate(self):
@@ -193,6 +207,15 @@ class Tracker:
             shape = pp_size*self.local_layers, len(self.final_metrics_map), len(self.expected_names)
             gathered_final_metrics = torch.empty(shape, dtype=torch.float32, device="cuda")
             torch.distributed.all_gather_into_tensor(gathered_final_metrics, final_metrics, group=pp_group)
+            if self._vp_map is not None:  # i.e. virtual pp is enabled, let's fix the order.
+                vp_map = torch.tensor(list(self._vp_map.values()), dtype=torch.float32, device="cuda")
+                gathered_vp_map = torch.empty(pp_size*self.local_layers, dtype=torch.float32, device="cuda")
+                torch.distributed.all_gather_into_tensor(gathered_vp_map, vp_map, group=pp_group)
+                # Let's fix_vp_ordering.
+                gathered_vp_map_list = (gathered_vp_map - 1).long().cpu().tolist()
+                assert all(0 <= idx < self.args.num_layers for idx in gathered_vp_map_list)
+                assert len(gathered_vp_map_list) == len(set(gathered_vp_map_list))  # i.e. no repeated layers.
+                gathered_final_metrics = gathered_final_metrics[gathered_vp_map_list]
         else:
             gathered_final_metrics = final_metrics
         self.gathered_final_metrics = gathered_final_metrics
@@ -211,6 +234,27 @@ class Tracker:
                 yield f"{metric}/{name}_avg", avg_metrics_across_layers[metric_id][name_id]
                 for layer in range(self.gathered_final_metrics.size(0)):
                     yield f"{metric}/{name}_layer{layer:03d}", values[layer][metric_id][name_id]
+
+    def _init_pp(self):
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+
+        if vp_size is None:  # No Virtual Pipelines.
+            self.local_first_layer = self.local_layers*pp_rank
+            self._vp_map = None
+            return
+
+        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+        from megatron.training.arguments import core_transformer_config_from_args
+        layers_per_vp = self.args.num_layers_per_virtual_pipeline_stage
+        config = core_transformer_config_from_args(self.args)
+        self._vp_map = {}
+        for local_idx in range(self.local_layers):
+            vp_stage = local_idx//layers_per_vp
+            layer_in_vp = local_idx % layers_per_vp
+            self._vp_map[local_idx] = layer_in_vp + get_transformer_layer_offset(config, vp_stage) + 1
+        self._inv_vp_map = {layer: local_idx for local_idx, layer in self._vp_map.items()}
 
 
 _TRACKER: Optional[Tracker] = None
