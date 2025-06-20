@@ -1,12 +1,30 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import math
-from typing import Optional
+from typing import List, Optional, Union
 
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+
+try:
+    from megatron.core.extensions.transformer_engine import (
+        fused_permute,
+        fused_permute_with_probs,
+        fused_sort_chunks_by_index,
+        fused_sort_chunks_by_index_with_probs,
+        fused_unpermute,
+    )
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+
+# MOE logging
+_MOE_LAYER_WISE_LOGGING_TRACKER = {}
 
 
 def switch_load_balancing_loss_func(
@@ -164,7 +182,7 @@ def get_capacity(num_tokens: int, num_experts: int, capacity_factor: float, min_
 class MoEAuxLossAutoScaler(torch.autograd.Function):
     """An AutoScaler that triggers the backward pass and scales the grad for auxiliary loss."""
 
-    main_loss_backward_scale: torch.Tensor = torch.tensor(1.0)
+    main_loss_backward_scale: torch.Tensor = None
 
     @staticmethod
     def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor):
@@ -192,6 +210,10 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
                                                gradient.
         """
         (aux_loss,) = ctx.saved_tensors
+        if MoEAuxLossAutoScaler.main_loss_backward_scale is None:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+                1.0, device=aux_loss.device
+            )
         aux_loss_backward_scale = MoEAuxLossAutoScaler.main_loss_backward_scale
         scaled_aux_loss_grad = torch.ones_like(aux_loss) * aux_loss_backward_scale
         return grad_output, scaled_aux_loss_grad
@@ -204,10 +226,20 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
             scale (torch.Tensor): The scale value to set. Please ensure that the scale passed in
                                   matches the scale of the main_loss.
         """
-        MoEAuxLossAutoScaler.main_loss_backward_scale = scale
+        if MoEAuxLossAutoScaler.main_loss_backward_scale is None:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = scale
+        else:
+            MoEAuxLossAutoScaler.main_loss_backward_scale.copy_(scale)
 
 
-def permute(tokens, routing_map, num_out_tokens: int = None, drop_and_pad: bool = False):
+def permute(
+    tokens,
+    routing_map,
+    probs: Optional[torch.Tensor] = None,
+    num_out_tokens: Optional[int] = None,
+    fused: bool = False,
+    drop_and_pad: bool = False,
+):
     """Permute the tokens and probs based on the mask.
     Tokens with the same designated expert will be grouped together.
     The shape of mask is [tokens, num_experts], it indicates which experts were selected
@@ -219,15 +251,33 @@ def permute(tokens, routing_map, num_out_tokens: int = None, drop_and_pad: bool 
     Args:
         tokens (torch.Tensor): The input token tensor, [num_tokens, hidden].
         routing_map (torch.Tensor): The sparse token to expert mapping, [num_tokens, num_experts].
+        probs (torch.Tensor, optional): The probs tensor, [num_tokens, num_experts].
         num_out_tokens (int, optional): The number of output tokens. If None, it's set to
                                         the number of input tokens.
+        fused (bool, optional): Whether use the fused permute function.
         drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
                                        and pads the number of tokens to the expert capacity.
                                        If set to true, routing_map has a fixed number of non-zeros
                                        in each column.
     """
+    if fused and probs is None:
+        if not HAVE_TE or fused_permute is None:
+            raise ValueError("fused_permute is not available. Please install TE >= 2.1.0.")
+        permuted_input, sorted_indices = fused_permute(
+            tokens, routing_map, num_out_tokens=num_out_tokens
+        )
+        return permuted_input, None, sorted_indices
+
+    if fused and probs is not None:
+        if not HAVE_TE or fused_permute_with_probs is None:
+            raise ValueError(
+                "fused_permute_with_probs is not available. Please install TE >= 2.1.0."
+            )
+        return fused_permute_with_probs(tokens, probs, routing_map, num_out_tokens=num_out_tokens)
+
     num_tokens, hidden = tokens.shape
     num_experts = routing_map.shape[1]
+    permuted_probs = None
     if drop_and_pad and not (num_out_tokens is None):
         capacity = num_out_tokens // num_experts
         assert not routing_map.requires_grad
@@ -240,6 +290,16 @@ def permute(tokens, routing_map, num_out_tokens: int = None, drop_and_pad: bool 
         ].contiguous()
         # flatten from [num_experts, capacity] to 1D
         sorted_indices = sorted_indices.view(-1)
+
+        if probs is not None:
+            # [num_tokens, num_experts] -> num_experts * num_tokens
+            probs_T_1D = probs.T.contiguous().view(-1)
+            # get 1D indices of the probs selected by routing_map
+            indices_dim0 = torch.arange(num_experts, device=routing_map.device).unsqueeze(-1)
+            indices_dim1 = sorted_indices.view(num_experts, capacity)
+            indices_1D = (indices_dim0 * num_tokens + indices_dim1).view(-1)
+            # get probs from indices
+            permuted_probs = probs_T_1D.index_select(0, indices_1D)
     else:
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
         routing_map = routing_map.bool().T.contiguous()
@@ -250,10 +310,13 @@ def permute(tokens, routing_map, num_out_tokens: int = None, drop_and_pad: bool 
         )
         sorted_indices = token_indices.masked_select(routing_map)
 
+        if probs is not None:
+            permuted_probs = probs.T.contiguous().masked_select(routing_map)
+
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)
 
-    return permuted_input, sorted_indices
+    return permuted_input, permuted_probs, sorted_indices
 
 
 def unpermute(
@@ -262,6 +325,7 @@ def unpermute(
     restore_shape: torch.Size,
     probs: torch.Tensor = None,
     routing_map: torch.Tensor = None,
+    fused: bool = False,
     drop_and_pad: bool = False,
 ):
     """
@@ -281,13 +345,22 @@ def unpermute(
         probs (torch.Tensor, optional): The unpermuted probs tensor,
         routing_map (torch.Tensor, optional): Token to expert mapping, shape
             [num_tokens, num_experts].
+        fused (bool, optional): Whether use the fused unpermute function.
         drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
                                        and pads the number of tokens to the expert capacity.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
     """
+    if fused:
+        if not HAVE_TE or fused_unpermute is None:
+            raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
+        return fused_unpermute(
+            permuted_tokens, sorted_indices, merging_probs=probs, restore_shape=restore_shape
+        )
+
     _, hidden = restore_shape
+    input_dtype = permuted_tokens.dtype
 
     if probs is not None:
         assert routing_map is not None, "Mask must be provided to permute the probs."
@@ -309,65 +382,107 @@ def unpermute(
             permuted_probs = probs_T_1D.index_select(0, indices_1D)
         else:
             permuted_probs = probs.T.contiguous().masked_select(routing_map.T.contiguous())
+        # Here may promote permuted_tokens to higher precision (fp32/fp64) if probs is in
+        # higher precision due to moe_router_dtype being enabled. This can lead to
+        # additional GPU memory usage. Use --moe-permute-fusion flag to avoid this extra memory
+        # allocation.
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
 
     # Create an output tensor filled with zeros
     output_tokens = torch.zeros(
-        restore_shape, device=permuted_tokens.device, dtype=permuted_tokens.dtype
+        restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
     # Scatter add the permuted_input back to the original positions
     output_tokens.scatter_add_(0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens)
-    return output_tokens
+    return output_tokens.to(dtype=input_dtype)
 
 
-def sort_chunks_by_idxs(input: torch.Tensor, split_sizes: torch.Tensor, sorted_idxs: torch.Tensor):
+def sort_chunks_by_idxs(
+    input: torch.Tensor,
+    split_sizes: torch.Tensor,
+    sorted_idxs: torch.Tensor,
+    probs: Optional[torch.Tensor] = None,
+    fused: bool = False,
+):
     """Split and sort the input tensor based on the split_sizes and sorted indices."""
+    if fused and probs is None:
+        if not HAVE_TE or fused_sort_chunks_by_index is None:
+            raise ValueError(
+                "fused_sort_chunks_by_index is not available. Please install TE >= 2.1.0."
+            )
+        return fused_sort_chunks_by_index(input, split_sizes, sorted_idxs), None
+
+    if fused and probs is not None:
+        if not HAVE_TE or fused_sort_chunks_by_index_with_probs is None:
+            raise ValueError(
+                "fused_sort_chunks_by_index_with_probs is not available. "
+                "Please install TE >= 2.1.0."
+            )
+        return fused_sort_chunks_by_index_with_probs(input, probs, split_sizes, sorted_idxs)
+
     input = torch.split(input, split_sizes.tolist(), dim=0)
-    output = torch.cat([input[i] for i in sorted_idxs], dim=0)
-    return output
+    output = torch.cat([input[i] for i in sorted_idxs.tolist()], dim=0)
+    if probs is not None:
+        probs = torch.split(probs, split_sizes.tolist(), dim=0)
+        permuted_probs = torch.cat([probs[i] for i in sorted_idxs.tolist()], dim=0)
+    else:
+        permuted_probs = None
+    return output, permuted_probs
 
 
-def device_limited_topk(
+def group_limited_topk(
     scores: torch.Tensor,
     topk: int,
     num_tokens: int,
     num_experts: int,
-    moe_router_topk_limited_devices: int,
+    num_groups: int,
+    group_topk: int,
 ):
-    """Perform top-k routing on a subset of expert parallel ranks.
+    """Perform top-k routing on a subset of expert groups.
 
-    Selects N ranks for each token, then conducts top-k selection among experts on these devices.
-    See DeepSeek-V2 technical report (https://arxiv.org/pdf/2405.04434) for details.
+    When using group-limited routing:
+    1. Experts are divided into 'moe_router_num_groups' equal-sized groups
+    2. For each token, 'moe_router_group_topk' groups are selected based on routing scores
+       (specifically, the sum of top-2 expert scores within each group)
+    3. From these selected groups, 'moe_router_topk' individual experts are chosen
+
+    Two common use cases:
+    - Device-limited routing: Set 'moe_router_num_groups' equal to expert parallel size (EP)
+      to limit each token to experts on a subset of devices
+      (See DeepSeek-V2: https://arxiv.org/pdf/2405.04434)
+
+    - Node-limited routing: Set 'moe_router_num_groups' equal to number of nodes in EP group
+      to limit each token to experts on a subset of nodes
+      (See DeepSeek-V3: https://arxiv.org/pdf/2412.19437)
 
     Args:
-        scores (torch.Tensor): Softmax scores from the router.
+        scores (torch.Tensor): Softmax scores generated by the router.
         topk (int): The number of experts to select for each token.
         num_tokens (int): The number of tokens.
         num_experts (int): The number of experts.
-        moe_router_topk_limited_devices (int): Number of expert parallel ranks to consider for
-            each token during routing. None means no device limitation.
+        num_groups (int): Number of groups for routed experts.
+        group_topk (int): Number of groups selected for each token.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Probs and indices tensor.
     """
-
     # Organize the experts into groups
-    num_group = (
-        parallel_state.get_expert_model_parallel_world_size()
-    )  # num_group equals to expert parallel size
-    group_scores = scores.view(num_tokens, num_group, -1).max(dim=-1).values
-    group_idx = torch.topk(group_scores, k=moe_router_topk_limited_devices, dim=-1, sorted=False)[1]
+    # Select groups based on sum of top-(topk/group_topk) routing scores within each group
+    group_scores = (
+        scores.view(num_tokens, num_groups, -1).topk(topk // group_topk, dim=-1)[0].sum(dim=-1)
+    )
+    group_idx = torch.topk(group_scores, k=group_topk, dim=-1, sorted=False)[1]
     group_mask = torch.zeros_like(group_scores)
     group_mask.scatter_(1, group_idx, 1)
 
     # Mask the experts based on selection groups
     score_mask = (
         group_mask.unsqueeze(-1)
-        .expand(num_tokens, num_group, num_experts // num_group)
+        .expand(num_tokens, num_groups, num_experts // num_groups)
         .reshape(num_tokens, -1)
     )
 
-    masked_scores = scores.masked_fill(~score_mask.bool(), 0.0)
+    masked_scores = scores.masked_fill(~score_mask.bool(), float('-inf'))
     probs, top_indices = torch.topk(masked_scores, k=topk, dim=-1)
 
     return probs, top_indices
@@ -380,8 +495,9 @@ def topk_softmax_with_capacity(
     pad_to_capacity: bool = False,
     drop_policy: str = "probs",
     use_pre_softmax: bool = False,
-    moe_router_topk_limited_devices: int = None,
-    moe_router_topk_scaling_factor: Optional[float] = None,
+    num_groups: Optional[int] = None,
+    group_topk: Optional[int] = None,
+    scaling_factor: Optional[float] = None,
     deterministic_mode: bool = False,
     score_function: str = "softmax",
     expert_bias: Optional[torch.Tensor] = None,
@@ -392,16 +508,19 @@ def topk_softmax_with_capacity(
         topk (int): The number of experts to select for each token.
         capacity_factor (float): The capacity factor of each expert. Will drop tokens if the number
                                of tokens exceeds the capacity.
-        pad_to_capacity (bool): Whether to need padding in token drop mode.
+        pad_to_capacity (bool): Whether to need padding in token drop mode. The probs for padded
+                               tokens will be 0.
         drop_policy (str): The policy to drop tokens. Can be either "prob" or "position".
                            If "prob", the tokens with the lowest probabilities will be dropped.
                            If "position", tokens at the end of each batch will be dropped.
-        use_pre_softmax (bool): Whether to apply softmax before top-k selection.
-        moe_router_topk_limited_devices (int): Number of expert parallel ranks to consider for
-            each token during routing. None means no device limitation.
-        moe_router_topk_scaling_factor (float): Scaling factor for routing score in top-k
-            selection, only works when use_pre_softmax enabled.
+        use_pre_softmax (bool): Whether to apply softmax or sigmoid before top-k selection.
+        num_groups (int): Number of groups for routed experts.
+        group_topk (int): Number of selected groups for each token.
+        scaling_factor (float): Scaling factor of routing score in top-k selection.
         deterministic_mode (bool): Deprecated.
+        score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
+        expert_bias (torch.Tensor): The bias added to logits for expert routing.
+
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
@@ -415,33 +534,40 @@ def topk_softmax_with_capacity(
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
 
-    def compute_topk(scores, topk, limited_devices=None):
-        if limited_devices:
-            return device_limited_topk(scores, topk, num_tokens, num_experts, limited_devices)
+    def compute_topk(scores, topk, num_groups=None, group_topk=None):
+        if group_topk:
+            return group_limited_topk(
+                scores=scores,
+                topk=topk,
+                num_tokens=num_tokens,
+                num_experts=num_experts,
+                num_groups=num_groups,
+                group_topk=group_topk,
+            )
         else:
             return torch.topk(scores, k=topk, dim=1)
 
     if score_function == "softmax":
         if use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
-            probs, top_indices = compute_topk(scores, topk, moe_router_topk_limited_devices)
+            probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         else:
-            scores, top_indices = compute_topk(logits, topk, moe_router_topk_limited_devices)
+            scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
     elif score_function == "sigmoid":
-        scores = torch.sigmoid(logits)
+        scores = torch.sigmoid(logits.float()).type_as(logits)
         if expert_bias is not None:
             scores_for_routing = scores + expert_bias
-            _, top_indices = compute_topk(scores_for_routing, topk, moe_router_topk_limited_devices)
+            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
             scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
         else:
-            scores, top_indices = compute_topk(scores, topk, moe_router_topk_limited_devices)
+            scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 
-    if moe_router_topk_scaling_factor:
-        probs = probs * moe_router_topk_scaling_factor
+    if scaling_factor:
+        probs = probs * scaling_factor
 
     # TODO Try using element-wise operations instead of scatter?
     topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
@@ -500,7 +626,7 @@ def save_to_aux_losses_tracker(
     if layer_number is None:
         return
 
-    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    tracker = get_moe_layer_wise_logging_tracker()
     if name not in tracker:
         tracker[name] = {}
         tracker[name]["values"] = torch.zeros(num_layers, device=loss.device)
@@ -511,18 +637,21 @@ def save_to_aux_losses_tracker(
 
 def clear_aux_losses_tracker():
     """Clear the auxiliary losses."""
-    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    tracker = get_moe_layer_wise_logging_tracker()
     for name in tracker:
         tracker[name]["values"].zero_()
         tracker[name]["reduce_group"] = None
         tracker[name]["avg_group"] = None
 
 
-def reduce_aux_losses_tracker_across_ranks():
+def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = None):
     """Collect and reduce the auxiliary losses across ranks."""
-    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
-    for name in tracker:
+    tracker = get_moe_layer_wise_logging_tracker()
+    if track_names is None:
+        track_names = tracker.keys()
+    for name in track_names:
         values = tracker[name]["values"]
+        # TODO(Hepteract): delete the usage of the global parallel_state.
         # Collect aux losses across PP.
         torch.distributed.all_reduce(
             values, group=parallel_state.get_pipeline_model_parallel_group()
@@ -537,25 +666,56 @@ def reduce_aux_losses_tracker_across_ranks():
 
 
 def track_moe_metrics(
-    loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None, per_layer_logging=False
+    loss_scale: float,
+    iteration: int,
+    writer,
+    wandb_writer=None,
+    total_loss_dict=None,
+    per_layer_logging=False,
+    force_initialize: bool = False,
+    track_names: Optional[List[str]] = None,
+    num_layers: Optional[int] = None,
+    moe_layer_freq: Optional[Union[int, List[int]]] = None,
 ):
     """Track the MoE metrics for logging."""
     # Aux loss logging
-    reduce_aux_losses_tracker_across_ranks()
-    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    tracker = get_moe_layer_wise_logging_tracker()
+    # Initialize the tracker if force_initialize is True
+    if force_initialize:
+        if track_names is not None:
+            for key in track_names:
+                if key not in tracker:
+                    tracker[key] = {}
+                    tracker[key]["values"] = torch.zeros(num_layers, device="cuda")
+                    tracker[key]["reduce_group"] = None
+                    tracker[key]["avg_group"] = None
+    reduce_aux_losses_tracker_across_ranks(track_names)
+
+    # Get number of MoE layers
+    if moe_layer_freq is None:
+        num_moe_layers = num_layers
+    elif isinstance(moe_layer_freq, int):
+        assert isinstance(num_layers, int)
+        moe_layer_pattern = [1 if (i % moe_layer_freq == 0) else 0 for i in range(num_layers)]
+        num_moe_layers = sum(moe_layer_pattern)
+    elif isinstance(moe_layer_freq, list):
+        num_moe_layers = sum(moe_layer_freq)
+    else:
+        raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
+
     if writer is not None:
         aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}
         for name, loss_list in aux_losses.items():
             if total_loss_dict is not None:
                 if name not in total_loss_dict:
-                    total_loss_dict[name] = loss_list.mean()
+                    total_loss_dict[name] = loss_list.sum() / num_moe_layers
                 else:
-                    total_loss_dict[name] += loss_list.mean()
+                    total_loss_dict[name] += loss_list.sum() / num_moe_layers
 
             # currently when using add_scalars,
             # torch.utils.add_scalars makes each timer its own run, which
             # polutes the runs list, so we just add each as a scalar
-            writer.add_scalar(name, loss_list.mean(), iteration)
+            writer.add_scalar(name, loss_list.sum() / num_moe_layers, iteration)
             if per_layer_logging:
                 for i, loss in enumerate(loss_list.tolist()):
                     writer.add_scalar(f"moe/{name}_layer_{i}", loss, iteration)
@@ -564,7 +724,7 @@ def track_moe_metrics(
             # As a workaround, we log each scalar individually first, then we can create
             # a custom panel to manually group them to a single plot.
             if wandb_writer:
-                wandb_writer.log({f"{name}": loss_list.mean()}, iteration)
+                wandb_writer.log({f"{name}": loss_list.sum() / num_moe_layers}, iteration)
                 if per_layer_logging:
                     wandb_writer.log(
                         {
@@ -589,9 +749,93 @@ def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_r
         # All Reduce Across TPxCPxDP group
         torch.distributed.all_reduce(
             tokens_per_expert,
+            # TODO(Hepteract): delete the usage of the global parallel_state.
             group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
         )
         average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
         offset = average_tokens - tokens_per_expert
         updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
         return updated_expert_bias
+
+
+def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
+    """Move a tensor to CPU if it is on GPU.
+    Args:
+        tensor (torch.Tensor or None): The tensor to move to CPU.
+        as_numpy (bool): Whether to convert the tensor to a numpy array.
+        record_stream (bool): Whether to record the stream of the tensor, to prevent memory leak
+                              when the DtoH data transfer is on a side stream.
+    """
+    if torch.is_tensor(tensor) and tensor.is_cuda:
+        cpu_tensor = tensor.to(torch.device("cpu"), non_blocking=True)
+        if as_numpy:
+            cpu_tensor = cpu_tensor.numpy()
+        if record_stream:
+            tensor.record_stream(torch.cuda.current_stream())
+        tensor = cpu_tensor
+    return tensor
+
+
+def get_moe_layer_wise_logging_tracker():
+    """Return the moe layer wise tracker."""
+    global _MOE_LAYER_WISE_LOGGING_TRACKER
+    return _MOE_LAYER_WISE_LOGGING_TRACKER
+
+
+class RandomSTE(torch.autograd.Function):
+    """
+    Straight-Through Estimator(STE) function that returns random values
+    with different seed for each rank.
+
+    This is used to generate random logits of router for load-balanced benchmark.
+    """
+
+    generator = None
+
+    @staticmethod
+    def forward(ctx, logits):
+        """
+        Forward pass returns random logits with rank-specific seed.
+        """
+        if RandomSTE.generator is None:
+            global_rank = torch.distributed.get_rank()
+            base_seed = 42
+            seed = base_seed + global_rank
+            RandomSTE.generator = torch.Generator(device=logits.device)
+            RandomSTE.generator.manual_seed(seed)
+
+        random_logits = logits.clone().normal_(generator=RandomSTE.generator)
+        return random_logits
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        Backward pass propagates the gradient for logits.
+        """
+        return grad_output
+
+
+def apply_random_logits(logits):
+    """
+    Apply the RandomSTE function to the logits.
+    """
+    return RandomSTE.apply(logits)
+
+
+# TODO(Hepteract): delete the usage of the global parallel_state.
+# Initialize process groups with the global parallel_state.
+def get_default_model_comm_pgs():
+    """Get the default process groups for MoE.
+
+    Returns:
+        ModelCommProcessGroups: The default process groups for MoE.
+    """
+    model_comm_pgs = ModelCommProcessGroups()
+    model_comm_pgs.ep = parallel_state.get_expert_model_parallel_group()
+    model_comm_pgs.tp = parallel_state.get_tensor_model_parallel_group()
+    model_comm_pgs.cp = parallel_state.get_context_parallel_group()
+    model_comm_pgs.expt_tp = parallel_state.get_expert_tensor_parallel_group()
+    model_comm_pgs.expt_dp = parallel_state.get_expert_data_parallel_group()
+    model_comm_pgs.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
+    model_comm_pgs.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
+    return model_comm_pgs
