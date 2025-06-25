@@ -9,6 +9,7 @@ from megatron.core import parallel_state
 from megatron.core.export.data_type import DataType
 from megatron.core.export.trtllm.trtllm_layers import NON_TRANSFORMER_LAYERS_NAMES, TRTLLMLayers
 from megatron.core.export.trtllm.trtllm_layers import get_layer_name_without_prefix as suffix
+from megatron.core.export.trtllm.trtllm_weights_converter.utils import is_gated_activation
 from megatron.core.tensor_parallel.utils import VocabUtility
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -66,7 +67,7 @@ class DistributedTRTLLMModelWeightsConverter:
         self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
         self.pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         self.tp_group = parallel_state.get_tensor_model_parallel_group()
-        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+        vp_size = self.transformer_config.virtual_pipeline_model_parallel_size
 
         assert (
             vp_size is None or vp_size == 1
@@ -108,9 +109,9 @@ class DistributedTRTLLMModelWeightsConverter:
             or layer_name.endswith(suffix(TRTLLMLayers.post_layernorm_weight))
             or layer_name.endswith(suffix(TRTLLMLayers.post_layernorm_bias))
             or layer_name.endswith(suffix(TRTLLMLayers.attention_dense_bias))
-            or layer_name.endswith(suffix(TRTLLMLayers.attention_dense_bias))
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_bias))
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_router_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.ffn_projection_weight))
             or layer_name.endswith(suffix(TRTLLMLayers.attention_dense_weight))
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_weight))
         ):
@@ -124,22 +125,23 @@ class DistributedTRTLLMModelWeightsConverter:
 
             self._add_to_trtllm_model_weights(val=val, layer_name=layer_name)
 
-        elif layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_weight)) or layer_name.endswith(
-            suffix(TRTLLMLayers.mlp_fc_bias)
+        elif (
+            layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_bias))
+            or layer_name.endswith(suffix(TRTLLMLayers.ffn_fc_weight))
         ):
-
-            split_gated_activation = self.activation in [
-                "swiglu",
-                "geglu",
-                "fast-swiglu",
-                "fast-geglu",
-            ]
+            split_gated_activation = is_gated_activation(self)
             if split_gated_activation:
                 vals, gates = [[n] for n in torch.chunk(val, 2, axis=-1)]
                 gate_layer_name = layer_name.replace("fc", "gate")
                 self._add_to_trtllm_model_weights(val=gates[0], layer_name=gate_layer_name)
                 val = vals[0]
 
+            self._add_to_trtllm_model_weights(val=val, layer_name=layer_name)
+
+        elif layer_name.endswith(suffix(TRTLLMLayers.ffn_linear_weight)) or layer_name.endswith(
+            suffix(TRTLLMLayers.attention_linear_weight)
+        ):
             self._add_to_trtllm_model_weights(val=val, layer_name=layer_name)
 
         elif layer_name.endswith(suffix(TRTLLMLayers.attention_qkv_bias)):
