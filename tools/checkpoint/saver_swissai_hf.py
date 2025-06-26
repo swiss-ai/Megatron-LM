@@ -103,7 +103,7 @@ def save_checkpoint(queue: mp.Queue, args):
         raise ValueError("wrong model_type in metadata. must be GPT")
     if md.checkpoint_args.position_embedding_type != "rope":
         raise ValueError("LLama model must use RoPE")
-    if md.checkpoint_args.use_rope_scaling:
+    if not md.checkpoint_args.use_rope_scaling:
         raise ValueError("LLama model must use llama3 RoPE scaling")
     if md.checkpoint_args.normalization != "RMSNorm":
         raise ValueError("LLama model must not use mlp bias")
@@ -166,9 +166,9 @@ def save_checkpoint(queue: mp.Queue, args):
             rope_theta=md.checkpoint_args.rotary_base,
             rope_scaling={"type": "llama3",
                          "factor": md.checkpoint_args.rope_scaling_factor,   # = 8
-                         "original_max_position_embeddings": 8000,  # md.checkpoint_args.max_position_embeddings (set manually to avoid 4k being used)
+                         "original_max_position_embeddings": 8192,  # set manually because: md.checkpoint_args.max_position_embeddings = 4k
                          "high_freq_factor": 4.0,                   # set manually as it isn't stored in megatron checkpoint.
-                         "low_freq_factor": 1.0},                   # set manually as it isn't stored in megatron checkpoint.
+                         "low_freq_factor": 1.0} if md.checkpoint_args.use_rope_scaling else None,
             attention_bias=md.checkpoint_args.add_qkv_bias,
             mlp_bias=md.checkpoint_args.add_bias_linear,
             torch_dtype=torch_dtype,
