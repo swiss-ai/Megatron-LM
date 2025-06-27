@@ -72,6 +72,7 @@ def _load_checkpoint(queue, args):
                 '--mock-data', # To pass the "blend data checks" in arguments.py
                 '--load', args.load_dir,
                 '--position-embedding-type', args.position_embedding_type,
+                '--use-rope-scaling', # Only for Apertus models
                 '--exit-on-missing-checkpoint',
                 '--no-one-logger',
                 '--use-mp-args-from-checkpoint-args',

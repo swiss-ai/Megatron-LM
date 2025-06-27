@@ -8,6 +8,8 @@
 MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
 CKPT_PATH=/iopsstor/scratch/cscs/schlag/experiments/merge-for-v2/Megatron-LM/logs/Meg-Runs/apertus2_baselines/apertus2-1b-21n-4096sl-504gbsz-ademamix-wsd-xielu-crossDocAttn-goldfish-beta2-qkNorm-untie/checkpoints
 
+export PYTHONPATH=$MEGATRON_LM_DIR:$PYTHONPATH
+
 # [torch_dist -> torch] dependencies
 CKPT_IS_TORCH_DIST=true
 TORCH_DIST_SCRIPT=$MEGATRON_LM_DIR/scripts/conversion/torchdist_2_torch.py
@@ -42,4 +44,5 @@ python $MEGATRON_LM_DIR/tools/checkpoint/convert.py \
     --saver $SAVER \
     --load-dir $LOAD_DIR \
     --save-dir $SAVE_DIR \
+    --test-logits \
     #\ --hf-tokenizer .....
