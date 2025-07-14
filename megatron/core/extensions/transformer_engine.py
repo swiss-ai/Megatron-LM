@@ -6,12 +6,14 @@ import os
 import pickle
 import warnings
 from typing import Callable, Optional, Iterable
+from contextlib import contextmanager
 
 import torch
 import transformer_engine as te
 from packaging.version import Version as PkgVersion
 from torch import Tensor
 from torch.nn.parameter import Parameter
+from fast_hadamard_transform import hadamard_transform
 
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.model_parallel_config import ModelParallelConfig
@@ -41,6 +43,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.utils import get_te_version, is_te_min_version
+from megatron.core.extensions.qat import QUANTIZE_AUTOGRAD_FNS
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
@@ -295,6 +298,10 @@ class TELinear(te.pytorch.Linear):
             **extra_kwargs,
         )
 
+        self.forward_hadamard_matrix = hadamard_transform(torch.eye(32, device=torch.cuda.current_device(), dtype=config.params_dtype))
+        self.w_quant_fn = QUANTIZE_AUTOGRAD_FNS[config.w_quant]
+        self.a_quant_fn = QUANTIZE_AUTOGRAD_FNS[config.a_quant]
+
         for param in self.parameters():
             if is_expert:
                 # Reduce the gradient on the expert_data_parallel group for expert linear layers
@@ -321,6 +328,27 @@ class TELinear(te.pytorch.Linear):
         if self.te_return_bias:
             return out
         return out, None
+
+    @contextmanager
+    def prepare_forward(
+        self,
+        inp: torch.Tensor,
+        num_gemms: int = 1,
+        allow_non_contiguous: bool = False,
+    ):
+        if self.fp8:
+            raise ValueError("FP8 is incompatible with QAT")
+        
+        with super().prepare_forward(inp, num_gemms, allow_non_contiguous) as inp:
+            quantized_inp = self.a_quant_fn.apply(inp, self.forward_hadamard_matrix)
+            yield quantized_inp
+
+    def _get_weight_tensors(self):
+        if self.fp8:
+            raise ValueError("FP8 is incompatible with QAT")
+        
+        unfused_weights = [self.w_quant_fn.apply(getattr(self, name), self.forward_hadamard_matrix) for name in self.weight_names]
+        return unfused_weights
 
 
 class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
