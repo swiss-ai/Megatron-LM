@@ -75,6 +75,7 @@ def _load_checkpoint(queue, args):
                 '--exit-on-missing-checkpoint',
                 '--no-one-logger',
                 '--use-mp-args-from-checkpoint-args',
+                '--use-rope-scaling',
                 ]
 
     margs = parse_args()
