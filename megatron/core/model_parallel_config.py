@@ -333,6 +333,15 @@ class ModelParallelConfig:
        the user adds a level 1 timer that is not called by all ranks.
     """
 
+    ###################
+    # QAT
+    ###################
+    w_quant: str = "none"
+    """Quantization function for weights."""
+    
+    a_quant: str = "none"
+    """Quantization function for activations."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more

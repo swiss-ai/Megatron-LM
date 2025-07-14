@@ -23,6 +23,7 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import is_torch_min_version
 from megatron.training.activations import squared_relu, XIELU, XIPReLU, XIPReLUP
 from megatron.training.utils import update_use_dist_ckpt
+from megatron.core.extensions.qat import QUANTIZE_AUTOGRAD_FNS
 
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
@@ -845,6 +846,9 @@ def validate_args(args, defaults={}):
     if args.goldfish_loss:
         assert args.goldfish_k > 0, f"goldfish_k (frequency) must be a positive integer. ({args.goldfish_k})"
         assert args.goldfish_h > 0, f"goldfish_h (context width) must be a positive integer. ({args.goldfish_h})"
+
+    assert args.w_quant in QUANTIZE_AUTOGRAD_FNS, f"Invalid weight quantization function: {args.w_quant}. Available functions: {list(QUANTIZE_AUTOGRAD_FNS.keys())}"
+    assert args.a_quant in QUANTIZE_AUTOGRAD_FNS, f"Invalid activation quantization function: {args.a_quant}. Available functions: {list(QUANTIZE_AUTOGRAD_FNS.keys())}"
     
     # Print arguments.
     _print_args("arguments", args)
@@ -2381,4 +2385,8 @@ def _add_experimental_args(parser):
                        help='Dtype of exp_avg when enabling precision-aware-optimizer')
     group.add_argument('--exp-avg-sq-dtype', default='fp32', choices=['fp32', 'fp16', 'fp8'],
                        help='Dtype of exp_avg_sq when enabling precision-aware-optimizer')
+    group.add_argument('--w-quant', default='none', choices=list(QUANTIZE_AUTOGRAD_FNS.keys()),
+                       help='Quantization function for weights')
+    group.add_argument('--a-quant', default='none', choices=list(QUANTIZE_AUTOGRAD_FNS.keys()),
+                       help='Quantization function for activations')
     return parser

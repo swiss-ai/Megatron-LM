@@ -60,6 +60,9 @@ def get_blend_from_list(
     if blend is None:
         return None
 
+    if len(blend) == 0:
+        raise ValueError("Blend list is empty")
+
     if len(blend) % 2 == 1:
         weight_per_dataset = None
         raw_prefix_per_dataset = blend
