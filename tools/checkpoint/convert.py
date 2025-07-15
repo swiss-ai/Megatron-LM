@@ -130,7 +130,7 @@ def main():
     parser.add_argument('--test-logits', action='store_true',
                         help=('If enabled, the loader will send a final "logits_check" to the loader, '
                               'so the loader can verify the forward function of the converted model '
-                              'is equivalent. Only supported with --loader=core and --saver=swissai_hf'))
+                              'is equivalent. Only supported with --loader=core and --saver=apertus_hf'))
 
     known_args, _ = parser.parse_known_args()
 
@@ -159,7 +159,7 @@ def main():
         # See https://github.com/pytorch/pytorch/issues/40403.
         mp.set_start_method("spawn")
         assert args.loader == "core", "Only the core loader implements test_logits"
-        assert args.saver == "swissai_hf", "Only the swissai_hf saver implements test_logits"
+        assert args.saver == "apertus_hf", "Only the apertus_hf saver implements test_logits"
     queue = mp.Queue(maxsize=args.max_queue_size)
 
     # Start saver process.
