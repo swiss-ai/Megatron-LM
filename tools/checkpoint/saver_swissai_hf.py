@@ -1,3 +1,5 @@
+"""HF saver for Apertus and Llama models."""
+
 import sys
 import os
 import gc
@@ -103,8 +105,6 @@ def save_checkpoint(queue: mp.Queue, args):
         raise ValueError("wrong model_type in metadata. must be GPT")
     if md.checkpoint_args.position_embedding_type != "rope":
         raise ValueError("LLama model must use RoPE")
-    if not md.checkpoint_args.use_rope_scaling:
-        raise ValueError("LLama model must use llama3 RoPE scaling")
     if md.checkpoint_args.normalization != "RMSNorm":
         raise ValueError("LLama model must not use mlp bias")
     if md.checkpoint_args.add_bias_linear:
