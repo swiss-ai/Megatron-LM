@@ -298,7 +298,7 @@ class TELinear(te.pytorch.Linear):
             **extra_kwargs,
         )
 
-        self.forward_hadamard_matrix = hadamard_transform(torch.eye(32, device=torch.cuda.current_device(), dtype=config.params_dtype))
+        self.forward_hadamard_matrix = hadamard_transform(torch.eye(32, device=torch.cuda.current_device(), dtype=config.params_dtype), scale=32**-0.5)
         self.w_quant_fn = QUANTIZE_AUTOGRAD_FNS[config.w_quant]
         self.a_quant_fn = QUANTIZE_AUTOGRAD_FNS[config.a_quant]
 
