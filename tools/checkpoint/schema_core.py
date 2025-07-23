@@ -85,8 +85,8 @@ class CoreTESchema(CoreSchema):
         super().__init__(model_type, layer_schema={
 
             # Self attention.
-            "self_attn_norm_weight" : "self_attention.linear_qkv.layer_norm_weight",
-            "self_attn_norm_bias" : "self_attention.linear_qkv.layer_norm_bias",
+            "self_attn_norm_weight" : "input_layernorm.weight",
+            "self_attn_norm_bias" : "input_layernorm.bias",
             "self_attn_qkv_weight" : "self_attention.linear_qkv.weight",
             "self_attn_qkv_bias" : "self_attention.linear_qkv.bias",
 
@@ -98,8 +98,8 @@ class CoreTESchema(CoreSchema):
             "self_attn_k_layernorm_bias" : "self_attention.k_layernorm.bias",
 
             # MLP.
-            "mlp_norm_weight" : "mlp.linear_fc1.layer_norm_weight",
-            "mlp_norm_bias" : "mlp.linear_fc1.layer_norm_bias",
+            "mlp_norm_weight" : "pre_mlp_layernorm.weight",
+            "mlp_norm_bias" : "pre_mlp_layernorm.bias",
             "mlp_fc1_weight" : "mlp.linear_fc1.weight",
             "mlp_fc1_bias" : "mlp.linear_fc1.bias",
             "mlp_fc2_weight" : "mlp.linear_fc2.weight",

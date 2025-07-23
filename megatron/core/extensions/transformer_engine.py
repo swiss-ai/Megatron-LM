@@ -5,7 +5,7 @@ import io
 import os
 import pickle
 import warnings
-from typing import Callable, Optional, Iterable
+from typing import Callable, Optional, Iterable, Union, Tuple
 from contextlib import contextmanager
 
 import torch
@@ -319,7 +319,7 @@ class TELinear(te.pytorch.Linear):
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
-        out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        out = self.copied_forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
@@ -341,14 +341,116 @@ class TELinear(te.pytorch.Linear):
         
         with super().prepare_forward(inp, num_gemms, allow_non_contiguous) as inp:
             quantized_inp = self.a_quant_fn.apply(inp, self.forward_hadamard_matrix)
+            # print(f"inps: shape={inp.shape} mean,std={inp.mean().item():.4f},{inp.std().item():.4f} inp[0,0]={inp[0][0]} quantized_inp[0,0]={quantized_inp[0][0]}\n")
             yield quantized_inp
 
-    def _get_weight_tensors(self):
-        if self.fp8:
-            raise ValueError("FP8 is incompatible with QAT")
-        
-        unfused_weights = [self.w_quant_fn.apply(getattr(self, name), self.forward_hadamard_matrix) for name in self.weight_names]
-        return unfused_weights
+    @te.pytorch.jit.no_torch_dynamo()
+    def copied_forward(
+        self,
+        inp: torch.Tensor,
+        is_first_microbatch: Optional[bool] = None,
+        fp8_output: Optional[bool] = False,
+        fp8_grad: Optional[bool] = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        """
+        copied from https://github.com/NVIDIA/TransformerEngine/blob/v2.2/transformer_engine/pytorch/module/linear.py
+        added w_quant_fn
+        """
+        if te.pytorch.fp8.FP8GlobalStateManager.fp8_graph_capturing():
+            skip_fp8_weight_update = te.pytorch.fp8.FP8GlobalStateManager.get_skip_fp8_weight_update_tensor()
+        else:
+            skip_fp8_weight_update = None
+        if skip_fp8_weight_update is not None:
+            is_first_microbatch = False
+
+        if self.ub_overlap_rs_fprop:
+            if te.pytorch.module.base.get_ub(self.ub_name + "_fprop").is_fp8_ubuf():
+                fp8_output = True
+        if self.ub_overlap_rs_dgrad:
+            if te.pytorch.module.base.get_ub(self.ub_name + "_dgrad").is_fp8_ubuf():
+                fp8_grad = True
+
+        with self.prepare_forward(
+            inp,
+            allow_non_contiguous=isinstance(inp, te.pytorch.tensor.quantized_tensor.QuantizedTensor),
+        ) as inp:
+
+            # Get concatenated weight and bias tensors
+            unfused_weights = [self.w_quant_fn.apply(getattr(self, name), self.forward_hadamard_matrix) for name in self.weight_names]
+            if any(isinstance(w, te.pytorch.tensor.quantized_tensor.QuantizedTensor) for w in unfused_weights):
+                if self.fp8:
+                    if len(unfused_weights) != 1:
+                        raise RuntimeError(
+                            "Splitting QuantizedTensor into multiple params is not supported"
+                        )
+                else:
+                    unfused_weights = [w.dequantize() for w in unfused_weights]
+            weight_tensor = te.pytorch.module._common.noop_cat(unfused_weights)
+            if self.use_bias:
+                bias_tensor = te.pytorch.module._common.noop_cat([getattr(self, name) for name in self.bias_names])
+            else:
+                bias_tensor = None
+
+            (
+                input_quantizer,
+                weight_quantizer,
+                output_quantizer,
+                grad_output_quantizer,
+                grad_input_quantizer,
+            ) = self._get_quantizers(fp8_output, fp8_grad)
+
+            # Make sure weight tensor has correct quantizer
+            # Note: Quantizer might have changed if quantization
+            # recipe changed
+            if weight_quantizer is not None and isinstance(weight_tensor, te.pytorch.tensor.quantized_tensor.QuantizedTensor):
+                weight_tensor._quantizer = weight_quantizer
+
+            if torch.is_grad_enabled():
+                linear_fn = te.pytorch.module.linear._Linear.apply
+                args = []
+            else:
+                linear_fn = te.pytorch.module.linear._Linear.forward
+                args = [None]
+            args += (
+                weight_tensor,
+                inp,
+                bias_tensor if (self.apply_bias and not self.gemm_bias_unfused_add) else None,
+                is_first_microbatch,
+                self.fp8,
+                self.fp8_calibration,
+                input_quantizer,
+                weight_quantizer,
+                output_quantizer,
+                grad_output_quantizer,
+                grad_input_quantizer,
+                self.fuse_wgrad_accumulation,
+                te.pytorch.cpu_offload.is_cpu_offload_enabled(),
+                self.tp_group,
+                self.tp_size,
+                self.sequence_parallel,
+                self.tp_size > 1,
+                self.activation_dtype,
+                self.parallel_mode,
+                torch.is_grad_enabled(),
+                self.ub_overlap_rs_fprop,
+                self.ub_overlap_ag_dgrad,
+                self.ub_overlap_ag_fprop,
+                self.ub_overlap_rs_dgrad,
+                self.ub_bulk_dgrad,
+                self.ub_bulk_wgrad,
+                self.ub_name,
+                fp8_output,
+                self.fsdp_group,
+                self,
+                skip_fp8_weight_update,
+            )
+            out = linear_fn(*args)
+        if self.gemm_bias_unfused_add:
+            out = out + te.pytorch.utils.cast_if_needed(bias_tensor, self.activation_dtype)
+
+        if self.return_bias:
+            return out, te.pytorch.utils.cast_if_needed(bias_tensor, self.activation_dtype)
+        return out
 
 
 class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):

@@ -151,8 +151,8 @@ def get_gpt_layer_with_transformer_engine_spec(
             linear_qkv = TEColumnParallelLinear
             input_layernorm = TENorm
         elif attn_layernorm:  # standard pre-norm case: TELayerNormColumnParallelLinear handles it.
-            linear_qkv = TELayerNormColumnParallelLinear
-            input_layernorm = IdentityOp
+            linear_qkv = TEColumnParallelLinear
+            input_layernorm = TENorm
         else:  # no layernorms at all.
             linear_qkv = TEColumnParallelLinear
             input_layernorm = IdentityOp
@@ -163,7 +163,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         else:
             # even when mlp_layernorm but not post_layer_norm, we have the identity op
             # because mlp.fc1 will fuse the layernorm :)
-            pre_mlp_layernorm = IdentityOp
+            pre_mlp_layernorm = TENorm
 
         return ModuleSpec(
             module=TransformerLayer,
@@ -316,7 +316,7 @@ def get_mlp_module_spec(
 
     if use_te:
         if mlp_layernorm and not post_layer_norm:
-            fc1 = TELayerNormColumnParallelLinear
+            fc1 = TEColumnParallelLinear
         else:
             fc1 = TEColumnParallelLinear
     else:  # No OP arguments can be given without te.

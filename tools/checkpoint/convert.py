@@ -157,7 +157,7 @@ def main():
     if args.test_logits:
         # We need to change start method as loader process will use cuda during verification.
         # See https://github.com/pytorch/pytorch/issues/40403.
-        mp.set_start_method("spawn")
+        mp.set_start_method("spawn", force=True)
         assert args.loader == "core", "Only the core loader implements test_logits"
         assert args.saver == "swissai_hf", "Only the swissai_hf saver implements test_logits"
     queue = mp.Queue(maxsize=args.max_queue_size)
