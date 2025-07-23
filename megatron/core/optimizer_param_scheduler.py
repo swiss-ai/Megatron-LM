@@ -157,6 +157,7 @@ class OptimizerParamScheduler:
         assert decay_ratio <= 1.0
         delta_lr = max_lr - min_lr
 
+        coeff = None
         if self.lr_decay_style == 'linear':
             coeff = 1.0 - decay_ratio
         elif self.lr_decay_style == 'cosine':
@@ -178,6 +179,7 @@ class OptimizerParamScheduler:
                     coeff = 1.0 - math.sqrt(wsd_decay_ratio)
         else:
             raise Exception(f'{self.lr_decay_style} decay style is not supported.')
+        assert coeff is not None
 
         return min_lr + coeff * delta_lr
 

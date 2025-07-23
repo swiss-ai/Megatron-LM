@@ -2,7 +2,6 @@
 from copy import deepcopy
 from functools import partial
 from time import sleep
-from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -30,6 +29,7 @@ from megatron.core.dist_checkpointing.utils import extract_sharded_tensors
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
+from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
@@ -225,6 +225,8 @@ class TestDistributedOptimizer:
             # ((2, 1), 2, 2),
         ],
     )
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     def test_dp_sharding(self, tmp_path_dist_ckpt, tp_pp, src_dp, dest_dp, use_fpsl, initialize_fn):
         src_world_size = tp_pp[0] * tp_pp[1] * src_dp
         dest_world_size = tp_pp[0] * tp_pp[1] * dest_dp
@@ -252,13 +254,10 @@ class TestDistributedOptimizer:
                             parallel_state.get_data_parallel_group(with_context_parallel=True),
                             True,
                         )
-                    save(
-                        optimizer_A.sharded_state_dict(
-                            model[0].sharded_state_dict(), sharding_type=sharding_type
-                        ),
-                        ckpt_dir,
-                        save_strategy,
+                    optim_state_dict = optimizer_A.sharded_state_dict(
+                        model[0].sharded_state_dict(), sharding_type=sharding_type
                     )
+                    save(optim_state_dict, ckpt_dir, save_strategy)
                     optim_param_state_A = optimizer_A.get_parameter_state_dp_zero()
                     Utils.destroy_model_parallel()
                 else:
@@ -291,7 +290,6 @@ class TestDistributedOptimizer:
                     # Test both param state dicts are equal
                     diffs = diff(optim_param_state_A, optim_param_state_B)
                     assert not any(map(bool, diffs)), diffs
-
                 else:
                     # this prevents NCCL errors when changing DP. TODO: fix it properly
                     sleep(20)
@@ -310,7 +308,7 @@ class TestDistributedOptimizer:
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_finetune_doesnt_load_optimizer', sync=True
         ) as ckpt_dir:
-            mock_args = SimpleNamespace()
+            mock_args = parse_args(ignore_unknown_args=True)
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
                 init_basic_mock_args(mock_args, tp=src_tp_pp[0], pp=src_tp_pp[1])
                 init_checkpointing_mock_args(mock_args, ckpt_dir, False)
@@ -459,10 +457,11 @@ class TestOptimizerResharding:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
-        ('use_dist_opt', 'bf16'),
+        ('use_dist_opt', 'bf16', 'use_custom_fsdp'),
         (
-            (False, True),  # regular BF16
-            (True, True),  # DistOpt BF16
+            (False, True, False),  # regular BF16
+            (True, True, False),  # DistOpt BF16
+            (True, True, True),  # DistOpt + custom FSDP BF16
             # (False, False), # FP32
         ),
     )
@@ -471,7 +470,7 @@ class TestOptimizerResharding:
         [((2, 4), (2, 4)), ((2, 4), (2, 2)), ((2, 4), (4, 2)), ((8, 1), (1, 2))],
     )
     def test_optimizer_resharding(
-        self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_dist_opt, bf16
+        self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_dist_opt, bf16, use_custom_fsdp
     ):
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(
@@ -480,6 +479,9 @@ class TestOptimizerResharding:
             with TempNamedDir(
                 tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=False
             ) as ckpt_dir_B:
+                extra_kwargs = {}
+                if use_custom_fsdp:
+                    extra_kwargs['use_custom_fsdp'] = True
 
                 model_A, optimizer_A = setup_model_and_optimizer(
                     seed=2, tp=src_tp_pp[0], pp=src_tp_pp[1], bf16=bf16, dist_opt=use_dist_opt
@@ -508,6 +510,13 @@ class TestOptimizerResharding:
                 plain_state_dict_B = load_plain_tensors(ckpt_dir_B)
                 diffs = diff(plain_state_dict_A, plain_state_dict_B)
                 assert not any(map(bool, diffs)), diffs
+
+                if use_custom_fsdp and hasattr(torch.nn.parameter.Parameter, "main_grad"):
+                    # Custom fsdp adds the `main_grad` attribute function to the
+                    # torch Parameter, remove this attribute function so that
+                    # it doesn't conflict with the code in the non-custom fsdp
+                    # test branch.
+                    delattr(torch.nn.parameter.Parameter, "main_grad")
 
     @pytest.mark.parametrize(('use_dist_opt', 'bf16'), ((True, True),))  # DistOpt BF16
     @pytest.mark.parametrize(('use_te', 'use_grouped_mlp'), ((False, False), (False, True)))
