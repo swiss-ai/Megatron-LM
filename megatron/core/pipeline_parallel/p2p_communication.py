@@ -4,7 +4,6 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 
-from megatron import core
 from megatron.core import ModelParallelConfig
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
@@ -13,6 +12,7 @@ from megatron.core.parallel_state import (
     get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
 )
+from megatron.core.utils import nvtx_decorator
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -166,11 +166,17 @@ def _p2p_ops(
 ):
     reqs = {}
     even_send_odd_recv_group = group
-    if get_pipeline_model_parallel_world_size() == 2:
+    if (
+        get_pipeline_model_parallel_world_size() == 2
+        and torch.distributed.get_backend(group) != 'ucc'
+    ):
         # Use the global process group for one of the two p2p communications
         # to allow the overlap of the independent communications.
         # Using the global process group is compatible because the pipeline-parallel
         # communications set the source and destination by global rank.
+        # The only exception occurs when using the ‘ucc’ backend.
+        # Because the global communicator always uses the ‘nccl’ backend,
+        # we must ensure the else path is followed for the ‘ucc’ backend.
         even_recv_odd_send_group = torch.distributed.group.WORLD
     else:
         even_recv_odd_send_group = group
@@ -385,7 +391,13 @@ def _communicate(
             req.wait()
         reqs = None
 
-    if config.batch_p2p_comm and config.batch_p2p_sync:
+    if (
+        (config.batch_p2p_comm and config.batch_p2p_sync)
+        # The lists below have a size > 1 only when ETP ≠ DTP,
+        # meaning this synchronization is required when ETP ≠ DTP.
+        or len(tensor_recv_prev_list) > 1
+        or len(tensor_recv_next_list) > 1
+    ):
         # To protect against race condition when using batch_isend_irecv().
         # User should assert that we have a modern enough PyTorch to not need this
         torch.cuda.synchronize()
@@ -401,7 +413,12 @@ def _communicate(
             return x[0]
         if all(xx is None for xx in x):
             return None
-        return torch.stack(x, dim=0).sum(dim=0, dtype=torch.float32).to(x[0].dtype)
+        # When the encoder's TP size differs from the decoder's TP size
+        # (with the constraint `encoder_tp_size <= decoder_tp_size`), each encoder TP rank
+        # may receive multiple gradients from corresponding decoder TP ranks.
+        # For example, if `ETP=1` and `DTP=2`, then encoder rank 0 will receive gradients
+        # from decoder ranks 1 and 2. These received gradients must be averaged.
+        return torch.stack(x, dim=0).mean(dim=0, dtype=torch.float32).to(x[0].dtype)
 
     tensor_recv_prev = _handle_tensor_list(tensor_recv_prev_list)
     tensor_recv_next = _handle_tensor_list(tensor_recv_next_list)
@@ -409,13 +426,15 @@ def _communicate(
     return tensor_recv_prev, tensor_recv_next, reqs
 
 
-def recv_forward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tensor:
+@nvtx_decorator()
+def recv_forward(
+    tensor_shape: Shape, config: ModelParallelConfig, is_first_stage: bool
+) -> torch.Tensor:
     """Receive tensor from previous rank in pipeline (forward receive).
 
     See _communicate for argument details.
     """
-
-    if core.parallel_state.is_pipeline_first_stage():
+    if is_first_stage:
         input_tensor = None
     else:
         if config.timers is not None:
@@ -433,12 +452,15 @@ def recv_forward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tens
     return input_tensor
 
 
-def recv_backward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tensor:
+@nvtx_decorator()
+def recv_backward(
+    tensor_shape: Shape, config: ModelParallelConfig, is_last_stage: bool
+) -> torch.Tensor:
     """Receive tensor from next rank in pipeline (backward receive).
 
     See _communicate for argument details.
     """
-    if core.parallel_state.is_pipeline_last_stage():
+    if is_last_stage:
         output_tensor_grad = None
     else:
         if config.timers is not None:
@@ -456,13 +478,16 @@ def recv_backward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Ten
     return output_tensor_grad
 
 
-def send_forward(output_tensor: torch.Tensor, config: ModelParallelConfig) -> None:
+@nvtx_decorator()
+def send_forward(
+    output_tensor: torch.Tensor, config: ModelParallelConfig, is_last_stage: bool
+) -> None:
     """Send tensor to next rank in pipeline (forward send).
 
     See _communicate for argument details.
     """
 
-    if not core.parallel_state.is_pipeline_last_stage():
+    if not is_last_stage:
         if config.timers is not None:
             config.timers('forward-send', log_level=2).start()
         _communicate(
@@ -477,12 +502,15 @@ def send_forward(output_tensor: torch.Tensor, config: ModelParallelConfig) -> No
             config.timers('forward-send').stop()
 
 
-def send_backward(input_tensor_grad: torch.Tensor, config: ModelParallelConfig) -> None:
+@nvtx_decorator()
+def send_backward(
+    input_tensor_grad: torch.Tensor, config: ModelParallelConfig, is_first_stage: bool
+) -> None:
     """Send tensor to previous rank in pipeline (backward send).
 
     See _communicate for argument details.
     """
-    if not core.parallel_state.is_pipeline_first_stage():
+    if not is_first_stage:
         if config.timers is not None:
             config.timers('backward-send', log_level=2).start()
         _communicate(
@@ -497,14 +525,18 @@ def send_backward(input_tensor_grad: torch.Tensor, config: ModelParallelConfig) 
             config.timers('backward-send').stop()
 
 
+@nvtx_decorator()
 def send_forward_recv_backward(
-    output_tensor: torch.Tensor, tensor_shape: Shape, config: ModelParallelConfig
+    output_tensor: torch.Tensor,
+    tensor_shape: Shape,
+    config: ModelParallelConfig,
+    is_last_stage: bool,
 ) -> torch.Tensor:
     """Batched send and recv with next rank in pipeline.
 
     See _communicate for argument details.
     """
-    if core.parallel_state.is_pipeline_last_stage():
+    if is_last_stage:
         output_tensor_grad = None
     else:
         if config.timers is not None:
@@ -522,14 +554,18 @@ def send_forward_recv_backward(
     return output_tensor_grad
 
 
+@nvtx_decorator()
 def send_backward_recv_forward(
-    input_tensor_grad: torch.Tensor, tensor_shape: Shape, config: ModelParallelConfig
+    input_tensor_grad: torch.Tensor,
+    tensor_shape: Shape,
+    config: ModelParallelConfig,
+    is_first_stage: bool,
 ) -> torch.Tensor:
     """Batched send and recv with previous rank in pipeline.
 
     See _communicate for argument details.
     """
-    if core.parallel_state.is_pipeline_first_stage():
+    if is_first_stage:
         input_tensor = None
     else:
         if config.timers is not None:
@@ -547,6 +583,7 @@ def send_backward_recv_forward(
     return input_tensor
 
 
+@nvtx_decorator()
 def send_forward_recv_forward(
     output_tensor: torch.Tensor,
     recv_prev: bool,
@@ -576,6 +613,7 @@ def send_forward_recv_forward(
     return input_tensor
 
 
+@nvtx_decorator()
 def send_backward_recv_backward(
     input_tensor_grad: torch.Tensor,
     recv_next: bool,
@@ -605,6 +643,7 @@ def send_backward_recv_backward(
     return output_tensor_grad
 
 
+@nvtx_decorator()
 def send_forward_backward_recv_forward_backward(
     output_tensor: torch.Tensor,
     input_tensor_grad: torch.Tensor,

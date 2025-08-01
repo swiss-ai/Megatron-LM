@@ -18,6 +18,14 @@ from ..transformer.transformer_config import TransformerConfig
 from ..utils import get_attr_wrapped_model, get_model_config
 
 
+def _get_main_grad_attr(param: torch.nn.Parameter, use_custom_fsdp: bool = False):
+    if use_custom_fsdp:
+        return "fsdp_managed_main_grad"
+    if hasattr(param, "main_grad"):
+        return "main_grad"
+    return "grad"
+
+
 def _unshard_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
     """
     Unshards the input tensor if it is a DTensor and otherwise returns the
@@ -127,12 +135,21 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
         else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
 
+        ddp_config = model_module.ddp_config
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
-        if model_module.share_embeddings_and_output_weights:
+
+        # If share_embeddings_and_output_weights is True, we need to maintain duplicated
+        # embedding weights in post processing stage. If use Multi-Token Prediction (MTP),
+        # we also need to maintain duplicated embedding weights in mtp process stage.
+        # So we need to allreduce grads of embedding in the embedding group in these cases.
+        if model_module.share_embeddings_and_output_weights or getattr(config, 'mtp_num_layers', 0):
             weight = model_module.shared_embedding_or_output_weight()
-            grad_attr = "main_grad" if hasattr(weight, "main_grad") else "grad"
+            grad_attr = _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
             orig_grad = getattr(weight, grad_attr)
             grad = _unshard_if_dtensor(orig_grad)
+            # When the embedding is frozen, the grad is None.
+            if grad is None:
+                return
             torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
             setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
@@ -153,10 +170,11 @@ def _allreduce_position_embedding_grads(model: List[torch.nn.Module], config: Tr
         else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
 
+        ddp_config = model_module.ddp_config
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
         assert hasattr(model_module, 'position_embeddings')
         weight = model_module.position_embeddings.weight
-        grad_attr = "main_grad" if hasattr(weight, "main_grad") else "grad"
+        grad_attr = _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
         orig_grad = getattr(weight, grad_attr)
         grad = _unshard_if_dtensor(orig_grad)
         torch.distributed.all_reduce(grad, group=parallel_state.get_position_embedding_group())
@@ -184,15 +202,15 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
         params = []
         grads = []
         for model_chunk in model:
+            ddp_config = model_chunk.ddp_config
             for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
-                if (
-                    param.requires_grad
-                    and getattr(param, 'sequence_parallel', False)
+                if param.requires_grad and (
+                    getattr(param, 'sequence_parallel', False)
                     or 'q_layernorm' in name
                     or 'k_layernorm' in name
                 ):
                     params.append(param)
-                    grad_attr = "main_grad" if hasattr(param, "main_grad") else "grad"
+                    grad_attr = _get_main_grad_attr(param, ddp_config.use_custom_fsdp)
                     grad = getattr(param, grad_attr)
                     grad = _unshard_if_dtensor(grad)
                     grads.append(grad.data)
@@ -205,7 +223,7 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
                 params, grads, _unflatten_dense_tensors(coalesced, grads)
             ):
                 buf.copy_(synced)
-                grad_attr = "main_grad" if hasattr(param, "main_grad") else "grad"
+                grad_attr = _get_main_grad_attr(param, ddp_config.use_custom_fsdp)
                 orig_grad = getattr(param, grad_attr)
                 setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
 
@@ -222,6 +240,9 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
             if hasattr(module, 'expert_bias'):
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
                 expert_bias_list.append(module.expert_bias)
+    # For hybrid models with both MoE and Dense layers, this list can be empty.
+    if len(expert_bias_list) == 0:
+        return
     stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
     stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
     stacked_updated_expert_bias = get_updated_expert_bias(
@@ -306,7 +327,9 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
         assert all(x.item() == num_tokens_list[0] for x in num_tokens_list)
 
         # all-reduce across DP ranks.
-        torch.distributed.all_reduce(num_tokens, group=parallel_state.get_data_parallel_group())
+        torch.distributed.all_reduce(
+            num_tokens, group=parallel_state.get_data_parallel_group(with_context_parallel=True)
+        )
         for model_chunk in model:
             if num_tokens > 0:
                 scaling = 1.0 / num_tokens
