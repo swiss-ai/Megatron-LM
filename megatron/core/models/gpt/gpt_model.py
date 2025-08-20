@@ -203,7 +203,8 @@ class GPTModel(LanguageModule):
         position_ids: Tensor,
         attention_mask: Tensor,
         decoder_input: Tensor = None,
-        labels: Tensor = None,
+        teacher_probs: Tensor = None,
+        prob_positions: Tensor = None,
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
@@ -303,12 +304,36 @@ class GPTModel(LanguageModule):
             )
             log_config_to_disk(self.config, payload, prefix='input_and_logits')
 
-        if labels is None:
+        if teacher_probs is None:
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        loss = self.compute_teacher_loss(teacher_probs, prob_positions, logits)
+        
 
+        return loss
+    
+    def compute_teacher_loss(self, teacher_probs: Tensor, prob_positions: Tensor, logits: Tensor) -> Tensor:
+        """Computes the language model loss (Cross entropy across vocabulary)
+
+        Args:
+            teacher_probs (Tensor): The teacher probabilities of dimension [batch size, seq length, topk]
+            prob_positions (Tensor): The positions of the teacher probabilities of dimension [batch size, seq length, topk]
+            logits (Tensor): The final logits returned by the output layer of the transformer model of dimension [batch size, seq length, vocab size]
+
+        Returns:
+            Tensor: Loss tensor of dimensions [batch size, sequence_length]
+        """
+        
+        # Normalize student logits
+        student_logits = torch.nn.functional.log_softmax(logits, dim=-1)  # [batch size, seq length, vocab size]
+        
+        # Select student logits at the teacher positions
+        student_logits = student_logits.gather(dim=-1, index=prob_positions.to(torch.int64))  # [batch size, seq length, topk]
+        
+        # Compute the loss
+        loss = - torch.sum(teacher_probs * student_logits, dim=-1)  # [batch size, seq length]
+        
         return loss
 
     def sharded_state_dict(

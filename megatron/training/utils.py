@@ -508,6 +508,153 @@ def get_batch_on_this_tp_rank(data_iterator):
     return batch
 
 
+TOPK = 256
+TENSORS_DIR = "/capstor/scratch/cscs/asolergi/main_run_70B_megatron/Megatron-LM/logs/Meg-Runs/main-runs-v1/apertus3-70b-512-nodes-1e-5lr/70b-probs-tensors"
+ITERATION_TO_JOBID_PATH = "/iopsstor/scratch/cscs/blacksamorez/Megatron-LM-QAT/iteration_to_jobid.json"
+ITERATION_TO_JOBID = json.load(open(ITERATION_TO_JOBID_PATH))
+
+from torch.distributed.checkpoint.state_dict_loader import _load_state_dict
+from torch.distributed.checkpoint.format_utils import FileSystemReader, _EmptyStateDictLoadPlanner
+
+
+class LogitsLoader:
+    def __init__(self):        
+        self.input_ids_buffer = None
+        self.exp_logits_buffer = None
+        self.index_buffer = None
+        
+        self.cached_seq_counter = -32
+        
+    def get_seq(self, common_seq_counter: int, seqs_to_consume_per_dp: int, dp_rank: int, dp_world_size: int):
+        assert seqs_to_consume_per_dp <= 32
+        assert 32 % seqs_to_consume_per_dp == 0
+        assert 128 % dp_world_size == 0
+        
+        block_start = (common_seq_counter // (128 * 32)) * 128 * 32
+        files_per_rank = 128 // dp_world_size
+        block_section_offset = dp_rank * files_per_rank * 32
+        section_pos = (common_seq_counter % (128 * 32)) // dp_world_size
+        
+        local_seq_counter = block_start + block_section_offset + section_pos
+        
+        device = torch.cuda.current_device()
+        
+        diff = local_seq_counter - self.cached_seq_counter
+        
+        if diff < 0 or diff + seqs_to_consume_per_dp > 32:
+            # Initiate a load of this seq
+            self.load_seqs_from_disk(local_seq_counter)
+            diff = local_seq_counter - self.cached_seq_counter
+            assert 0 <= diff <= 32 - seqs_to_consume_per_dp, (diff, seqs_to_consume_per_dp)
+        
+        input_ids = self.input_ids_buffer[diff:diff + seqs_to_consume_per_dp]
+        exp_logits = self.exp_logits_buffer[:, diff:diff + seqs_to_consume_per_dp]
+        index = self.index_buffer[:, diff:diff + seqs_to_consume_per_dp]
+        
+        return {
+            'input_ids': input_ids.to(device, non_blocking=True),
+            'exp_logits': exp_logits.to(device, non_blocking=True),
+            'index': index.to(device, non_blocking=True),
+            'loss_mask': torch.ones(seqs_to_consume_per_dp, input_ids.shape[1], device=device),
+            'attention_mask': None,
+            'position_ids': torch.arange(input_ids.shape[1], dtype=torch.long, device=device)
+        }
+            
+    def load_seqs_from_disk(self, dp_seq_counter: int):        
+        orig_iter = dp_seq_counter // (128 * 32)
+        orig_iter_seq = dp_seq_counter % (128 * 32)
+        orig_dp = orig_iter_seq // 32
+        
+        orig_jobid = ITERATION_TO_JOBID[str(orig_iter)]
+        
+        file_path = os.path.join(TENSORS_DIR, f"{orig_jobid}-iter-{orig_iter}-dp-{orig_dp}")
+        tensor_sd = {}
+        
+        _load_state_dict(
+            tensor_sd,
+            storage_reader=FileSystemReader(file_path),
+            planner=_EmptyStateDictLoadPlanner(),
+            no_dist=True,
+        )
+        
+        # Get correct sequence
+        self.input_ids_buffer = tensor_sd["labels"].transpose(0, 1).contiguous()
+        
+        self.exp_logits_buffer = tensor_sd["exp_logits"].contiguous()
+
+        self.index_buffer = tensor_sd["index"].contiguous()
+        self.index_buffer[:, :, :TOPK] += 0
+        self.index_buffer[:, :, TOPK:2 * TOPK] += 32768
+        self.index_buffer[:, :, 2*TOPK:3*TOPK] += 32768 * 2
+        self.index_buffer[:, :, 3*TOPK:4*TOPK] += 32768 * 3
+        
+        self.cached_seq_counter = (dp_seq_counter // 32) * 32
+        
+LOGITS_LOADER = None
+
+
+def get_top_logits_batch(current_seq_counter: int, seqs_to_consume_per_dp: int):
+    global LOGITS_LOADER
+    if LOGITS_LOADER is None:
+        LOGITS_LOADER = LogitsLoader()
+        
+    args = get_args()
+
+    def _broadcast(item):
+       if item is not None:
+           torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
+           
+    if mpu.get_tensor_model_parallel_rank() == 0:
+        data_parallel_rank = mpu.get_data_parallel_rank()
+        data_parallel_world_size = mpu.get_data_parallel_world_size()
+        assert 128 % data_parallel_world_size == 0, "128 must be divisible by data parallel world size"
+
+        batch = LOGITS_LOADER.get_seq(current_seq_counter, seqs_to_consume_per_dp, data_parallel_rank, data_parallel_world_size)
+        
+        if args.pipeline_model_parallel_size == 1:
+            _broadcast(batch['input_ids'])
+            _broadcast(batch['exp_logits'])
+            _broadcast(batch['index'])
+            _broadcast(batch['loss_mask'])
+            _broadcast(batch['attention_mask'])
+            _broadcast(batch['position_ids'])
+        else:
+            raise ValueError("Pipeline model parallel size must be 1")
+    else:
+        input_ids = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.int64, device=torch.cuda.current_device())
+        exp_logits = torch.empty((args.micro_batch_size, args.seq_length, args.padded_vocab_size), dtype=torch.float32, device=torch.cuda.current_device())
+        index = torch.empty((args.micro_batch_size, args.seq_length, TOPK), dtype=torch.int64, device=torch.cuda.current_device())
+        loss_mask = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.float32, device=torch.cuda.current_device())
+        if args.create_attention_mask_in_dataloader:
+           attention_mask=torch.empty(
+                (args.micro_batch_size,1,args.seq_length,args.seq_length), dtype = torch.bool , device = torch.cuda.current_device()
+            )
+        else:
+            attention_mask=None
+        position_ids = torch.arange(args.seq_length, dtype=torch.long, device=torch.cuda.current_device())
+        
+        if args.pipeline_model_parallel_size == 1:
+            _broadcast(input_ids)
+            _broadcast(exp_logits)
+            _broadcast(index)
+            _broadcast(loss_mask)
+            _broadcast(attention_mask)
+            _broadcast(position_ids)
+        else:
+            raise ValueError("Pipeline model parallel size must be 1")
+            
+        batch = {
+            'input_ids': input_ids,
+            'exp_logits': exp_logits,
+            'index': index,
+            'loss_mask': loss_mask,
+            'attention_mask': attention_mask,
+            'position_ids': position_ids
+        }
+    
+    return batch
+
+
 def update_use_dist_ckpt(args):
     args.use_dist_ckpt = args.ckpt_format != "torch"
 

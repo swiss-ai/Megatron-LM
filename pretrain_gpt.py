@@ -26,6 +26,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
+    get_top_logits_batch,
     get_blend_and_blend_per_split,
 )
 from megatron.training.arguments import core_transformer_config_from_args
@@ -144,8 +145,10 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
 
     return model
 
+CURRENT_SEQ_COUNTER = 1096333 * 128 * 32
 
 def get_batch(data_iterator):
+    global CURRENT_SEQ_COUNTER
     """Generate a batch."""
 
     # TODO: this is pretty hacky, find a better way
@@ -157,8 +160,13 @@ def get_batch(data_iterator):
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
+    
+    seqs_to_consume_per_dp = batch['tokens'].shape[0]
 
-    return batch.values()
+    batch = get_top_logits_batch(CURRENT_SEQ_COUNTER, seqs_to_consume_per_dp)
+    CURRENT_SEQ_COUNTER += seqs_to_consume_per_dp * mpu.get_data_parallel_world_size()
+
+    return batch
 
 
 # define spiky loss as a variation of 20% or more
@@ -233,15 +241,19 @@ def forward_step(data_iterator, model: GPTModel):
     timers('batch-generator', log_level=2).start()
     global stimer
     with stimer(bdata=True):
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-            data_iterator)
+        batch = get_batch(data_iterator)
     timers('batch-generator').stop()
 
     with stimer:
-        output_tensor = model(tokens, position_ids, attention_mask,
-                              labels=labels)
+        output_tensor = model(
+            input_ids=batch['input_ids'],
+            teacher_probs=batch['exp_logits'],
+            prob_positions=batch['index'],
+            attention_mask=batch['attention_mask'],
+            position_ids=batch['position_ids'],
+        )
 
-    return output_tensor, partial(loss_func, loss_mask)
+    return output_tensor, partial(loss_func, batch['loss_mask'])
 
 
 def is_dataset_built_on_rank():
