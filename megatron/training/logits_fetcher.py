@@ -1,8 +1,14 @@
-# Prefetching LogitsLoader with rank-aware prefetch and deadlock-safe loading.
-# - One worker process per DP rank (recommended).
-# - STRICT cache cap: current file + next N files (default N=3 => 4 total).
-# - "Must-have" loads (on the critical path) bypass the queue and load synchronously.
-# - Prefetch follows the rank’s dithered path across iteration boundaries.
+# Prefetching LogitsLoader with rank-aware prefetch and deadlock-safe loading,
+# optimized for strictly sequential access.
+#
+# Key properties:
+# - Worker-only I/O. The main thread never touches disk.
+# - Blocks only when the CURRENT file is not yet cached (cold start / catch-up).
+# - STRICT cache cap: {current file + next N files along THIS RANK's path}.
+# - Rank-aware prefetch + eviction (handles iteration boundaries cleanly).
+# - Pin CPU tensors on cache admission so H2D copies can be truly async.
+#
+# Spawn one instance per DP rank (recommended).
 
 import os
 import json
@@ -95,15 +101,15 @@ def _prefetch_worker(task_q: mp.Queue, result_q: mp.Queue):
             result_q.put((key, e))
 
 
-# ---------------------- Main class ----------------------
+# ---------------------- Optimized Main class ----------------------
 class LogitsLoader:
     """
-    Prefetching logits loader.
+    Prefetching logits loader optimized for sequential loads:
 
-    - Spawn one per DP rank (recommended): each rank gets its own worker and cache.
-    - STRICT cache cap: keep only current file + next `prefetch_ahead_files` files.
-    - Critical-path loads are synchronous to avoid deadlocks when queues are full.
-    - Prefetch follows the rank’s path (including iter boundary jumps).
+    - Blocks only when the current file is not yet cached.
+    - Worker-only disk I/O; main thread never does synchronous reads.
+    - Rank-aware prefetch + eviction (handles iteration boundaries).
+    - CPU tensors are pinned upon cache admission for async H2D.
     """
 
     def __init__(self, prefetch_ahead_files: int = 3, start_method: str = "spawn"):
@@ -142,6 +148,11 @@ class LogitsLoader:
         # Anchor file (current) for eviction policy
         self._anchor_file_start_seq: Optional[int] = None
 
+        # Sticky runtime info (filled on first get_seq)
+        self._last_dp_rank: Optional[int] = None
+        self._last_dp_world_size: Optional[int] = None
+        self._device: Optional[torch.device] = None
+
     # -------------------- Public API --------------------
     def get_seq(
         self,
@@ -155,6 +166,14 @@ class LogitsLoader:
         assert SEQS_PER_FILE % seqs_to_consume_per_dp == 0
         assert FILES_PER_ITER % dp_world_size == 0
 
+        # Sticky runtime info
+        if self._last_dp_rank is None:
+            self._last_dp_rank = dp_rank
+        if self._last_dp_world_size is None:
+            self._last_dp_world_size = dp_world_size
+        if self._device is None:
+            self._device = torch.device('cuda', torch.cuda.current_device())
+
         # Compute this rank's absolute local sequence position
         block_start = (common_seq_counter // SEQS_PER_ITER) * SEQS_PER_ITER
         files_per_rank = FILES_PER_ITER // dp_world_size
@@ -162,19 +181,18 @@ class LogitsLoader:
         section_pos = (common_seq_counter % SEQS_PER_ITER) // dp_world_size
         local_seq_counter = block_start + block_section_offset + section_pos
 
-        device = torch.cuda.current_device()
-
         # Ensure the file containing local_seq_counter is ready
         file_start_seq = (local_seq_counter // SEQS_PER_FILE) * SEQS_PER_FILE
-        self._ensure_file_ready(file_start_seq)
+        self._ensure_file_ready_async_then_wait(file_start_seq)  # worker-only I/O + wait only for current
         self._activate_file(file_start_seq)
 
         # Slice within file
         diff = local_seq_counter - self.cached_seq_counter
         if diff < 0 or diff + seqs_to_consume_per_dp > SEQS_PER_FILE:
             # Unexpected jump (e.g., caller advanced across file boundary). Mount correct file.
-            self._ensure_file_ready((local_seq_counter // SEQS_PER_FILE) * SEQS_PER_FILE)
-            self._activate_file((local_seq_counter // SEQS_PER_FILE) * SEQS_PER_FILE)
+            file_start_seq = (local_seq_counter // SEQS_PER_FILE) * SEQS_PER_FILE
+            self._ensure_file_ready_async_then_wait(file_start_seq)
+            self._activate_file(file_start_seq)
             diff = local_seq_counter - self.cached_seq_counter
             assert 0 <= diff <= SEQS_PER_FILE - seqs_to_consume_per_dp, (diff, seqs_to_consume_per_dp)
 
@@ -184,7 +202,9 @@ class LogitsLoader:
 
         # Rank-aware prefetch for the next N files (jump correctly across iter boundaries)
         for k in range(1, self.prefetch_ahead + 1):
-            future_seq = self._kth_future_file_start_seq(file_start_seq, k, dp_rank, dp_world_size)
+            future_seq = self._kth_future_file_start_seq(
+                file_start_seq, k, dp_rank, dp_world_size
+            )
             self._maybe_enqueue_file(future_seq)
 
         # Opportunistically drain completed loads & enforce strict eviction
@@ -192,12 +212,12 @@ class LogitsLoader:
         self._evict_strict()
 
         return {
-            'input_ids': input_ids.to(device, non_blocking=True),
-            'exp_logits': exp_logits.to(device, non_blocking=True),
-            'index': index.to(device, non_blocking=True),
-            'loss_mask': torch.ones(seqs_to_consume_per_dp, input_ids.shape[1], device=device),
+            'input_ids': input_ids.to(self._device, non_blocking=True),
+            'exp_logits': exp_logits.to(self._device, non_blocking=True),
+            'index': index.to(self._device, non_blocking=True),
+            'loss_mask': torch.ones(seqs_to_consume_per_dp, input_ids.shape[1], device=self._device),
             'attention_mask': None,
-            'position_ids': torch.arange(input_ids.shape[1], dtype=torch.long, device=device),
+            'position_ids': torch.arange(input_ids.shape[1], dtype=torch.long, device=self._device),
         }
 
     def close(self):
@@ -218,8 +238,8 @@ class LogitsLoader:
         key = _file_key_from_dp_seq(file_start_seq)
         slot = self._cache.get(key)
         if slot is None:
-            # Block until present (should be rare because _ensure_file_ready was called)
-            self._ensure_file_ready(file_start_seq)
+            # Should be rare (only if prefetch fell behind): wait for it now.
+            self._wait_for_key(key)
             slot = self._cache[key]
 
         self.input_ids_buffer = slot["input_ids"]
@@ -228,63 +248,69 @@ class LogitsLoader:
         self.cached_seq_counter = file_start_seq
         self._anchor_file_start_seq = file_start_seq
 
-    def _ensure_file_ready(self, file_start_seq: int) -> None:
+    def _ensure_file_ready_async_then_wait(self, file_start_seq: int) -> None:
         """
-        Ensure file is in local cache; prefer synchronous direct load to avoid
-        waiting behind a prefetch backlog. If direct load fails, enqueue (guaranteed)
-        and wait for the worker to deliver.
+        Ensure 'file' is (or will be) in cache using the worker only.
+        Enqueue the current file (guaranteed), best-effort prefetch futures,
+        then wait for the current file if still missing.
         """
         key = _file_key_from_dp_seq(file_start_seq)
         if key in self._cache:
             return
 
-        # 1) DIRECT (synchronous) load to bypass any queue congestion
-        try:
-            payload = _load_one_file(*key)
-            self._cache[key] = payload
-            self._pending.discard(key)
-            return
-        except Exception:
-            # If direct load fails (e.g., transient I/O), fall back to worker path.
-            pass
-
-        # 2) Worker path: guarantee enqueue even if queues are full
+        # 1) Guarantee the current file is enqueued (may block on put if queue is full)
         self._enqueue_key_blocking(key)
 
-        # 3) Wait until requested key arrives; admit other arrivals meanwhile
-        while True:
+        # 2) Immediately schedule next files along the rank path (best effort)
+        if self._last_dp_rank is not None and self._last_dp_world_size is not None:
+            for k in range(1, self.prefetch_ahead + 1):
+                future_seq = self._kth_future_file_start_seq(
+                    file_start_seq, k, self._last_dp_rank, self._last_dp_world_size
+                )
+                self._maybe_enqueue_file(future_seq)
+
+        # 3) Drain any completed loads and then wait for current if still missing
+        self._drain_results(non_blocking=True)
+        if key not in self._cache:
+            self._wait_for_key(key)  # blocks only for the current file
+
+    def _wait_for_key(self, key: Tuple[int, int]) -> None:
+        """Block until 'key' arrives; admit other arrivals into cache while waiting."""
+        while key not in self._cache:
             k, payload = self._result_q.get()  # blocking
             if isinstance(payload, Exception):
                 self._pending.discard(k)
                 if k == key:
                     raise payload
                 continue
+            # Pin tensors upon admission so H2D .to(..., non_blocking=True) is effective
+            for v in payload.values():
+                if isinstance(v, torch.Tensor):
+                    try:
+                        v.pin_memory()
+                    except Exception:
+                        pass
             self._cache[k] = payload
             self._pending.discard(k)
-            if k == key:
-                break
 
     def _enqueue_key_blocking(self, key: Tuple[int, int]) -> None:
         """Guarantee that 'key' enters the worker queue (drain if needed, then block)."""
         if key in self._cache or key in self._pending:
             return
-        # Fast path
         try:
             self._task_q.put_nowait(key)
             self._pending.add(key)
             return
         except Exception:
-            # Drain completed items to free queue space
             self._drain_results(non_blocking=True)
-        # Blocking put to guarantee the must-have key is enqueued
-        self._task_q.put(key)
+        self._task_q.put(key)  # may block only on queue backpressure
         self._pending.add(key)
 
     def _maybe_enqueue_file(self, file_start_seq: int) -> None:
         self._maybe_enqueue_key(_file_key_from_dp_seq(file_start_seq))
 
     def _maybe_enqueue_key(self, key: Tuple[int, int]) -> None:
-        """Best-effort enqueue; if full, drain and try once, otherwise skip (not critical)."""
+        """Best-effort enqueue; if full, drain and try once, otherwise skip (prefetch only)."""
         if key in self._cache or key in self._pending:
             return
         try:
@@ -296,7 +322,7 @@ class LogitsLoader:
                 self._task_q.put_nowait(key)
                 self._pending.add(key)
             except Exception:
-                # Not critical; _ensure_file_ready will load synchronously if/when needed
+                # Not critical; current path will block only when/if we reach it.
                 pass
 
     def _drain_results(self, non_blocking: bool = True) -> None:
@@ -310,6 +336,13 @@ class LogitsLoader:
             if isinstance(payload, Exception):
                 self._pending.discard(k)
                 continue
+            # Pin tensors upon admission for async H2D later
+            for v in payload.values():
+                if isinstance(v, torch.Tensor):
+                    try:
+                        v.pin_memory()
+                    except Exception:
+                        pass
             self._cache[k] = payload
             self._pending.discard(k)
 
@@ -333,9 +366,19 @@ class LogitsLoader:
         return target_iter * SEQS_PER_ITER + target_dp * SEQS_PER_FILE
 
     def _expected_keys_around(self, file_start_seq: int) -> Set[Tuple[int, int]]:
-        """Keys we want to keep: current + next prefetch_ahead files."""
+        """Keep current + next prefetch_ahead files ALONG THIS RANK'S PATH (rank-aware)."""
+        if self._last_dp_rank is None or self._last_dp_world_size is None:
+            # Fallback to old behavior only during very first call bootstrap.
+            return {
+                _file_key_from_dp_seq(file_start_seq + i * SEQS_PER_FILE)
+                for i in range(0, self.prefetch_ahead + 1)
+            }
         return {
-            _file_key_from_dp_seq(file_start_seq + i * SEQS_PER_FILE)
+            _file_key_from_dp_seq(
+                self._kth_future_file_start_seq(
+                    file_start_seq, i, self._last_dp_rank, self._last_dp_world_size
+                )
+            )
             for i in range(0, self.prefetch_ahead + 1)
         }
 
