@@ -31,6 +31,7 @@ SEQS_PER_FILE = 32          # 32 sequences per dp file
 FILES_PER_ITER = 128        # 128 dp files per iteration
 SEQS_PER_ITER = SEQS_PER_FILE * FILES_PER_ITER  # 4096 sequences per iteration
 
+CONSUMED_IDS = set()
 
 # ---------------------- Helpers (importable at module top) ----------------------
 def _file_key_from_dp_seq(dp_seq_counter: int) -> Tuple[int, int]:
@@ -78,28 +79,23 @@ def _load_one_file(orig_iter: int, orig_dp: int) -> Dict[str, torch.Tensor]:
     }
 
 
-def _prefetch_worker(task_q: mp.Queue, result_q: mp.Queue):
-    """
-    Worker process:
-      - Receives (orig_iter, orig_dp) keys.
-      - Loads CPU tensors and sends (key, payload) back.
-      - Sends (key, Exception) on failure.
-    """
-    seen: Set[Tuple[int, int]] = set()
-    while True:
-        msg = task_q.get()
-        if msg is None:  # sentinel
-            break
-        key = tuple(msg)
-        if key in seen:
-            continue
-        seen.add(key)
+def _prefetch_worker(task_q: mp.Queue, result_q: mp.Queue, *, n_threads: int = 8):
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _run_one(key):
         try:
             payload = _load_one_file(key[0], key[1])
             result_q.put((key, payload))
         except Exception as e:
             result_q.put((key, e))
 
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        while True:
+            msg = task_q.get()
+            if msg is None:  # sentinel
+                break
+            key = tuple(msg)
+            pool.submit(_run_one, key)
 
 # ---------------------- Optimized Main class ----------------------
 class LogitsLoader:
@@ -137,7 +133,8 @@ class LogitsLoader:
             target=_prefetch_worker, args=(self._task_q, self._result_q), daemon=True
         )
         self._worker.start()
-        
+        self.expected_seqs = {}
+
         # Cache positions
         self._cached_seq: int =  -1_000_000
 
@@ -177,6 +174,7 @@ class LogitsLoader:
                 future_seq = self._kth_future_file_start_seq(
                     file_start_seq, i, dp_rank, dp_world_size
                 )
+                # print(f"adding future {_file_key_from_dp_seq(future_seq)} to queue")
                 self._task_q.put_nowait(_file_key_from_dp_seq(future_seq))
         
         # Get the file from the result queue if it is not already cached
@@ -192,6 +190,9 @@ class LogitsLoader:
         input_ids = self.input_ids_buffer[diff:diff + seqs_to_consume_per_dp]
         exp_logits = self.exp_logits_buffer[:, diff:diff + seqs_to_consume_per_dp]
         index = self.index_buffer[:, diff:diff + seqs_to_consume_per_dp]
+        
+        # for i in range(local_seq_counter, local_seq_counter + seqs_to_consume_per_dp):
+        #     CONSUMED_IDS.add(i)
 
         return {
             'input_ids': input_ids.to(self._device, non_blocking=True),
@@ -204,8 +205,13 @@ class LogitsLoader:
         
     def _queue_to_cache(self, file_start_seq: int, dp_rank: int, dp_world_size: int) -> None:
         # Queue to cache
-        k, payload = self._result_q.get()
-        assert k == _file_key_from_dp_seq(file_start_seq), f"Expected {_file_key_from_dp_seq(file_start_seq)}, got {k}"
+        key_to_cache = _file_key_from_dp_seq(file_start_seq)
+        while key_to_cache not in self.expected_seqs:
+            k, payload = self._result_q.get()
+            self.expected_seqs[k] = payload
+        
+        payload = self.expected_seqs[key_to_cache]
+        del self.expected_seqs[key_to_cache]
         
         for v in payload.values():
             if isinstance(v, torch.Tensor):
