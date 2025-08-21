@@ -112,7 +112,7 @@ class LogitsLoader:
     - CPU tensors are pinned upon cache admission for async H2D.
     """
 
-    def __init__(self, prefetch_ahead_files: int = 1, start_method: str = "spawn"):
+    def __init__(self, prefetch_ahead_files: int = 32, start_method: str = "spawn"):
         """
         prefetch_ahead_files:
             number of FUTURE files to keep ready (not counting current).
@@ -131,8 +131,8 @@ class LogitsLoader:
 
         # IPC (avoid inheriting CUDA state; do not touch CUDA in worker)
         ctx = mp.get_context(start_method)
-        self._task_q: mp.Queue = ctx.Queue(maxsize=256)
-        self._result_q: mp.Queue = ctx.Queue(maxsize=256)
+        self._task_q: mp.Queue = ctx.Queue(maxsize=prefetch_ahead_files)
+        self._result_q: mp.Queue = ctx.Queue(maxsize=prefetch_ahead_files)
         self._worker: mp.Process = ctx.Process(
             target=_prefetch_worker, args=(self._task_q, self._result_q), daemon=True
         )
