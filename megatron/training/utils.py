@@ -32,7 +32,7 @@ from megatron.training import (
     get_args,
     get_adlr_autoresume,
 )
-from megatron.training.logits_fetcher import LogitsLoader
+from megatron.training.logits_fetcher import LogitsLoader, TOPK
 from megatron.core import DistributedDataParallel as DDP
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
