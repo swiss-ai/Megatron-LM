@@ -247,6 +247,7 @@ def forward_step(data_iterator, model: GPTModel):
     with stimer:
         output_tensor = model(
             input_ids=batch['input_ids'],
+            labels=batch['labels'],
             teacher_probs=batch['exp_logits'],
             prob_positions=batch['index'],
             attention_mask=batch['attention_mask'],

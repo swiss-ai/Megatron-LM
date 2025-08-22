@@ -59,11 +59,12 @@ def _load_one_file(orig_iter: int, orig_dp: int) -> Dict[str, torch.Tensor]:
     )
 
     # Expected shapes after processing:
-    # - input_ids_buffer: [32, T]  (seq, tokens)
-    # - exp_logits_buffer: [T, 32, K]
-    # - index_buffer: [T, 32, 4*TOPK] (after offsets applied)
-    input_ids_buffer = tensor_sd["labels"].transpose(0, 1).contiguous()  # [32, T]
-    exp_logits_buffer = tensor_sd["exp_logits"].contiguous()             # [T, 32, K]
+    # - input_ids: [32, T]  (seq, tokens)
+    # - exp_logits: [T, 32, 4*TOPK]
+    # - index: [T, 32, 4*TOPK] (after offsets applied)
+    labels_buffer = tensor_sd["labels"].transpose(0, 1).contiguous()  # [32, T]
+    input_ids_buffer = torch.cat([torch.full((32, 1), 1, dtype=labels_buffer.dtype), labels_buffer[:,:-1].clone()], dim=1)
+    exp_logits_buffer = tensor_sd["exp_logits"].contiguous()             # [T, 32, 4*TOPK]
     index_buffer = tensor_sd["index"].contiguous()                       # [T, 32, 4*TOPK]
 
     # Apply banked offsets in-place (CPU)
@@ -74,6 +75,7 @@ def _load_one_file(orig_iter: int, orig_dp: int) -> Dict[str, torch.Tensor]:
 
     return {
         "input_ids": input_ids_buffer,
+        "labels": labels_buffer,
         "exp_logits": exp_logits_buffer,
         "index": index_buffer,
     }
@@ -119,6 +121,7 @@ class LogitsLoader:
         """
         # Active buffers (CPU) for the currently mounted file
         self.input_ids_buffer: Optional[torch.Tensor] = None
+        self.labels_buffer: Optional[torch.Tensor] = None
         self.exp_logits_buffer: Optional[torch.Tensor] = None
         self.index_buffer: Optional[torch.Tensor] = None
 
@@ -188,6 +191,7 @@ class LogitsLoader:
         diff = local_seq_counter - self._cached_seq
 
         input_ids = self.input_ids_buffer[diff:diff + seqs_to_consume_per_dp]
+        labels = self.labels_buffer[diff:diff + seqs_to_consume_per_dp]
         exp_logits = self.exp_logits_buffer[:, diff:diff + seqs_to_consume_per_dp]
         index = self.index_buffer[:, diff:diff + seqs_to_consume_per_dp]
         
@@ -196,6 +200,7 @@ class LogitsLoader:
 
         return {
             'input_ids': input_ids.to(self._device, non_blocking=True),
+            'labels': labels.to(self._device, non_blocking=True),
             'exp_logits': exp_logits.to(self._device, non_blocking=True),
             'index': index.to(self._device, non_blocking=True),
             'loss_mask': torch.ones(seqs_to_consume_per_dp, input_ids.shape[1], device=self._device),
@@ -221,6 +226,7 @@ class LogitsLoader:
                     pass
         
         self.input_ids_buffer = payload["input_ids"]
+        self.labels_buffer = payload["labels"]
         self.exp_logits_buffer = payload["exp_logits"]
         self.index_buffer = payload["index"]
         

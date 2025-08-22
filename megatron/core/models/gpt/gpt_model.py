@@ -18,6 +18,12 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+from megatron.core.parallel_state import (
+    get_tensor_model_parallel_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+
 
 class GPTModel(LanguageModule):
     """GPT Transformer language model.
@@ -203,6 +209,7 @@ class GPTModel(LanguageModule):
         position_ids: Tensor,
         attention_mask: Tensor,
         decoder_input: Tensor = None,
+        labels: Tensor = None,
         teacher_probs: Tensor = None,
         prob_positions: Tensor = None,
         inference_params: InferenceParams = None,
@@ -304,37 +311,12 @@ class GPTModel(LanguageModule):
             )
             log_config_to_disk(self.config, payload, prefix='input_and_logits')
 
-        if teacher_probs is None:
+        if labels is None:
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_teacher_loss(teacher_probs, prob_positions, logits)
-        
-
-        return loss
-    
-    def compute_teacher_loss(self, teacher_probs: Tensor, prob_positions: Tensor, logits: Tensor) -> Tensor:
-        """Computes the language model loss (Cross entropy across vocabulary)
-
-        Args:
-            teacher_probs (Tensor): The teacher probabilities of dimension [batch size, seq length, topk]
-            prob_positions (Tensor): The positions of the teacher probabilities of dimension [batch size, seq length, topk]
-            logits (Tensor): The final logits returned by the output layer of the transformer model of dimension [batch size, seq length, vocab size]
-
-        Returns:
-            Tensor: Loss tensor of dimensions [batch size, sequence_length]
-        """
-        
-        # Normalize student logits
-        student_logits = torch.nn.functional.log_softmax(logits, dim=-1)  # [batch size, seq length, vocab size]
-        
-        # Select student logits at the teacher positions
-        student_logits = student_logits.gather(dim=-1, index=prob_positions.to(torch.int64))  # [batch size, seq length, topk]
-        
-        # Compute the loss
-        loss = - torch.sum(teacher_probs * student_logits, dim=-1)  # [batch size, seq length]
-        
-        return loss
+        distill_loss = compute_teacher_loss_custom(teacher_probs, prob_positions, logits, labels)
+        return distill_loss
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
@@ -361,3 +343,98 @@ class GPTModel(LanguageModule):
         ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
 
         return sharded_state_dict
+
+
+from torch.autograd import Function
+
+class _TeacherDistillLoss(Function):
+    @staticmethod
+    def forward(ctx,
+                teacher_probs: Tensor,       # [S, B, topk]
+                prob_positions: Tensor,      # [S, B, topk] (global vocab ids)
+                logits: Tensor,              # [S, B, V_local]
+                teacher_vocab_size: int = 1024):  # used to shard teacher_probs the same way
+        """
+        Returns: distill_loss: [S, B]
+        """
+        group = get_tensor_model_parallel_group()
+        rank = get_tensor_model_parallel_rank()
+        world_size = get_tensor_model_parallel_world_size()
+
+        # Numerically-stable global logsumexp over the *full* vocabulary via tensor-parallel reduction
+        logits = logits.float()
+        local_max = logits.max(dim=-1).values                      # [S, B]
+        global_max = local_max.clone()
+        torch.distributed.all_reduce(global_max, op=torch.distributed.ReduceOp.MAX, group=group)
+        shifted = logits - global_max.unsqueeze(-1)                # [S, B, V_local]
+
+        exp_shifted = torch.exp(shifted)                           # [S, B, V_local]
+        local_sum = exp_shifted.sum(dim=-1)                        # [S, B]
+        global_sum = local_sum.clone()
+        torch.distributed.all_reduce(global_sum, op=torch.distributed.ReduceOp.SUM, group=group)
+        log_sum_exp = torch.log(global_sum)                        # [S, B]
+
+        # Distillation part: shard teacher probs/positions consistently with tensor-parallel vocab sharding
+        teacher_logits_per_rank = teacher_vocab_size // world_size
+        assert teacher_logits_per_rank % 256 == 0, \
+            f"Teacher logits per rank must be divisible by 256, got {teacher_logits_per_rank}"
+
+        # slice this rank's teacher top-k slice
+        t_start = teacher_logits_per_rank * rank
+        t_end   = teacher_logits_per_rank * (rank + 1)
+        rank_teacher_probs = teacher_probs[..., t_start:t_end]     # [S, B, topk_local]
+
+        # convert global vocab ids -> local shard indices
+        vocab_start_index = rank * shifted.shape[-1]
+        rank_prob_positions = (
+            prob_positions[..., t_start:t_end] - vocab_start_index
+        ).to(torch.int64)                                          # [S, B, topk_local]
+
+        # gather the selected logits from this shard
+        selected_logits = shifted.gather(dim=-1, index=rank_prob_positions)  # [S, B, topk_local]
+
+        # local teacher dot selected logits, then sum globally (other ranks own other selected ids)
+        local_loss = -(rank_teacher_probs * selected_logits).sum(dim=-1)     # [S, B]
+        torch.distributed.all_reduce(local_loss, op=torch.distributed.ReduceOp.SUM, group=group)
+
+        distill_loss = local_loss + log_sum_exp                     # [S, B]
+
+        # ---- Save for backward ----
+        # We need global denominator for softmax grad and the teacher scatter pattern.
+        ctx.save_for_backward(exp_shifted, global_sum, rank_prob_positions, rank_teacher_probs)
+        ctx.group = group
+        return distill_loss
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        """
+        grad_out: upstream gradient for [S, B] loss.
+        Returns grads for (teacher_probs, prob_positions, logits, teacher_vocab_size)
+        """
+        exp_shifted, global_sum, rank_prob_positions, rank_teacher_probs = ctx.saved_tensors
+        # global softmax over the full vocab: exp(shifted) / sum_exp_global
+        softmax_local = exp_shifted / global_sum.unsqueeze(-1)      # [S, B, V_local]
+
+        # build a tensor with teacher mass scattered at the selected local indices
+        # same shape as logits shard
+        teacher_scatter = torch.zeros_like(softmax_local)           # [S, B, V_local]
+        # scatter_add along vocab dim
+        teacher_scatter.scatter_add_(
+            dim=-1,
+            index=rank_prob_positions,
+            src=rank_teacher_probs
+        )
+
+        # dL/dlogits_local = softmax_local - teacher_scatter
+        grad_logits_local = (softmax_local - teacher_scatter) * grad_out.unsqueeze(-1)
+
+        # No gradients for teacher inputs/indices in this op (they're treated as constants)
+        return (None, None, grad_logits_local, None)
+
+
+def compute_teacher_loss_custom(teacher_probs: Tensor,
+                                prob_positions: Tensor,
+                                logits: Tensor,
+                                labels: Tensor) -> Tensor:
+    # labels are unused here (matching your forward); keep signature for compatibility
+    return _TeacherDistillLoss.apply(teacher_probs, prob_positions, logits)
