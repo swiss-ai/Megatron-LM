@@ -173,7 +173,7 @@ def get_batch(data_iterator):
 SPIKY_LOSS_PERC = 0.2
 
 
-def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
+def loss_func(loss_mask: torch.Tensor, lm_loss: torch.Tensor, distill_loss: torch.Tensor):
     """Loss function.
 
     Args:
@@ -187,20 +187,33 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
             the data parallel ranks
     """
     args = get_args()
+    
+    lm_loss = torch.where(
+        loss_mask,
+        lm_loss,
+        torch.zeros_like(lm_loss),
+    )
 
-    losses = output_tensor.float()
-    loss_mask = loss_mask.view(-1).float()
-    total_tokens = loss_mask.sum()
-    loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
+    distill_loss = torch.where(
+        loss_mask,
+        distill_loss,
+        torch.zeros_like(distill_loss),
+    )
+
+    distill_lm_count = torch.cat([
+        distill_loss.float().sum().view(1),
+        lm_loss.float().sum().view(1),
+        loss_mask.float().sum().view(1),
+    ])
 
     if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+        torch.distributed.all_reduce(distill_lm_count, group=mpu.get_context_parallel_group())
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
         rerun_state_machine.validate_result(
-            result=loss[0],
+            result=distill_lm_count[0],
             rejection_func=torch.isnan,
             message="found NaN in local forward loss calculation",
             tolerance=0.0,        # forward pass calculations are determinisic
@@ -209,21 +222,21 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     # Check for spiky loss
     if args.check_for_spiky_loss:
         rerun_state_machine.validate_result(
-            result=loss[0],
+            result=distill_lm_count[0],
             rejection_func=partial(rerun_state_machine.is_spiky_loss, threshold=SPIKY_LOSS_PERC),
             message="Spiky loss",
             tolerance=0.0,        # forward pass calculations are determinisic
             fatal=False,
         )
     # Reduce loss for logging.
-    reporting_loss = loss.clone().detach()
+    reporting_loss = distill_lm_count.clone().detach()
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
-    local_num_tokens = loss[1].clone().detach().to(torch.int)
+    local_num_tokens = distill_lm_count[2].clone().detach().to(torch.int)
     return (
-        loss[0] * args.context_parallel_size,
+        distill_lm_count[0] * args.context_parallel_size,
         local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])},
+        {'distill loss': (reporting_loss[0], reporting_loss[2]), 'lm loss': (reporting_loss[1], reporting_loss[2])},
     )
 
 
@@ -245,7 +258,7 @@ def forward_step(data_iterator, model: GPTModel):
     timers('batch-generator').stop()
 
     with stimer:
-        output_tensor = model(
+        distill_loss, lm_loss = model(
             input_ids=batch['input_ids'],
             labels=batch['labels'],
             teacher_probs=batch['exp_logits'],
@@ -254,7 +267,7 @@ def forward_step(data_iterator, model: GPTModel):
             position_ids=batch['position_ids'],
         )
 
-    return output_tensor, partial(loss_func, batch['loss_mask'])
+    return distill_loss, partial(loss_func, batch['loss_mask'], lm_loss)
 
 
 def is_dataset_built_on_rank():

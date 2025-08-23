@@ -315,8 +315,12 @@ class GPTModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        distill_loss = compute_teacher_loss_custom(teacher_probs, prob_positions, logits, labels)
-        return distill_loss
+        with torch.no_grad():
+            lm_loss = self.compute_language_model_loss(labels, logits) # [b s]
+            
+        distill_loss = compute_teacher_loss_custom(teacher_probs, prob_positions, logits, labels).transpose(0, 1).contiguous()
+
+        return distill_loss, lm_loss
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None

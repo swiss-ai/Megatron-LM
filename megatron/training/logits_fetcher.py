@@ -18,13 +18,18 @@ from typing import Dict, Tuple, Any, Optional, Set
 import torch
 from torch.distributed.checkpoint.state_dict_loader import _load_state_dict
 from torch.distributed.checkpoint.format_utils import FileSystemReader, _EmptyStateDictLoadPlanner
+from torch.distributed.checkpoint import CheckpointException
+
+from logging import getLogger
+logger = getLogger(__name__)
 
 
 # ---------------------- USER-DEFINED CONSTANTS ----------------------
+SEQLEN = 4096
 TOPK = 256
 TENSORS_DIR = "/capstor/scratch/cscs/asolergi/main_run_70B_megatron/Megatron-LM/logs/Meg-Runs/main-runs-v1/apertus3-70b-512-nodes-1e-5lr/70b-probs-tensors"
-ITERATION_TO_JOBID_PATH = "/iopsstor/scratch/cscs/blacksamorez/Megatron-LM-QAT/iteration_to_jobid.json"
-ITERATION_TO_JOBID = json.load(open(ITERATION_TO_JOBID_PATH))
+ITERATION_DP_TO_JOBID_PATH = "/iopsstor/scratch/cscs/blacksamorez/Megatron-LM-QAT/iteration_dp_to_jobid.json"
+ITERATION_DP_TO_JOBID = json.load(open(ITERATION_DP_TO_JOBID_PATH))
 # -------------------------------------------------------------------
 
 SEQS_PER_FILE = 32          # 32 sequences per dp file
@@ -43,7 +48,7 @@ def _file_key_from_dp_seq(dp_seq_counter: int) -> Tuple[int, int]:
 
 
 def _filepath_for_key(orig_iter: int, orig_dp: int) -> str:
-    jobid = ITERATION_TO_JOBID[str(orig_iter)]
+    jobid = ITERATION_DP_TO_JOBID[str(orig_iter)][str(orig_dp)][0]
     return os.path.join(TENSORS_DIR, f"{jobid}-iter-{orig_iter}-dp-{orig_dp}")
 
 
@@ -51,12 +56,17 @@ def _load_one_file(orig_iter: int, orig_dp: int) -> Dict[str, torch.Tensor]:
     """Load a single DP file from disk (CPU tensors) and return the three buffers."""
     file_path = _filepath_for_key(orig_iter, orig_dp)
     tensor_sd: Dict[str, Any] = {}
-    _load_state_dict(
-        tensor_sd,
-        storage_reader=FileSystemReader(file_path),
-        planner=_EmptyStateDictLoadPlanner(),
-        no_dist=True,
-    )
+    try:
+        _load_state_dict(
+            tensor_sd,
+            storage_reader=FileSystemReader(file_path),
+            planner=_EmptyStateDictLoadPlanner(),
+            no_dist=True,
+        )
+    except CheckpointException:
+        return {
+            "failed": True,
+        }
 
     # Expected shapes after processing:
     # - input_ids: [32, T]  (seq, tokens)
@@ -73,11 +83,14 @@ def _load_one_file(orig_iter: int, orig_dp: int) -> Dict[str, torch.Tensor]:
     index_buffer[:, :, 2 * TOPK:3 * TOPK] += 32768 * 2
     index_buffer[:, :, 3 * TOPK:4 * TOPK] += 32768 * 3
 
+    loss_mask = torch.ones(32, SEQLEN, dtype=torch.bool)
+
     return {
         "input_ids": input_ids_buffer,
         "labels": labels_buffer,
         "exp_logits": exp_logits_buffer,
         "index": index_buffer,
+        'loss_mask': loss_mask,
     }
 
 
@@ -124,6 +137,7 @@ class LogitsLoader:
         self.labels_buffer: Optional[torch.Tensor] = None
         self.exp_logits_buffer: Optional[torch.Tensor] = None
         self.index_buffer: Optional[torch.Tensor] = None
+        self.loss_mask_buffer: Optional[torch.Tensor] = None
 
         # Prefetch config
         self.prefetch_ahead: int = max(0, int(prefetch_ahead_files))
@@ -194,7 +208,8 @@ class LogitsLoader:
         labels = self.labels_buffer[diff:diff + seqs_to_consume_per_dp]
         exp_logits = self.exp_logits_buffer[:, diff:diff + seqs_to_consume_per_dp]
         index = self.index_buffer[:, diff:diff + seqs_to_consume_per_dp]
-        
+        loss_mask = self.loss_mask_buffer[diff:diff + seqs_to_consume_per_dp]
+                
         # for i in range(local_seq_counter, local_seq_counter + seqs_to_consume_per_dp):
         #     CONSUMED_IDS.add(i)
 
@@ -203,7 +218,7 @@ class LogitsLoader:
             'labels': labels.to(self._device, non_blocking=True),
             'exp_logits': exp_logits.to(self._device, non_blocking=True),
             'index': index.to(self._device, non_blocking=True),
-            'loss_mask': torch.ones(seqs_to_consume_per_dp, input_ids.shape[1], device=self._device),
+            'loss_mask': loss_mask.to(self._device, non_blocking=True),
             'attention_mask': None,
             'position_ids': torch.arange(input_ids.shape[1], dtype=torch.long, device=self._device),
         }
@@ -211,6 +226,7 @@ class LogitsLoader:
     def _queue_to_cache(self, file_start_seq: int, dp_rank: int, dp_world_size: int) -> None:
         # Queue to cache
         key_to_cache = _file_key_from_dp_seq(file_start_seq)
+        # logger.warning(f"Awaiting file {key_to_cache}")
         while key_to_cache not in self.expected_seqs:
             k, payload = self._result_q.get()
             self.expected_seqs[k] = payload
@@ -218,17 +234,22 @@ class LogitsLoader:
         payload = self.expected_seqs[key_to_cache]
         del self.expected_seqs[key_to_cache]
         
+        if isinstance(payload, Exception):
+            raise payload
+        
         for v in payload.values():
             if isinstance(v, torch.Tensor):
                 try:
                     v.pin_memory()
                 except Exception:
                     pass
-        
-        self.input_ids_buffer = payload["input_ids"]
-        self.labels_buffer = payload["labels"]
-        self.exp_logits_buffer = payload["exp_logits"]
-        self.index_buffer = payload["index"]
+                
+        if "failed" not in payload:
+            self.input_ids_buffer = payload["input_ids"]
+            self.labels_buffer = payload["labels"]
+            self.exp_logits_buffer = payload["exp_logits"]
+            self.index_buffer = payload["index"]
+            self.loss_mask_buffer = payload["loss_mask"]
         
         # Add next file to load to queue
         next_file_start_seq = self._kth_future_file_start_seq(
