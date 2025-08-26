@@ -5,6 +5,7 @@ import multiprocessing as mp
 from typing import Dict, Tuple, Any, Optional, Set
 from pathlib import Path
 from itertools import chain
+from gc import collect
 
 import os
 import re
@@ -31,8 +32,8 @@ def _atomic_json_write(path: Path, obj):
 # ---------------------- USER-DEFINED CONSTANTS ----------------------
 RANK = int(os.environ["RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
-PREFETCH_AHEAD_FILES = 8
-N_THREADS = 8
+PREFETCH_AHEAD_FILES = 2
+N_THREADS = 2
 
 SEQLEN = 4096
 TOPK = 256
@@ -317,6 +318,7 @@ class LogitsProcessor:
         self.save_one_file()
         self.pipe_one_file()
         self.load_one_file()
+        collect()
     
     def save_one_file(self):
         iter_dp_to_confirm = (self.iter_to_confirm, self.dp_to_confirm)
@@ -380,7 +382,7 @@ def main(rank: int, world_size: int):
         processor.step_pipeline()
         if rank == 0:
             pbar.update(1)
-        if i % 200 == 0:
+        if i % 100 == 0:
             processor.dump_progress()
     if rank == 0:
         pbar.close()
@@ -388,4 +390,5 @@ def main(rank: int, world_size: int):
 
 
 if __name__ == "__main__":
-    main(RANK, WORLD_SIZE)
+    if RANK < WORLD_SIZE:
+        main(RANK, WORLD_SIZE)
