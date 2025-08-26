@@ -16,82 +16,40 @@ import multiprocessing as mp
 from typing import Dict, Tuple, Any, Optional, Set
 
 import torch
-from torch.distributed.checkpoint.state_dict_loader import _load_state_dict
-from torch.distributed.checkpoint.format_utils import FileSystemReader, _EmptyStateDictLoadPlanner
-from torch.distributed.checkpoint import CheckpointException
 
 from logging import getLogger
 logger = getLogger(__name__)
 
 
 # ---------------------- USER-DEFINED CONSTANTS ----------------------
-SEQLEN = 4096
+TENSORS_DIR = "/capstor/scratch/cscs/blacksamorez/70B_processed_logits"
 TOPK = 256
-TENSORS_DIR = "/capstor/scratch/cscs/asolergi/main_run_70B_megatron/Megatron-LM/logs/Meg-Runs/main-runs-v1/apertus3-70b-512-nodes-1e-5lr/70b-probs-tensors"
-ITERATION_DP_TO_JOBID_PATH = "/iopsstor/scratch/cscs/blacksamorez/Megatron-LM-QAT/iteration_dp_to_jobid.json"
-ITERATION_DP_TO_JOBID = json.load(open(ITERATION_DP_TO_JOBID_PATH))
-# -------------------------------------------------------------------
-
 SEQS_PER_FILE = 32          # 32 sequences per dp file
 FILES_PER_ITER = 128        # 128 dp files per iteration
 SEQS_PER_ITER = SEQS_PER_FILE * FILES_PER_ITER  # 4096 sequences per iteration
 
-CONSUMED_IDS = set()
+# CONSUMED_IDS = set()
+# -------------------------------------------------------------------
 
 # ---------------------- Helpers (importable at module top) ----------------------
-def _file_key_from_dp_seq(dp_seq_counter: int) -> Tuple[int, int]:
-    """Map an absolute dp-sequence index to (orig_iter, orig_dp file index)."""
-    orig_iter = dp_seq_counter // SEQS_PER_ITER
-    orig_iter_seq = dp_seq_counter % SEQS_PER_ITER
-    orig_dp = orig_iter_seq // SEQS_PER_FILE
-    return orig_iter, orig_dp
+def _filepath_for_seq(seq: int) -> str:
+    return os.path.join(TENSORS_DIR, f"{seq // 32:010d}.pt")
 
 
-def _filepath_for_key(orig_iter: int, orig_dp: int) -> str:
-    jobid = ITERATION_DP_TO_JOBID[str(orig_iter)][str(orig_dp)][0]
-    return os.path.join(TENSORS_DIR, f"{jobid}-iter-{orig_iter}-dp-{orig_dp}")
-
-
-def _load_one_file(orig_iter: int, orig_dp: int) -> Dict[str, torch.Tensor]:
+def _load_one_file(seq: int) -> Dict[str, torch.Tensor]:
     """Load a single DP file from disk (CPU tensors) and return the three buffers."""
-    file_path = _filepath_for_key(orig_iter, orig_dp)
-    tensor_sd: Dict[str, Any] = {}
-    try:
-        _load_state_dict(
-            tensor_sd,
-            storage_reader=FileSystemReader(file_path),
-            planner=_EmptyStateDictLoadPlanner(),
-            no_dist=True,
-        )
-    except CheckpointException:
-        return {
-            "failed": True,
-        }
+    file_path = _filepath_for_seq(seq)
+    tensor_sd = torch.load(file_path, weights_only=False)
+    
+    # {
+    #     "input_ids": input_ids_buffer,
+    #     "labels": labels_buffer,
+    #     "exp_logits": exp_logits_buffer,
+    #     "index": index_buffer,
+    #     "loss_mask": loss_mask,
+    # }
 
-    # Expected shapes after processing:
-    # - input_ids: [32, T]  (seq, tokens)
-    # - exp_logits: [T, 32, 4*TOPK]
-    # - index: [T, 32, 4*TOPK] (after offsets applied)
-    labels_buffer = tensor_sd["labels"].transpose(0, 1).contiguous()  # [32, T]
-    input_ids_buffer = torch.cat([torch.full((32, 1), 1, dtype=labels_buffer.dtype), labels_buffer[:,:-1].clone()], dim=1)
-    exp_logits_buffer = tensor_sd["exp_logits"].contiguous()             # [T, 32, 4*TOPK]
-    index_buffer = tensor_sd["index"].contiguous()                       # [T, 32, 4*TOPK]
-
-    # Apply banked offsets in-place (CPU)
-    index_buffer[:, :, :TOPK] += 0
-    index_buffer[:, :, TOPK:2 * TOPK] += 32768
-    index_buffer[:, :, 2 * TOPK:3 * TOPK] += 32768 * 2
-    index_buffer[:, :, 3 * TOPK:4 * TOPK] += 32768 * 3
-
-    loss_mask = torch.ones(32, SEQLEN, dtype=torch.bool)
-
-    return {
-        "input_ids": input_ids_buffer,
-        "labels": labels_buffer,
-        "exp_logits": exp_logits_buffer,
-        "index": index_buffer,
-        'loss_mask': loss_mask,
-    }
+    return tensor_sd
 
 
 def _prefetch_worker(task_q: mp.Queue, result_q: mp.Queue, *, n_threads: int = 8):
@@ -99,7 +57,7 @@ def _prefetch_worker(task_q: mp.Queue, result_q: mp.Queue, *, n_threads: int = 8
 
     def _run_one(key):
         try:
-            payload = _load_one_file(key[0], key[1])
+            payload = _load_one_file(key)
             result_q.put((key, payload))
         except Exception as e:
             result_q.put((key, e))
@@ -109,8 +67,7 @@ def _prefetch_worker(task_q: mp.Queue, result_q: mp.Queue, *, n_threads: int = 8
             msg = task_q.get()
             if msg is None:  # sentinel
                 break
-            key = tuple(msg)
-            pool.submit(_run_one, key)
+            pool.submit(_run_one, msg)
 
 # ---------------------- Optimized Main class ----------------------
 class LogitsLoader:
@@ -191,8 +148,7 @@ class LogitsLoader:
                 future_seq = self._kth_future_file_start_seq(
                     file_start_seq, i, dp_rank, dp_world_size
                 )
-                # print(f"adding future {_file_key_from_dp_seq(future_seq)} to queue")
-                self._task_q.put_nowait(_file_key_from_dp_seq(future_seq))
+                self._task_q.put_nowait(future_seq)
         
         # Get the file from the result queue if it is not already cached
         if file_start_seq == self._cached_seq:
@@ -225,14 +181,13 @@ class LogitsLoader:
         
     def _queue_to_cache(self, file_start_seq: int, dp_rank: int, dp_world_size: int) -> None:
         # Queue to cache
-        key_to_cache = _file_key_from_dp_seq(file_start_seq)
-        # logger.warning(f"Awaiting file {key_to_cache}")
-        while key_to_cache not in self.expected_seqs:
-            k, payload = self._result_q.get()
-            self.expected_seqs[k] = payload
+        # logger.warning(f"Awaiting file {file_start_seq}")
+        while file_start_seq not in self.expected_seqs:
+            seq, payload = self._result_q.get()
+            self.expected_seqs[seq] = payload
         
-        payload = self.expected_seqs[key_to_cache]
-        del self.expected_seqs[key_to_cache]
+        payload = self.expected_seqs[file_start_seq]
+        del self.expected_seqs[file_start_seq]
         
         if isinstance(payload, Exception):
             raise payload
@@ -244,18 +199,17 @@ class LogitsLoader:
                 except Exception:
                     pass
                 
-        if "failed" not in payload:
-            self.input_ids_buffer = payload["input_ids"]
-            self.labels_buffer = payload["labels"]
-            self.exp_logits_buffer = payload["exp_logits"]
-            self.index_buffer = payload["index"]
-            self.loss_mask_buffer = payload["loss_mask"]
+        self.input_ids_buffer = payload["input_ids"]
+        self.labels_buffer = payload["labels"]
+        self.exp_logits_buffer = payload["exp_logits"]
+        self.index_buffer = payload["index"]
+        self.loss_mask_buffer = payload["loss_mask"]
         
         # Add next file to load to queue
         next_file_start_seq = self._kth_future_file_start_seq(
             file_start_seq, self.prefetch_ahead, dp_rank, dp_world_size
         )
-        self._task_q.put_nowait(_file_key_from_dp_seq(next_file_start_seq))
+        self._task_q.put_nowait(next_file_start_seq)
 
     def close(self):
         """Gracefully stop the worker process."""

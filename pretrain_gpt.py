@@ -37,6 +37,9 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 
+from logging import getLogger
+logger = getLogger(__name__)
+
 
 stimer = StragglerDetector()
 
@@ -145,7 +148,9 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
 
     return model
 
-CURRENT_SEQ_COUNTER = 1096333 * 128 * 32
+
+CURRENT_SEQ_COUNTER = 0
+
 
 def get_batch(data_iterator):
     global CURRENT_SEQ_COUNTER
