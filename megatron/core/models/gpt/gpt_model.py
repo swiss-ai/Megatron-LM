@@ -373,10 +373,10 @@ class _TeacherDistillLoss(Function):
         shifted = logits - global_max.unsqueeze(-1)                # [S, B, V_local]
 
         exp_shifted = torch.exp(shifted)                           # [S, B, V_local]
-        local_sum = exp_shifted.sum(dim=-1)                        # [S, B]
-        global_sum = local_sum.clone()
-        torch.distributed.all_reduce(global_sum, op=torch.distributed.ReduceOp.SUM, group=group)
-        log_sum_exp = torch.log(global_sum)                        # [S, B]
+        local_sum_exp_shifted = exp_shifted.sum(dim=-1)                        # [S, B]
+        global_sum_exp_shifted = local_sum_exp_shifted.clone()
+        torch.distributed.all_reduce(global_sum_exp_shifted, op=torch.distributed.ReduceOp.SUM, group=group)
+        log_sum_exp_shifted = torch.log(global_sum_exp_shifted)                # [S, B]
 
         # Distillation part: shard teacher probs/positions consistently with tensor-parallel vocab sharding
         teacher_logits_per_rank = teacher_vocab_size // world_size
@@ -386,6 +386,7 @@ class _TeacherDistillLoss(Function):
         # slice this rank's teacher top-k slice
         t_start = teacher_logits_per_rank * rank
         t_end   = teacher_logits_per_rank * (rank + 1)
+        teacher_sum = teacher_probs.sum(dim=-1)
         rank_teacher_probs = teacher_probs[..., t_start:t_end]     # [S, B, topk_local]
 
         # convert global vocab ids -> local shard indices
@@ -395,17 +396,17 @@ class _TeacherDistillLoss(Function):
         ).to(torch.int64)                                          # [S, B, topk_local]
 
         # gather the selected logits from this shard
-        selected_logits = shifted.gather(dim=-1, index=rank_prob_positions)  # [S, B, topk_local]
+        selected_shifted = shifted.gather(dim=-1, index=rank_prob_positions)  # [S, B, topk_local]
 
         # local teacher dot selected logits, then sum globally (other ranks own other selected ids)
-        local_loss = -(rank_teacher_probs * selected_logits).sum(dim=-1)     # [S, B]
-        torch.distributed.all_reduce(local_loss, op=torch.distributed.ReduceOp.SUM, group=group)
+        global_loss_shifted = -(rank_teacher_probs * selected_shifted).sum(dim=-1)     # [S, B]
+        torch.distributed.all_reduce(global_loss_shifted, op=torch.distributed.ReduceOp.SUM, group=group)
 
-        distill_loss = local_loss + log_sum_exp                     # [S, B]
+        distill_loss = global_loss_shifted + log_sum_exp_shifted * teacher_sum         # [S, B]
 
         # ---- Save for backward ----
         # We need global denominator for softmax grad and the teacher scatter pattern.
-        ctx.save_for_backward(exp_shifted, global_sum, rank_prob_positions, rank_teacher_probs)
+        ctx.save_for_backward(exp_shifted, global_sum_exp_shifted, rank_prob_positions, rank_teacher_probs, teacher_sum)
         ctx.group = group
         return distill_loss
 
@@ -415,13 +416,12 @@ class _TeacherDistillLoss(Function):
         grad_out: upstream gradient for [S, B] loss.
         Returns grads for (teacher_probs, prob_positions, logits, teacher_vocab_size)
         """
-        exp_shifted, global_sum, rank_prob_positions, rank_teacher_probs = ctx.saved_tensors
-        # global softmax over the full vocab: exp(shifted) / sum_exp_global
-        softmax_local = exp_shifted / global_sum.unsqueeze(-1)      # [S, B, V_local]
+        exp_shifted, global_sum_exp_shifted, rank_prob_positions, rank_teacher_probs, teacher_sum = ctx.saved_tensors
+        softmax = exp_shifted / global_sum_exp_shifted.unsqueeze(-1)      # [S, B, V_local]
 
         # build a tensor with teacher mass scattered at the selected local indices
         # same shape as logits shard
-        teacher_scatter = torch.zeros_like(softmax_local)           # [S, B, V_local]
+        teacher_scatter = torch.zeros_like(softmax)           # [S, B, V_local]
         # scatter_add along vocab dim
         teacher_scatter.scatter_add_(
             dim=-1,
@@ -429,8 +429,7 @@ class _TeacherDistillLoss(Function):
             src=rank_teacher_probs
         )
 
-        # dL/dlogits_local = softmax_local - teacher_scatter
-        grad_logits_local = (softmax_local - teacher_scatter) * grad_out.unsqueeze(-1)
+        grad_logits_local = (softmax * teacher_sum.unsqueeze(-1) - teacher_scatter) * grad_out.unsqueeze(-1)
 
         # No gradients for teacher inputs/indices in this op (they're treated as constants)
         return (None, None, grad_logits_local, None)
