@@ -38,7 +38,7 @@ N_THREADS = 2
 SEQLEN = 4096
 TOPK = 256
 SRC_PATH = "/capstor/scratch/cscs/asolergi/main_run_70B_megatron/Megatron-LM/logs/Meg-Runs/main-runs-v1/apertus3-70b-512-nodes-1e-5lr/70b-probs-tensors"
-DST_PATH = "/capstor/scratch/cscs/blacksamorez/70B_processed_logits"
+DST_PATH = "/capstor/store/cscs/swissai/infra01/distillation/70B_processed_logits"
 SEQS_PER_FILE = 32          # 32 sequences per dp file
 FILES_PER_ITER = 128        # 128 dp files per iteration
 SEQS_PER_ITER = SEQS_PER_FILE * FILES_PER_ITER  # 4096 sequences per iteration
@@ -233,8 +233,7 @@ class LogitsProcessor:
             raise FileNotFoundError(f"Source path {self.src_path} does not exist")
         
         # Create dst path if it doesn't exist
-        if not os.path.exists(self.dst_path):
-            os.makedirs(self.dst_path)
+        os.makedirs(self.dst_path, exist_ok=True)
             
         # Load and verify src->dst mapping if exists
         if os.path.exists(self.dst_path.joinpath(f"consumed_mapping-{self.rank}.json")):

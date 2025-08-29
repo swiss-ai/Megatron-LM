@@ -176,6 +176,7 @@ def get_batch(data_iterator):
 
 # define spiky loss as a variation of 20% or more
 SPIKY_LOSS_PERC = 0.2
+DISTILL_LOSS_WEIGHT = 0.9
 
 
 def loss_func(loss_mask: torch.Tensor, lm_loss: torch.Tensor, distill_loss: torch.Tensor):
@@ -204,21 +205,24 @@ def loss_func(loss_mask: torch.Tensor, lm_loss: torch.Tensor, distill_loss: torc
         distill_loss,
         torch.zeros_like(distill_loss),
     )
+    
+    combined_loss = DISTILL_LOSS_WEIGHT * distill_loss + (1 - DISTILL_LOSS_WEIGHT) * lm_loss
 
-    distill_lm_count = torch.cat([
+    distill_lm_combined_count = torch.cat([
         distill_loss.float().sum().view(1),
         lm_loss.float().sum().view(1),
+        combined_loss.float().sum().view(1),
         loss_mask.float().sum().view(1),
     ])
 
     if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(distill_lm_count, group=mpu.get_context_parallel_group())
+        torch.distributed.all_reduce(distill_lm_combined_count, group=mpu.get_context_parallel_group())
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
         rerun_state_machine.validate_result(
-            result=distill_lm_count[0],
+            result=distill_lm_combined_count[2],
             rejection_func=torch.isnan,
             message="found NaN in local forward loss calculation",
             tolerance=0.0,        # forward pass calculations are determinisic
@@ -227,21 +231,21 @@ def loss_func(loss_mask: torch.Tensor, lm_loss: torch.Tensor, distill_loss: torc
     # Check for spiky loss
     if args.check_for_spiky_loss:
         rerun_state_machine.validate_result(
-            result=distill_lm_count[0],
+            result=distill_lm_combined_count[2],
             rejection_func=partial(rerun_state_machine.is_spiky_loss, threshold=SPIKY_LOSS_PERC),
             message="Spiky loss",
             tolerance=0.0,        # forward pass calculations are determinisic
             fatal=False,
         )
     # Reduce loss for logging.
-    reporting_loss = distill_lm_count.clone().detach()
+    reporting_loss = distill_lm_combined_count.clone().detach()
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
-    local_num_tokens = distill_lm_count[2].clone().detach().to(torch.int)
+    local_num_tokens = distill_lm_combined_count[3].clone().detach().to(torch.int)
     return (
-        distill_lm_count[0] * args.context_parallel_size,
+        distill_lm_combined_count[2] * args.context_parallel_size,
         local_num_tokens,
-        {'distill loss': (reporting_loss[0], reporting_loss[2]), 'lm loss': (reporting_loss[1], reporting_loss[2])},
+        {'distill loss': (reporting_loss[0], reporting_loss[3]), 'lm loss': (reporting_loss[1], reporting_loss[3]), 'combined loss': (reporting_loss[2], reporting_loss[3])},
     )
 
 

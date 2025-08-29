@@ -315,10 +315,9 @@ class GPTModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        with torch.no_grad():
-            lm_loss = self.compute_language_model_loss(labels, logits) # [b s]
-            
-        distill_loss = compute_teacher_loss_custom(teacher_probs, prob_positions, logits, labels).transpose(0, 1).contiguous()
+        
+        lm_loss = self.compute_language_model_loss(labels, logits) # [b s]
+        distill_loss = compute_teacher_loss_custom(teacher_probs, prob_positions, logits, labels).transpose(0, 1).contiguous() # [b s]
 
         return distill_loss, lm_loss
 
