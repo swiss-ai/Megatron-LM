@@ -32,8 +32,8 @@ def _atomic_json_write(path: Path, obj):
 # ---------------------- USER-DEFINED CONSTANTS ----------------------
 RANK = int(os.environ["RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
-PREFETCH_AHEAD_FILES = 2
-N_THREADS = 2
+PREFETCH_AHEAD_FILES = 16
+N_THREADS = 16
 
 SEQLEN = 4096
 TOPK = 256
@@ -290,7 +290,7 @@ class LogitsProcessor:
         
         self.step_iter_dp_to_save()
         if "failed" in payload:
-            logger.warning(f"Failed to load file {iter_dp_to_save}, skipping")
+            return
         else:
             self.step_chunk_to_save()
             
@@ -381,7 +381,7 @@ def main(rank: int, world_size: int):
         processor.step_pipeline()
         if rank == 0:
             pbar.update(1)
-        if i % 100 == 0:
+        if i % 20 == 0:
             processor.dump_progress()
     if rank == 0:
         pbar.close()
