@@ -32,8 +32,8 @@ def _atomic_json_write(path: Path, obj):
 # ---------------------- USER-DEFINED CONSTANTS ----------------------
 RANK = int(os.environ["RANK"])
 WORLD_SIZE = int(os.environ["WORLD_SIZE"])
-PREFETCH_AHEAD_FILES = 16
-N_THREADS = 16
+PREFETCH_AHEAD_FILES = 8
+N_THREADS = 8
 
 SEQLEN = 4096
 TOPK = 256
@@ -347,8 +347,8 @@ class LogitsProcessor:
     def dump_progress(self):
         logger.warning(f"Dumping progress: {self.progress}")
         
-        _atomic_json_write(self.dst_path.joinpath(f"progress-{self.rank}.json"), self.progress)
         _atomic_json_write(self.dst_path.joinpath(f"consumed_mapping-{self.rank}.json"), self.mapping)
+        _atomic_json_write(self.dst_path.joinpath(f"progress-{self.rank}.json"), self.progress)
 
     def close(self):
         for q in (self._iter_dp_q, self._saver_payload_q):
