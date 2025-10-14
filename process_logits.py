@@ -38,7 +38,7 @@ N_THREADS = 8
 SEQLEN = 4096
 TOPK = 256
 SRC_PATH = "/capstor/scratch/cscs/asolergi/main_run_70B_megatron/Megatron-LM/logs/Meg-Runs/main-runs-v1/apertus3-70b-512-nodes-1e-5lr/70b-probs-tensors"
-DST_PATH = "/capstor/store/cscs/swissai/infra01/distillation/70B_processed_logits"
+DST_PATH = "/capstor/store/cscs/swissai/infra01/distillation/70B_TOP256_ws75_logits"
 SEQS_PER_FILE = 32          # 32 sequences per dp file
 FILES_PER_ITER = 128        # 128 dp files per iteration
 SEQS_PER_ITER = SEQS_PER_FILE * FILES_PER_ITER  # 4096 sequences per iteration
@@ -112,14 +112,19 @@ def _load_one_file(orig_iter: int, orig_dp: int, src_path: os.PathLike, iteratio
     index_buffer[:, :, TOPK:2 * TOPK] += 32768
     index_buffer[:, :, 2 * TOPK:3 * TOPK] += 32768 * 2
     index_buffer[:, :, 3 * TOPK:4 * TOPK] += 32768 * 3
+    
+    # Select 256 from logits
+    topk = torch.topk(exp_logits_buffer, TOPK, dim=-1)
+    selected_exp_logits_buffer = topk.values # [T, 32, TOPK]
+    selected_index_buffer = torch.gather(index_buffer, -1, topk.indices) # [T, 32, TOPK]
 
     loss_mask = torch.ones(32, SEQLEN, dtype=torch.bool)
 
     return {
         "input_ids": input_ids_buffer,
         "labels": labels_buffer,
-        "exp_logits": exp_logits_buffer,
-        "index": index_buffer,
+        "exp_logits": selected_exp_logits_buffer,
+        "index": selected_index_buffer,
         "loss_mask": loss_mask,
     }
 
