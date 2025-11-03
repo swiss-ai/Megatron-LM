@@ -22,7 +22,7 @@ logger = getLogger(__name__)
 
 
 # ---------------------- USER-DEFINED CONSTANTS ----------------------
-TENSORS_DIR = "/capstor/store/cscs/swissai/infra01/distillation/70B_processed_logits"
+TENSORS_DIR = "/capstor/store/cscs/swissai/infra01/distillation/70B_TOP256_ws75_logits"
 TOPK = 256
 SEQS_PER_FILE = 32          # 32 sequences per dp file
 FILES_PER_ITER = 128        # 128 dp files per iteration
@@ -39,17 +39,7 @@ def _filepath_for_seq(seq: int) -> str:
 def _load_one_file(seq: int) -> Dict[str, torch.Tensor]:
     """Load a single DP file from disk (CPU tensors) and return the three buffers."""
     file_path = _filepath_for_seq(seq)
-    tensor_sd = torch.load(file_path, weights_only=False)
-    
-    # {
-    #     "input_ids": input_ids_buffer,
-    #     "labels": labels_buffer,
-    #     "exp_logits": exp_logits_buffer,
-    #     "index": index_buffer,
-    #     "loss_mask": loss_mask,
-    # }
-
-    return tensor_sd
+    return torch.load(file_path, weights_only=False)
 
 
 def _prefetch_worker(task_q: mp.Queue, result_q: mp.Queue, *, n_threads: int = 8):

@@ -539,8 +539,8 @@ def get_top_logits_batch(current_seq_counter: int, seqs_to_consume_per_dp: int):
         
         assert batch['input_ids'].shape == (args.micro_batch_size, args.seq_length), f"input_ids shape {batch['input_ids'].shape} != {(args.micro_batch_size, args.seq_length)}"
         assert batch['labels'].shape == (args.micro_batch_size, args.seq_length), f"labels shape {batch['labels'].shape} != {(args.micro_batch_size, args.seq_length)}"
-        assert batch['exp_logits'].shape == (args.seq_length, args.micro_batch_size, 4 * TOPK), f"exp_logits shape {batch['exp_logits'].shape} != {(args.seq_length, args.micro_batch_size, 4 * TOPK)}"
-        assert batch['index'].shape == (args.seq_length, args.micro_batch_size, 4 * TOPK), f"index shape {batch['index'].shape} != {(args.seq_length, args.micro_batch_size, 4 * TOPK)}"
+        assert batch['exp_logits'].shape == (args.seq_length, args.micro_batch_size, TOPK), f"exp_logits shape {batch['exp_logits'].shape} != {(args.seq_length, args.micro_batch_size, TOPK)}"
+        assert batch['index'].shape == (args.seq_length, args.micro_batch_size, TOPK), f"index shape {batch['index'].shape} != {(args.seq_length, args.micro_batch_size, TOPK)}"
         assert batch['loss_mask'].shape == (args.micro_batch_size, args.seq_length), f"loss_mask shape {batch['loss_mask'].shape} != {(args.micro_batch_size, args.seq_length)}"
         assert batch['position_ids'].shape == (args.seq_length,), f"position_ids shape {batch['position_ids'].shape} != {(args.seq_length,)}"
         
@@ -556,8 +556,8 @@ def get_top_logits_batch(current_seq_counter: int, seqs_to_consume_per_dp: int):
     else:
         input_ids = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.int32, device=torch.cuda.current_device())
         labels = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.int32, device=torch.cuda.current_device())
-        exp_logits = torch.empty((args.seq_length, args.micro_batch_size, 4 * TOPK), dtype=torch.float32, device=torch.cuda.current_device())
-        index = torch.empty((args.seq_length, args.micro_batch_size, 4 * TOPK), dtype=torch.int32, device=torch.cuda.current_device())
+        exp_logits = torch.empty((args.seq_length, args.micro_batch_size, TOPK), dtype=torch.float32, device=torch.cuda.current_device())
+        index = torch.empty((args.seq_length, args.micro_batch_size, TOPK), dtype=torch.int32, device=torch.cuda.current_device())
         loss_mask = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.bool, device=torch.cuda.current_device())
         attention_mask=None
         position_ids = torch.arange(args.seq_length, dtype=torch.long, device=torch.cuda.current_device())
