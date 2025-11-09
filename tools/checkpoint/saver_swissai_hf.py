@@ -270,6 +270,17 @@ def save_checkpoint(queue: mp.Queue, args):
                     f"model.layers.{i_layer}.mlp.act_fn.alpha_p": message["mlp xielu alpha p"],
                     f"model.layers.{i_layer}.mlp.act_fn.alpha_n": message["mlp xielu alpha n"],
                 }
+                # Add beta and eps if they exist in the message
+                if "mlp xielu beta" in message:
+                    state_dict[f"model.layers.{i_layer}.mlp.act_fn.beta"] = message["mlp xielu beta"]
+                else:
+                    # Use default value if not present
+                    state_dict[f"model.layers.{i_layer}.mlp.act_fn.beta"] = torch.tensor(0.5)
+                if "mlp xielu eps" in message:
+                    state_dict[f"model.layers.{i_layer}.mlp.act_fn.eps"] = message["mlp xielu eps"]
+                else:
+                    # Use default value if not present
+                    state_dict[f"model.layers.{i_layer}.mlp.act_fn.eps"] = torch.tensor(-1e-6)
             qkv_weights = message["qkv weight"]
             qkv_weights = qkv_weights.reshape(
                 [qkv_total_heads, head_size, llama_conf.hidden_size]
