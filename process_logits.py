@@ -75,6 +75,8 @@ def get_iter_dp_to_jobid(src_path: os.PathLike):
 
 # ---- loader worker functions ----
 def _filepaths_for_key(orig_iter: int, orig_dp: int, src_path: os.PathLike, iteration_dp_to_jobid: Dict[str, Dict[str, list[int]]]) -> list[str]:
+    if str(orig_dp) not in iteration_dp_to_jobid[str(orig_iter)]:
+        return []
     return [os.path.join(src_path, f"{jobid}-iter-{orig_iter}-dp-{orig_dp}") for jobid in iteration_dp_to_jobid[str(orig_iter)][str(orig_dp)]]
 
 
