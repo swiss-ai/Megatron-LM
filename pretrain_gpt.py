@@ -149,11 +149,15 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     return model
 
 
-CURRENT_SEQ_COUNTER = 0
+CURRENT_SEQ_COUNTER = None
 
 
 def get_batch(data_iterator):
     global CURRENT_SEQ_COUNTER
+    if CURRENT_SEQ_COUNTER is None:
+        CURRENT_SEQ_COUNTER = get_args().consumed_train_samples
+        print_rank_0(f"Initializing distill seq counter: {CURRENT_SEQ_COUNTER} sequences")
+    
     """Generate a batch."""
 
     # TODO: this is pretty hacky, find a better way

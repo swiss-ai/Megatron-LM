@@ -1649,6 +1649,9 @@ def _add_learning_rate_args(parser):
     group.add_argument('--lr-warmup-iters', type=int, default=0,
                        help='number of iterations to linearly warmup '
                        'learning rate over.')
+    group.add_argument('--lr-delay-iters', type=int, default=0,
+                       help='number of iterations to linearly warmup '
+                       'learning rate over.')
     group.add_argument('--lr-warmup-samples', type=int, default=0,
                        help='number of samples to linearly warmup '
                        'learning rate over.')

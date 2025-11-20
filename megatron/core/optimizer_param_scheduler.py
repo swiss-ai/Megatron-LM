@@ -53,6 +53,7 @@ class OptimizerParamScheduler:
         override_opt_param_scheduler: Optional[bool] = False,
         wsd_decay_steps: Optional[int] = None,
         lr_wsd_decay_style: Optional[str] = None,
+        lr_delay_steps: int = 0,
     ) -> None:
 
         # Class values.
@@ -70,6 +71,7 @@ class OptimizerParamScheduler:
         self.lr_decay_steps = lr_decay_steps
         self.wsd_decay_steps = wsd_decay_steps
         self.lr_wsd_decay_style = lr_wsd_decay_style
+        self.lr_delay_steps = lr_delay_steps
         assert self.lr_decay_steps > 0
         assert self.lr_warmup_steps < self.lr_decay_steps
 
@@ -128,11 +130,14 @@ class OptimizerParamScheduler:
 
         max_lr = param_group.get('max_lr', self.max_lr)
         min_lr = param_group.get('min_lr', self.min_lr)
+        
+        num_delayed_steps = self.num_steps - self.lr_delay_steps
+        log_single_rank(logger, logging.INFO, f"> num_delayed_steps: {num_delayed_steps}")
 
         # Use linear warmup for the initial part.
-        if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
+        if self.lr_warmup_steps > 0 and num_delayed_steps <= self.lr_warmup_steps:
             return self.init_lr + (
-                (max_lr - self.init_lr) * float(self.num_steps) / float(self.lr_warmup_steps)
+                (max_lr - self.init_lr) * float(num_delayed_steps) / float(self.lr_warmup_steps)
             )
 
         # If the learning rate is constant, just return the initial value.
@@ -140,17 +145,17 @@ class OptimizerParamScheduler:
             return max_lr
 
         # For any steps larger than `self.lr_decay_steps`, use `min_lr`.
-        if self.num_steps > self.lr_decay_steps:
+        if num_delayed_steps > self.lr_decay_steps:
             return min_lr
 
         # If we are done with the warmup period, use the decay style.
         if self.lr_decay_style == 'inverse-square-root':
             warmup_steps = max(self.lr_warmup_steps, 1)
-            num_steps = max(self.num_steps, 1)
+            num_steps = max(num_delayed_steps, 1)
             lr = max_lr * warmup_steps**0.5 / (num_steps**0.5)
             return max(min_lr, lr)
 
-        num_steps_ = self.num_steps - self.lr_warmup_steps
+        num_steps_ = num_delayed_steps - self.lr_warmup_steps
         decay_steps_ = self.lr_decay_steps - self.lr_warmup_steps
         decay_ratio = float(num_steps_) / float(decay_steps_)
         assert decay_ratio >= 0.0
@@ -163,10 +168,10 @@ class OptimizerParamScheduler:
             coeff = 0.5 * (math.cos(math.pi * decay_ratio) + 1.0)
         elif self.lr_decay_style == 'WSD':
             wsd_anneal_start_ = self.lr_decay_steps - self.wsd_decay_steps
-            if self.num_steps <= wsd_anneal_start_:
+            if num_delayed_steps <= wsd_anneal_start_:
                 coeff = 1.0
             else:
-                wsd_steps = self.num_steps - wsd_anneal_start_
+                wsd_steps = num_delayed_steps - wsd_anneal_start_
                 wsd_decay_ratio = float(wsd_steps) / float(self.wsd_decay_steps)
                 if self.lr_wsd_decay_style == "linear":
                     coeff = 1.0 - wsd_decay_ratio

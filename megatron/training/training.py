@@ -653,6 +653,7 @@ def get_optimizer_param_scheduler(optimizer):
             lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
         else:
             lr_warmup_steps = args.lr_warmup_iters * args.global_batch_size
+        lr_delay_steps = args.lr_delay_iters * args.global_batch_size
     # Sample-based training.
     elif args.train_samples:
         # We need to set training iters for later use. Technically
@@ -687,7 +688,8 @@ def get_optimizer_param_scheduler(optimizer):
         use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
         override_opt_param_scheduler=args.override_opt_param_scheduler,
         wsd_decay_steps=wsd_decay_steps,
-        lr_wsd_decay_style=args.lr_wsd_decay_style)
+        lr_wsd_decay_style=args.lr_wsd_decay_style,
+        lr_delay_steps=lr_delay_steps)
 
     return opt_param_scheduler
 
