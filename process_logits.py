@@ -102,8 +102,8 @@ def _load_one_file(orig_iter: int, orig_dp: int, src_path: os.PathLike, iteratio
 
     # Expected shapes after processing:
     # - input_ids: [32, T]  (seq, tokens)
-    # - exp_logits: [T, 32, 4*TOPK]
-    # - index: [T, 32, 4*TOPK] (after offsets applied)
+    # - exp_logits: [T, 32, TOPK]
+    # - index: [T, 32, TOPK] (after offsets applied)
     labels_buffer = tensor_sd["labels"].transpose(0, 1).contiguous()  # [32, T]
     input_ids_buffer = torch.cat([torch.full((32, 1), 1, dtype=labels_buffer.dtype), labels_buffer[:,:-1].clone()], dim=1)
     exp_logits_buffer = tensor_sd["exp_logits"].contiguous()             # [T, 32, 4*TOPK]
