@@ -554,6 +554,14 @@ class _CudaGraphRunner(torch.nn.Module):
         for _, state in get_all_rng_states().items():
             self.fwd_graph.register_generator_state(state)
 
+        # Register RandomSTE generator if it exists (for MoE load-balanced benchmarking)
+        try:
+            from megatron.core.transformer.moe.moe_utils import RandomSTE
+            if RandomSTE.generator is not None:
+                self.fwd_graph.register_generator_state(RandomSTE.generator)
+        except (ImportError, AttributeError):
+            pass
+
         # warmup again as case graph capture mode may execute a different codepath
         for _ in range(self.num_warmup_steps):
             with self.get_quantization_context():
@@ -646,6 +654,14 @@ class _CudaGraphRunner(torch.nn.Module):
         # For cases with multiple active RNG states, e.g. TP.
         for _, state in get_all_rng_states().items():
             self.bwd_graph.register_generator_state(state)
+
+        # Register RandomSTE generator if it exists (for MoE load-balanced benchmarking)
+        try:
+            from megatron.core.transformer.moe.moe_utils import RandomSTE
+            if RandomSTE.generator is not None:
+                self.bwd_graph.register_generator_state(RandomSTE.generator)
+        except (ImportError, AttributeError):
+            pass
 
         if static_grad_outputs is None:
             static_grad_outputs = tuple(
