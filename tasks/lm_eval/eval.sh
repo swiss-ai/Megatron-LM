@@ -12,6 +12,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --dependency=singleton
 
+# export PYTHONUNBUFFERED=1
+
 # NOTE: the eval logs will be created in the directory where the user is calling this file (eval.sh) from
 
 

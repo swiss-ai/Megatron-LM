@@ -107,7 +107,8 @@ class EvalHarnessAdaptor(HFLM):
                          batch_size=batch_size,
                          trust_remote_code=trust_remote_code,
                          max_length=max_length,
-                         tokenizer=self.tokenizer)
+                         tokenizer=self.tokenizer,
+                         **kwargs)
 
     def _create_model(
         self,
@@ -198,12 +199,16 @@ class EvalHarnessAdaptor(HFLM):
         loglikelihoods = []
         with torch.no_grad():
             for string, in tqdm(requests):
-                rolling_token_windows = list(map(utils.make_disjoint_window, utils.get_rolling_token_windows(
-                    token_list=self.tok_encode(string, add_special_tokens=False),
-                    prefix_token=self.eot_token_id,
-                    max_seq_len=self.max_length,
-                    context_len=1,
-                )))
+                rolling_token_windows = list(
+                    map(
+                        utils.make_disjoint_window, utils.get_rolling_token_windows(
+                        token_list=self.tok_encode(string),
+                        prefix_token=self.prefix_token_id,
+                        max_seq_len=self.max_length,
+                        context_len=1,
+                        )
+                    )
+                )
 
                 rolling_token_windows = [(None,) + x for x in rolling_token_windows]
 
@@ -276,7 +281,7 @@ class EvalHarnessAdaptor(HFLM):
                 for _, context_enc, continuation_enc in chunk:
                     # when too long to fit in context, truncate from the left (remove left part)
                     input = torch.tensor(
-                        (context_enc + continuation_enc)[-(self.max_length + 1):][:-1]
+                        (context_enc + continuation_enc)[-(self.max_length + 1):][:-1] # Dont' grab the last token
                         , dtype=torch.long).to(self.device)
                     input_len, = input.shape
 
@@ -297,14 +302,15 @@ class EvalHarnessAdaptor(HFLM):
                     continuation_lens.append(continuation)
                     input_lens.append(input_len)
 
-                logits = self._model_call(torch.cat(inputs, dim=0))
+                logits = self._model_call(torch.cat(inputs, dim=0)) # [batch, seq, vocab]
                 res_len += len(chunk) # to do the normalization of logits by length of text
                 if logits is not None:
-                    multi_logits = F.log_softmax(logits, dim=-1).cpu()  # [batch, seq, vocab]
+                    multi_logits = F.log_softmax(logits, dim=-1, dtype=self.softmax_dtype).cpu()  # [batch, seq, vocab]
 
                     for (cache_key, _, _), logits, inp, input_len, continuation_toks in zip(chunk, multi_logits, inputs, input_lens, continuation_lens):
                         contlen = len(continuation_toks)
-                        logits = logits[input_len - contlen:input_len].unsqueeze(0)  # [1, seq, vocab]
+                        logits = self._select_cont_toks(logits, contlen=contlen, inplen=input_len).unsqueeze(0)  # [1, seq, vocab]
+
                         greedy_tokens = logits.argmax(dim=-1) # chose from vocab token with highest prob
                         # cont_toks :: [1, seq]
                         continuation_toks = torch.tensor(continuation_toks, dtype=torch.long).unsqueeze(0)
@@ -339,15 +345,14 @@ class EvalHarnessAdaptor(HFLM):
         special_tokens_kwargs = _add_special_kwargs(
             add_special_tokens, self.add_bos_token
         )
-        # set add_special_tokens=False if the string already starts with BOS token.
+        # set add_special_tokens=False if the string already starts with BOS token (in loglikelihood_rolling is added with the prefix_token_id option)
         if add_special_tokens is None and has_bos_prefix(
-            string, self.tokenizer.detokenize(self.prefix_token_id)
+            string, self.tokenizer.detokenize([self.prefix_token_id])
         ):
             special_tokens_kwargs["add_special_tokens"] = False
 
-        # Megatron tokenizer doesn't use add_special_tokens parameter
-        # It handles special tokens based on the tokenizer configuration
-        encoding = self.tokenizer.tokenize(string, *special_tokens_kwargs)
+        # We are using the huggingface tokenizer from megatron
+        encoding = self.tokenizer.tokenize(string, **special_tokens_kwargs)
 
         # left-truncate the encoded context to be at most `left_truncate_len` tokens long
         if left_truncate_len:
@@ -509,3 +514,28 @@ class EvalHarnessAdaptor(HFLM):
 
         clear_torch_cache()
         return batch_size
+
+    def _select_cont_toks(
+        self,
+        logits: torch.Tensor,
+        contlen: int | None = None,
+        inplen: int | None = None,
+    ) -> torch.Tensor:
+        if self.backend == "causal":
+            assert contlen and inplen, (
+                "Must pass input len and cont. len to select scored logits for causal LM"
+            )
+            # discard right-padding.
+            # also discard the input/context tokens. we'll only score continuations.
+            logits = logits[inplen - contlen : inplen]
+        elif self.backend == "seq2seq":
+            # NOTE: For now we have only checked the cauasal LM case
+            assert False, "Seq2SeqLM loglikelihood hasn't been tested yet"
+            assert contlen and not inplen, (
+                "Selecting scored logits for Seq2SeqLM requires only cont. len"
+            )
+            # only discard right-padding.
+            # the logits input to this fn only contain decoder-side tokens.
+            logits = logits[:contlen]
+
+        return logits
