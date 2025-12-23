@@ -89,6 +89,7 @@ class EvalHarnessAdaptor(HFLM):
         trust_remote_code: Optional[bool] = False,
         **kwargs,
     ) -> None:
+        # TODO: We should grab tokenizer from the checkpoint not from passing the name with arguments when calling the eval script
         self.args = get_args()
         build_tokenizer(self.args)
         self.tokenizer = get_tokenizer()
