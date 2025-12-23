@@ -24,6 +24,8 @@
 
 # we use ngc 25.06 container
 
+export HF_DATASETS_TRUST_REMOTE_CODE=1
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --model_dir)
