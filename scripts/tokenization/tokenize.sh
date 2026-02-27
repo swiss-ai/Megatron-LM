@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=288
-#SBATCH --environment=/capstor/store/cscs/swissai/a06/containers/data-pipeline-pretrain/data-pipeline.toml # WARN(tj.solergibert) Modify path to your own file
+#SBATCH --environment=/capstor/scratch/cscs/dtamayomela/containers/data-pipeline.toml # WARN(tj.solergibert) Modify path to your own file
 #SBATCH --no-requeue
 
 input_folder=$1
