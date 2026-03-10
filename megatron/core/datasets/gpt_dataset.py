@@ -76,6 +76,20 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     modality_weights: Optional[Dict[str, float]] = None
     """Per-modality loss weights keyed by modality name (e.g., vision/audio)."""
 
+    sft_plw: float = 0.0
+    """Prompt loss weight for user tokens (0 = fully masked). Used by ApertusSFTDataset."""
+
+    sft_load_loss_mask: bool = False
+    """Load pre-computed loss masks from tokenized data. Used by ApertusSFTDataset."""
+
+    sft_mask_special_tokens: bool = False
+    """Mask special tokens (BOS, EOD, assistant begin) from loss. Used by ApertusSFTDataset."""
+
+    sft_pack_samples: bool = False
+    """Pack multiple whole documents per sequence. Used by ApertusSFTDataset."""
+
+    sft_equalize_sample_loss: bool = False
+    """Normalize loss per sample segment. Used by ApertusSFTDataset."""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
