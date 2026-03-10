@@ -347,6 +347,10 @@ def tuple_type(x):
 
 def validate_args(args, defaults={}):
 
+    if args.ap_sft:
+        assert args.calculate_per_token_loss, \
+            '--ap-sft requires --calculate-per-token-loss for correct loss normalization'
+
     # Temporary
     assert args.non_persistent_ckpt_type in ['global', 'local', None], \
         'Currently only global and local checkpoints are supported'
@@ -3740,4 +3744,17 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
+    group.add_argument('--ap-sft', action="store_true",
+                       help='Enable Apertus model SFT training. Assumes --calculate-per-token-loss is activated.')
+    group.add_argument('--ap-sft-pack-samples', action="store_true",
+                       help='Pack multiple whole documents per sequence. Doesnt spread one document across sequences. '
+                            'Only packs full sequences and adds padding to reach full seq len.')
+    group.add_argument('--ap-sft-plw', type=float, default=0.0,
+                       help='Prompt loss weight for user tokens (0 = fully masked)')
+    group.add_argument('--ap-sft-load-loss-mask', action="store_true",
+                       help='Load pre-computed loss masks from tokenized data')
+    group.add_argument('--ap-sft-mask-special-tokens', action="store_true",
+                       help='Mask special tokens (BOS, EOD, assistant begin) from loss')
+    group.add_argument('--ap-sft-equalize-sample-loss', action="store_true",
+                       help='Normalize loss per sample segment')
     return parser
