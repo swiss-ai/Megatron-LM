@@ -102,9 +102,10 @@ def populate_omni_metadata_from_tokenizer(
     - `args.omnimodal_config`
     - `args.{name}_token_offset`, `args.{name}_vocab_size` for each modality entry
     - `tokenizer.goldfish_exemption_range`
+    - `tokenizer.sft_assistant_begin_sequence`, `tokenizer.sft_assistant_end_sequence`
 
     Metadata source:
-    - tokenizer `init_kwargs` keys: `base_vocab_size`, `omnimodal_config`
+    - tokenizer `init_kwargs` keys: `base_vocab_size`, `omnimodal_config`, `sft_assistant_begin_sequence`, `sft_assistant_end_sequence`
     - falls back to already-populated `args.*` when direct kwargs are unavailable
     """
     init_kwargs = extract_tokenizer_init_kwargs(tokenizer)
@@ -135,6 +136,26 @@ def populate_omni_metadata_from_tokenizer(
             print(
                 " > loaded omnimodal_config with modalities: "
                 f"{[m.get('name') for m in omnimodal_config.get('modalities', []) if m.get('name')]}",
+                flush=True,
+            )
+
+    # Load SFT sequences from tokenizer init_kwargs
+    sft_assistant_begin_sequence = init_kwargs.get("sft_assistant_begin_sequence")
+    sft_assistant_end_sequence = init_kwargs.get("sft_assistant_end_sequence")
+    
+    if sft_assistant_begin_sequence is not None:
+        tokenizer.sft_assistant_begin_sequence = sft_assistant_begin_sequence
+        if getattr(args, "rank", None) == 0:
+            print(
+                f" > loaded sft_assistant_begin_sequence: {sft_assistant_begin_sequence}",
+                flush=True,
+            )
+    
+    if sft_assistant_end_sequence is not None:
+        tokenizer.sft_assistant_end_sequence = sft_assistant_end_sequence
+        if getattr(args, "rank", None) == 0:
+            print(
+                f" > loaded sft_assistant_end_sequence: {sft_assistant_end_sequence}",
                 flush=True,
             )
 
