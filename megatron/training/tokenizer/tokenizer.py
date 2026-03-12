@@ -17,6 +17,7 @@ from .gpt2_tokenization import GPT2Tokenizer
 from megatron.training.tokenizer.multimodal_tokenizer import MultimodalTokenizer
 from megatron.training.tokenizer.sft_tokenizer import SFTTokenizer
 from megatron.training.tokenizer.tokenizer_omni_metadata import populate_omni_metadata_from_tokenizer
+from megatron.training.tokenizer.tokenizer_sft_metadata import populate_sft_information_from_tokenizer
 
 
 def build_tokenizer(args, **kwargs):
@@ -119,6 +120,9 @@ def build_tokenizer(args, **kwargs):
         print_loaded_modalities=True,
         reset_goldfish_exemption=True,
     )
+
+    # add sft metadata if exists
+    populate_sft_information_from_tokenizer(args, tokenizer)
 
     return tokenizer
 

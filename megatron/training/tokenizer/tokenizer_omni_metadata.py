@@ -139,26 +139,6 @@ def populate_omni_metadata_from_tokenizer(
                 flush=True,
             )
 
-    # Load SFT sequences from tokenizer init_kwargs
-    sft_assistant_begin_sequence = init_kwargs.get("sft_assistant_begin_sequence")
-    sft_assistant_end_sequence = init_kwargs.get("sft_assistant_end_sequence")
-    
-    if sft_assistant_begin_sequence is not None:
-        tokenizer.sft_assistant_begin_sequence = sft_assistant_begin_sequence
-        if getattr(args, "rank", None) == 0:
-            print(
-                f" > loaded sft_assistant_begin_sequence: {sft_assistant_begin_sequence}",
-                flush=True,
-            )
-    
-    if sft_assistant_end_sequence is not None:
-        tokenizer.sft_assistant_end_sequence = sft_assistant_end_sequence
-        if getattr(args, "rank", None) == 0:
-            print(
-                f" > loaded sft_assistant_end_sequence: {sft_assistant_end_sequence}",
-                flush=True,
-            )
-
     if reset_goldfish_exemption:
         tokenizer.goldfish_exemption_range = None
     if getattr(tokenizer, "goldfish_exemption_range", None) is None:

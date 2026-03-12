@@ -50,6 +50,7 @@ from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.training.initialize import initialize_megatron
 from megatron.training.tokenizer.tokenizer_omni_metadata import populate_omni_metadata_from_tokenizer
+from megatron.training.tokenizer.tokenizer_sft_metadata import populate_sft_information_from_tokenizer
 from megatron.training.utils import get_blend_and_blend_per_split
 
 
@@ -69,6 +70,7 @@ def core_gpt_dataset_config_from_args(args):
 
     # Keep tokenizer-derived metadata behavior aligned with pretrain_gpt.py.
     populate_omni_metadata_from_tokenizer(args, tokenizer)
+    populate_sft_information_from_tokenizer(args, tokenizer)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]

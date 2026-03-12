@@ -23,6 +23,7 @@ from megatron.training.datasets.apertus_sft_dataset import ApertusSFTDataset
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.tokenizer.tokenizer_omni_metadata import populate_omni_metadata_from_tokenizer
+from megatron.training.tokenizer.tokenizer_sft_metadata import populate_sft_information_from_tokenizer
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -527,6 +528,7 @@ def core_gpt_dataset_config_from_args(args):
     # Populate metadata for both tokenizer paths. This keeps goldfish exemption and
     # modality offsets/vocab available to GPT dataset construction and reporting.
     populate_omni_metadata_from_tokenizer(args, tokenizer)
+    populate_sft_information_from_tokenizer(args, tokenizer)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
