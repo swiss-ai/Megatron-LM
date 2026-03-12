@@ -178,11 +178,11 @@ class ApertusSFTDataset(GPTDataset):
         cache_suffix = " (loaded from cache)" if from_cache else ""
         packing_efficiency = 100 * num_tokens_per_epoch / total_tokens_in_samples if total_tokens_in_samples > 0 else 0
 
-        log_single_rank(logger, logging.INFO, f"> ===== SFT Packing Statistics{cache_suffix} =====")
+        log_single_rank(logger, logging.INFO, f"> ===== SFT Packing Statistics (ONE EPOCH){cache_suffix} =====")
         log_single_rank(logger, logging.INFO, f" > #docs in epoch:                    {len(document_index):>12}")
-        log_single_rank(logger, logging.INFO, f" > #tokens for all docs:              {num_tokens_per_epoch:>12,}")
+        log_single_rank(logger, logging.INFO, f" > #tokens in epoch:                  {num_tokens_per_epoch:>12,}")
         log_single_rank(logger, logging.INFO, f" > Sequence length:                   {sequence_length:>12}")
-        log_single_rank(logger, logging.INFO, f" > #packed samples:                   {num_samples_available:>12,}")
+        log_single_rank(logger, logging.INFO, f" > #packed samples (per epoch):       {num_samples_available:>12,}")
         log_single_rank(logger, logging.INFO, f" > #tokens(incl. padding) in samples: {total_tokens_in_samples:>12,}")
         log_single_rank(logger, logging.INFO, f" > Average #tokens/sample:            {avg_tokens_per_sample:>12.1f}")
         log_single_rank(logger, logging.INFO, f" > Average #documents/sample:         {avg_documents_per_sample:>12.2f}")
