@@ -361,7 +361,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
             assistant_mask_flat = assistant_mask.view(-1).float()
             assistant_loss_sum = torch.sum(losses * assistant_mask_flat)
             assistant_count = assistant_mask_flat.sum().clone().detach().to(torch.int)
-            report['assistant loss'] = torch.cat([
+            report['assistant_loss'] = torch.cat([
                 assistant_loss_sum.clone().detach().view(1), assistant_count.view(1)
             ])
 
