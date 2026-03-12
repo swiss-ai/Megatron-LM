@@ -18,6 +18,17 @@ from megatron.core.utils import log_single_rank
 logger = logging.getLogger(__name__)
 
 
+def _pad_sequence_if_needed(document, target_length: int, padding_value):
+    """
+    Pad a sequence to max length if needed. Returns unchanged if not.
+    """
+    if len(document) >= target_length:
+        return document
+
+    padding_length = target_length - len(document)
+    return np.concatenate([document, np.full(padding_length, padding_value, dtype=document.dtype)])
+
+
 class ApertusSFTDataset(GPTDataset):
     """Apertus SFT dataset for supervised fine-tuning on pre-tokenized data.
 
@@ -55,6 +66,8 @@ class ApertusSFTDataset(GPTDataset):
 
         self.sft_plw_value = config.sft_plw
         log_single_rank(logger, logging.INFO, f"SFT PLW: {self.sft_plw_value}", )
+
+        self.truncate_right = config.sft_truncate_right
 
         self.tokenizer = config.tokenizer
         # Set pad token
@@ -161,17 +174,16 @@ class ApertusSFTDataset(GPTDataset):
         avg_tokens_per_sample = num_tokens_per_epoch / num_samples_available if num_samples_available > 0 else 0
         avg_documents_per_sample = len(document_index) / num_samples_available if num_samples_available > 0 else 0
 
-        # Log packing statistics
         cache_suffix = " (loaded from cache)" if from_cache else ""
         log_single_rank(logger, logging.INFO, f"> ===== SFT Packing Statistics{cache_suffix} =====")
-        log_single_rank(logger, logging.INFO, f"> Total documents in epoch: {len(document_index)}")
-        log_single_rank(logger, logging.INFO, f"> Total tokens in documents: {num_tokens_per_epoch:,}")
-        log_single_rank(logger, logging.INFO, f"> Sequence length: {sequence_length}")
-        log_single_rank(logger, logging.INFO, f"> Number of packed samples: {num_samples_available:,}")
-        log_single_rank(logger, logging.INFO, f"> Total tokens in samples: {total_tokens_in_samples:,}")
-        log_single_rank(logger, logging.INFO, f"> Average tokens per sample: {avg_tokens_per_sample:.1f}")
-        log_single_rank(logger, logging.INFO, f"> Average documents per sample: {avg_documents_per_sample:.2f}")
-        log_single_rank(logger, logging.INFO, f"> Token utilization: {100 * num_tokens_per_epoch / total_tokens_in_samples:.2f}%\n\n")
+        log_single_rank(logger, logging.INFO, f" > #docs in epoch:          {len(document_index):>10}")
+        log_single_rank(logger, logging.INFO, f" > #tokens for all docs:    {num_tokens_per_epoch:>10,}")
+        log_single_rank(logger, logging.INFO, f" > Sequence length:         {sequence_length:>10}")
+        log_single_rank(logger, logging.INFO, f" > #packed samples: {num_samples_available:>10,}")
+        log_single_rank(logger, logging.INFO, f" > #tokens(incl. padding) in samples: {total_tokens_in_samples:>10,}")
+        log_single_rank(logger, logging.INFO, f" > Average #tokens/sample: {avg_tokens_per_sample:>10.1f}")
+        log_single_rank(logger, logging.INFO, f" > Average #documents/sample: {avg_documents_per_sample:>10.2f}")
+        log_single_rank(logger, logging.INFO, f" > Packing efficiency:       {100 * num_tokens_per_epoch / total_tokens_in_samples:>10.2f}%\n\n")
 
     def _build_packing_document_to_sample_indices(self):
         """
@@ -373,6 +385,24 @@ class ApertusSFTDataset(GPTDataset):
 
         return document_index
 
+    def _truncate_sequence_if_needed(self, document, target_length: int, added_token_on_right_truncate):
+        """
+        Truncate a document to max length if needed(exceeds model seq len). Returns unchanged if not.
+        Depending on left and right truncation:
+            - right: keep seq-len -1 tokens in beginning + add eod in the end
+            - left: keep seq-len tokens in the end of document. No need to append eod as it's assumed to exist.
+
+        added_token_on_right_truncate: added to right truncated sequence can be eod or other value.
+        """
+        if len(document) <= target_length:
+            return document
+
+        if self.truncate_right:
+            return np.concatenate([document[:target_length - 1], np.array([added_token_on_right_truncate], dtype=document.dtype)])
+        else:
+            # by default do left truncation (keep tokens in the end)
+            return document[-target_length + 1:]
+
     def _get_packed_sample(self, idx: int) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
         """
         Load and concatenate multiple whole documents for a packed sample.
@@ -416,24 +446,15 @@ class ApertusSFTDataset(GPTDataset):
                 doc_loss_mask = document[doc_len:]
 
                 # Truncate document and end with EOD if too long
-                if len(doc_tokens) > target_length:
-                    logger.warning(
-                        f"Document {doc_id} in packed sample is too long ({len(doc_tokens)} > {target_length}), truncating")
-                    doc_tokens = np.concatenate([doc_tokens[:target_length - 1], np.array([self._eod_token_id], dtype=np.int64)])
-                    doc_loss_mask = doc_loss_mask[:target_length - 1]
-                    # Append 0.0 for the EOD token in loss_mask
-                    doc_loss_mask = np.concatenate([doc_loss_mask, np.array([0.0], dtype=np.float32)])
+                doc_tokens = self._truncate_sequence_if_needed(doc_tokens, target_length, self._eod_token_id)
+                doc_loss_mask = self._truncate_sequence_if_needed(doc_loss_mask, target_length, 0.0)
 
                 document_tokens.append(doc_tokens)
                 document_loss_masks.append(doc_loss_mask)
                 doc_end_indices.append(doc_tokens.size)
             else:
                 # Original behavior: no loss mask splitting
-                if len(document) > target_length:
-                    logger.warning(
-                        f"Document {doc_id} in packed sample is too long ({len(document)} > {target_length}), truncating")
-                    document = np.concatenate([document[:target_length - 1], np.array([self._eod_token_id], dtype=np.int64)])
-
+                document = self._truncate_sequence_if_needed(document, target_length, self._eod_token_id)
                 document_tokens.append(document)
                 doc_end_indices.append(document.size)
 
@@ -448,14 +469,11 @@ class ApertusSFTDataset(GPTDataset):
         else:
             raise RuntimeError("Encountered empty packed sample. This should not happen!")
 
-        # Pad to target length
-        if len(text) < target_length:
-            padding_length = target_length - len(text)
-            text = np.concatenate([text, np.full(padding_length, self._pad_token_id, dtype=np.int64)])
-            if self.config.sft_load_loss_mask:
-                # Pad loss_mask with 0.0 (padding tokens should have 0 loss)
-                loss_mask_data = np.concatenate([loss_mask_data, np.zeros(padding_length, dtype=np.float32)])
-        elif len(text) > target_length:
+        text = _pad_sequence_if_needed(text, target_length, self._pad_token_id)
+        if self.config.sft_load_loss_mask:
+            # Pad loss_mask with 0.0 (padding tokens should have 0 loss)
+            loss_mask_data = _pad_sequence_if_needed(loss_mask_data, target_length, 0.0)
+        if len(text) > target_length:
             # This should never happen with correct packing - raise error
             raise RuntimeError(
                 f"Packed sample {idx} exceeded target length ({len(text)} > {target_length}). "
@@ -498,34 +516,21 @@ class ApertusSFTDataset(GPTDataset):
 
             # Truncate or pad to sequence_length
             target_length = self.model_seq_length + self.config.add_extra_token_to_sequence
-            if len(doc_tokens) >= target_length:
-                # End truncated document with end-of-document token
-                logger.warning(f"Document {actual_doc_id} is longer than model sequence length {target_length} and gets trunc")
-                trunc_doc = doc_tokens[:target_length-1]
-                text = np.concatenate([trunc_doc, np.array([self._eod_token_id], dtype=np.int64)])
-                preloaded_loss_mask = doc_loss_mask[:target_length-1]
-                # Add 0.0 for the EOD token in loss_mask
-                preloaded_loss_mask = np.concatenate([preloaded_loss_mask, np.array([0.0], dtype=np.float32)])
-            else:
-                padding_length = target_length - len(doc_tokens)
-                # Pad on right side with pad token and add 0 for respective loss mask
-                text = np.concatenate([doc_tokens, np.full(padding_length, self._pad_token_id, dtype=np.int64)])
-                preloaded_loss_mask = np.concatenate([doc_loss_mask, np.zeros(padding_length, dtype=np.float32)])
+            text = self._truncate_sequence_if_needed(doc_tokens, target_length, self._eod_token_id)
+            preloaded_loss_mask = self._truncate_sequence_if_needed(doc_loss_mask, target_length, 0.0)
+
+            text = _pad_sequence_if_needed(text, target_length, self._pad_token_id)
+            preloaded_loss_mask = _pad_sequence_if_needed(preloaded_loss_mask, target_length, 0.0)
         else:
             # Normal mode
             eos_idx = np.array([document.size - 1], dtype=np.int64)
 
             # Truncate or pad to sequence_length
             target_length = self.model_seq_length + self.config.add_extra_token_to_sequence
-            if len(document) >= target_length:
-                # End truncated document with end-of-document token
-                logger.warning(f"Document {actual_doc_id} is longer than model sequence length {target_length} and gets trunc")
-                trunc_doc = document[:target_length-1]
-                text = np.concatenate([trunc_doc, np.array([self._eod_token_id], dtype=np.int64)])
-            else:
-                padding_length = target_length - len(document)
-                # Pad on right side with pad token
-                text = np.concatenate([document, np.full(padding_length, self._pad_token_id, dtype=np.int64)])
+            text = self._truncate_sequence_if_needed(document, target_length, self._eod_token_id)
+
+            # Pad on right side with pad token
+            text = _pad_sequence_if_needed(text, target_length, self._pad_token_id)
 
         return text, eos_idx, preloaded_loss_mask
 
