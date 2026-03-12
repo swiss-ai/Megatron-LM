@@ -47,6 +47,7 @@ class ApertusSFTDataset(GPTDataset):
          optionally be masked via --ap-sft-mask-special-tokens.
 
     Note: Goldfish loss (--goldfish-loss) is not supported and will be ignored if enabled.
+    Note: Omnimodal weighting during loss mask creation is not supported. We simply have all assistant tokens unmasked.
     """
     def __init__(
         self,
@@ -175,15 +176,17 @@ class ApertusSFTDataset(GPTDataset):
         avg_documents_per_sample = len(document_index) / num_samples_available if num_samples_available > 0 else 0
 
         cache_suffix = " (loaded from cache)" if from_cache else ""
+        packing_efficiency = 100 * num_tokens_per_epoch / total_tokens_in_samples if total_tokens_in_samples > 0 else 0
+
         log_single_rank(logger, logging.INFO, f"> ===== SFT Packing Statistics{cache_suffix} =====")
-        log_single_rank(logger, logging.INFO, f" > #docs in epoch:          {len(document_index):>10}")
-        log_single_rank(logger, logging.INFO, f" > #tokens for all docs:    {num_tokens_per_epoch:>10,}")
-        log_single_rank(logger, logging.INFO, f" > Sequence length:         {sequence_length:>10}")
-        log_single_rank(logger, logging.INFO, f" > #packed samples: {num_samples_available:>10,}")
-        log_single_rank(logger, logging.INFO, f" > #tokens(incl. padding) in samples: {total_tokens_in_samples:>10,}")
-        log_single_rank(logger, logging.INFO, f" > Average #tokens/sample: {avg_tokens_per_sample:>10.1f}")
-        log_single_rank(logger, logging.INFO, f" > Average #documents/sample: {avg_documents_per_sample:>10.2f}")
-        log_single_rank(logger, logging.INFO, f" > Packing efficiency:       {100 * num_tokens_per_epoch / total_tokens_in_samples:>10.2f}%\n\n")
+        log_single_rank(logger, logging.INFO, f" > #docs in epoch:                    {len(document_index):>12}")
+        log_single_rank(logger, logging.INFO, f" > #tokens for all docs:              {num_tokens_per_epoch:>12,}")
+        log_single_rank(logger, logging.INFO, f" > Sequence length:                   {sequence_length:>12}")
+        log_single_rank(logger, logging.INFO, f" > #packed samples:                   {num_samples_available:>12,}")
+        log_single_rank(logger, logging.INFO, f" > #tokens(incl. padding) in samples: {total_tokens_in_samples:>12,}")
+        log_single_rank(logger, logging.INFO, f" > Average #tokens/sample:            {avg_tokens_per_sample:>12.1f}")
+        log_single_rank(logger, logging.INFO, f" > Average #documents/sample:         {avg_documents_per_sample:>12.2f}")
+        log_single_rank(logger, logging.INFO, f" > Packing efficiency:                {packing_efficiency:>11.2f}%\n\n")
 
     def _build_packing_document_to_sample_indices(self):
         """
@@ -401,7 +404,7 @@ class ApertusSFTDataset(GPTDataset):
             return np.concatenate([document[:target_length - 1], np.array([added_token_on_right_truncate], dtype=document.dtype)])
         else:
             # by default do left truncation (keep tokens in the end)
-            return document[-target_length + 1:]
+            return document[-target_length:]
 
     def _get_packed_sample(self, idx: int) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
         """
@@ -512,22 +515,25 @@ class ApertusSFTDataset(GPTDataset):
             doc_len = len(document) // 2
             doc_tokens = document[:doc_len]
             doc_loss_mask = document[doc_len:]
-            eos_idx = np.array([doc_tokens.size - 1], dtype=np.int64)
 
             # Truncate or pad to sequence_length
             target_length = self.model_seq_length + self.config.add_extra_token_to_sequence
             text = self._truncate_sequence_if_needed(doc_tokens, target_length, self._eod_token_id)
             preloaded_loss_mask = self._truncate_sequence_if_needed(doc_loss_mask, target_length, 0.0)
 
+            # Compute eos_idx after truncation but before padding
+            eos_idx = np.array([len(text) - 1], dtype=np.int64)
+
             text = _pad_sequence_if_needed(text, target_length, self._pad_token_id)
             preloaded_loss_mask = _pad_sequence_if_needed(preloaded_loss_mask, target_length, 0.0)
         else:
             # Normal mode
-            eos_idx = np.array([document.size - 1], dtype=np.int64)
-
             # Truncate or pad to sequence_length
             target_length = self.model_seq_length + self.config.add_extra_token_to_sequence
             text = self._truncate_sequence_if_needed(document, target_length, self._eod_token_id)
+
+            # Compute eos_idx after truncation but before padding
+            eos_idx = np.array([len(text) - 1], dtype=np.int64)
 
             # Pad on right side with pad token
             text = _pad_sequence_if_needed(text, target_length, self._pad_token_id)
@@ -639,6 +645,10 @@ class ApertusSFTDataset(GPTDataset):
 
         # 1) unmask assistant parts and set rest to plw value (if not loaded from disk) otherwise assistant loss needed
         #    to keep track of assistant loss
+        # NOTE: Left truncation can cut into an assistant response, leaving an orphaned end_seq
+        # with no preceding begin_seq. In that case tokens before the first end_seq are incorrectly
+        # treated as non-assistant. A fix would detect orphaned end markers and mask 0..first_end
+        # as assistant. Same applies to right truncation of pre-packed data cutting through a begin_seq.
         begin_seq = self._sft_assistant_begin_sequence.to(dtype=data.dtype, device=data.device)
         end_seq = self._sft_assistant_end_sequence.to(dtype=data.dtype, device=data.device)
         assistant_mask = get_matching_mask_by_start_end(data, begin_seq, end_seq)
@@ -751,6 +761,9 @@ def get_matching_mask_by_start_end(sequence, begin_seq: torch.Tensor, end_seq: t
     """
     Given a sequence and a start and end query, return a mask indicating which positions in the sequence
     are between the start and end queries (inclusive).
+
+    Limitation: If the sequence starts mid-region (e.g. due to left truncation), an orphaned end_seq
+    without a preceding begin_seq will be ignored, leaving those leading tokens unmasked.
     """
     mask = torch.zeros(len(sequence), dtype=torch.bool, device=sequence.device)
     begin_len = len(begin_seq)
