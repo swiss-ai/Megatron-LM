@@ -132,6 +132,7 @@ def core_gpt_dataset_config_from_args(args):
         sft_pack_samples=args.ap_sft_pack_samples,
         sft_equalize_sample_loss=args.ap_sft_equalize_sample_loss,
         sft_load_loss_mask=args.ap_sft_load_loss_mask,
+        sft_truncate_right=args.ap_sft_truncate_right,
     )
 
 
@@ -222,7 +223,7 @@ def main():
 
     print_rank_0("=" * 80)
     print_rank_0("SFT Dataset Initialization Script")
-    print_rank_0("This script will build the dataset index and report packed sample counts")
+    print_rank_0("This script will build the dataset index and report ONE-EPOCH packing statistics")
     print_rank_0("=" * 80)
     print_rank_0("")
     print_rank_0("IMPORTANT: SEED must match your intended training run! It determines packing and thus num of samples.")
