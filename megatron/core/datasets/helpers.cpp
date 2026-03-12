@@ -932,7 +932,7 @@ PYBIND11_MODULE(helpers_cpp, m)
   m.def("build_blocks_mapping", &build_blocks_mapping);
   m.def("build_sample_idx_int32", &build_sample_idx<int32_t>);
   m.def("build_sample_idx_int64", &build_sample_idx<int64_t>);
-   m.def("build_sample_idx_packed_whole_docs_int32", &build_sample_idx_packed_whole_docs<int32_t>);
+  m.def("build_sample_idx_packed_whole_docs_int32", &build_sample_idx_packed_whole_docs<int32_t>);
   m.def("build_sample_idx_packed_whole_docs_int64", &build_sample_idx_packed_whole_docs<int64_t>);
   m.def("build_blending_indices", &build_blending_indices);
   m.def("build_exhaustive_blending_indices", &build_exhaustive_blending_indices);

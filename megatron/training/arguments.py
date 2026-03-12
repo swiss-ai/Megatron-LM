@@ -3742,4 +3742,7 @@ def _add_sft_args(parser):
                        help='Mask special tokens (BOS, EOD, assistant begin) from loss')
     group.add_argument('--ap-sft-equalize-sample-loss', action="store_true",
                        help='Normalize loss per sample segment')
+    group.add_argument('--ap-sft-truncate-right', action="store_true",
+                       help='Truncate documents from the right side instead of the left. '
+                            'If a document is too long it we keep tokens in the beginning if this option is given.')
     return parser

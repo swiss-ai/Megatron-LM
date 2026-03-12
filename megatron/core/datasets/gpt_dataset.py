@@ -91,6 +91,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     sft_equalize_sample_loss: bool = False
     """Normalize loss per sample segment. Used by ApertusSFTDataset."""
 
+    sft_truncate_right: bool = False
+    """If sample is too long for context, throw away tokens in the end"""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
