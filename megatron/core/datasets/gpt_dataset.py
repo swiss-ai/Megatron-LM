@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 _GOLDFISH_TOKEN_ID = -2
 _HASH_TABLE_SIZE = 1_000_003
+_PAD_TOKEN_ID = -1
 
 @dataclass
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
