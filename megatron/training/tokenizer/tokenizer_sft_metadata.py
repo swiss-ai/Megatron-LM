@@ -1,6 +1,6 @@
 from typing import Any
 
-from tokenizer_omni_metadata import extract_tokenizer_init_kwargs
+from megatron.training.tokenizer.tokenizer_omni_metadata import extract_tokenizer_init_kwargs
 
 
 def populate_sft_information_from_tokenizer(args, tokenizer: Any):

@@ -28,7 +28,7 @@ Example (for a training run with TP=8, PP=4):
         --tokenizer-type GPT2BPETokenizer \\
         --vocab-file /path/to/vocab.json \\
         --merge-file /path/to/merges.txt \\
-        --sft \\
+        --ap-sft \\
         --ap-sft-pack-samples \\
         --train-iters 1000 \\
         --global-batch-size 8
@@ -141,9 +141,6 @@ def build_train_valid_test_datasets(train_val_test_num_samples):
 
     Args:
         train_val_test_num_samples: A list containing the number of samples in train, test, and validation.
-
-    Returns:
-        train_ds, valid_ds, test_ds: The constructed datasets
     """
     args = get_args()
 
@@ -181,8 +178,13 @@ def get_train_val_test_num_samples():
     else:
         train_samples = args.train_iters * args.global_batch_size
 
-    if args.full_validation:
+    if args.eval_interval is None or args.eval_iters is None or args.eval_iters == 0:
+        # For initialization, eval is not needed
+        eval_samples = 0
+        test_samples = 0
+    elif args.full_validation:
         eval_samples = None
+        test_samples = args.eval_iters * args.global_batch_size
     else:
         if args.skip_train:
             eval_iters = args.eval_iters
@@ -190,7 +192,7 @@ def get_train_val_test_num_samples():
             assert args.train_iters is not None
             eval_iters = (args.train_iters // args.eval_interval + 1) * args.eval_iters
         eval_samples = eval_iters * args.global_batch_size
-    test_samples = args.eval_iters * args.global_batch_size
+        test_samples = args.eval_iters * args.global_batch_size
 
     return [train_samples, eval_samples, test_samples]
 
