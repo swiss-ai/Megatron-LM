@@ -827,6 +827,16 @@ def pretrain(
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
         wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
 
+    if type(model) == list:
+        for model_chunk in model:
+            for n, p in model_chunk.named_parameters():
+                if "word_embeddings" not in n:
+                    p.requires_grad = False
+    else:
+        for n, p in model.named_parameters():
+            if "word_embeddings" not in n:
+                p.requires_grad = False
+
     if not args.skip_train:
         print_rank_0('training ...')
 
@@ -1273,6 +1283,7 @@ def setup_model_and_optimizer(
     wrap_with_ddp = not args.skip_train
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
+
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
     if args.skip_train:
