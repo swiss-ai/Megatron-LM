@@ -77,6 +77,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     modality_weights: Optional[Dict[str, float]] = None
     """Per-modality loss weights keyed by modality name (e.g., vision/audio)."""
 
+    modality_weight_distributions: Optional[Dict[str, Tuple[List[float], List[float]]]] = None
+    """Per-modality stochastic weight distributions. Maps modality name to (values, probabilities)."""
+
     sft_plw: float = 0.0
     """Prompt loss weight for user tokens (0 = fully masked). Used by ApertusSFTDataset."""
 
@@ -123,6 +126,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
             self.modality_weights["vision"] = self.vision_weight
         if "audio" not in self.modality_weights and self.audio_weight != 1.0:
             self.modality_weights["audio"] = self.audio_weight
+        if self.modality_weight_distributions is None:
+            self.modality_weight_distributions = {}
 
 
 class GPTDataset(MegatronDataset):
@@ -168,6 +173,7 @@ class GPTDataset(MegatronDataset):
         # Build weighted modality specs as (name, start_id, end_id, weight).
         self._weighted_modality_specs: List[Tuple[str, int, int, float]] = []
         modality_weights = self.config.modality_weights or {}
+        modality_dists = self.config.modality_weight_distributions or {}
         used_modalities = set()
         unresolved_weighted_modalities = []
 
@@ -181,7 +187,7 @@ class GPTDataset(MegatronDataset):
                 weight = modality_weights.get(name, 1.0)
                 offset = modality.get("offset")
                 vocab_size = modality.get("vocab_size")
-                if weight == 1.0:
+                if weight == 1.0 and name not in modality_dists:
                     continue
                 if offset is None or vocab_size is None:
                     unresolved_weighted_modalities.append(name)
@@ -192,7 +198,7 @@ class GPTDataset(MegatronDataset):
 
         # Fallback for modality names not listed in omnimodal_config but exposed on args.
         for name, weight in modality_weights.items():
-            if name in used_modalities or weight == 1.0:
+            if name in used_modalities or (weight == 1.0 and name not in modality_dists):
                 continue
             offset = getattr(args, f"{name}_token_offset", None)
             vocab_size = getattr(args, f"{name}_vocab_size", None)
@@ -211,12 +217,19 @@ class GPTDataset(MegatronDataset):
                 "contains these modalities."
             )
 
+        self._modality_weight_distributions = self.config.modality_weight_distributions or {}
+        self._dataset_seed = self.config.random_seed
+
         for name, start, end, weight in self._weighted_modality_specs:
             log_single_rank(
                 logger,
                 logging.INFO,
                 f"{name.upper()} ID RANGE: {start} {end} apply weight {weight}",
             )
+            if name in self._modality_weight_distributions:
+                values, probs = self._modality_weight_distributions[name]
+                dist_str = ", ".join(f"{v}:{p}" for v, p in zip(values, probs))
+                log_single_rank(logger, logging.INFO, f"  -> stochastic sampling: {dist_str}")
 
         self.masks_and_position_ids_are_cacheable = not any(
             [
@@ -403,10 +416,16 @@ class GPTDataset(MegatronDataset):
             loss_mask[goldfish_labels == self._goldfish_token_id] = 0.0
 
         # Modality token loss masking.
-        for _, start, end, weight in self._weighted_modality_specs:
+        for name, start, end, weight in self._weighted_modality_specs:
             modality_mask = (labels >= start) & (labels < end)
             active_modality_mask = modality_mask & (loss_mask > 0)
-            loss_mask[active_modality_mask] = weight
+            if idx is not None and name in self._modality_weight_distributions:
+                values, probs = self._modality_weight_distributions[name]
+                rng = numpy.random.RandomState(seed=(self._dataset_seed + idx) % (2**31))
+                sampled_weight = float(rng.choice(values, p=probs))
+                loss_mask[active_modality_mask] = sampled_weight
+            else:
+                loss_mask[active_modality_mask] = weight
 
         # Batch padding sequence so we mask the loss
         if idx is None:

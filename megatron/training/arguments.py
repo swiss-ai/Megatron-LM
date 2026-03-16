@@ -1362,6 +1362,33 @@ def validate_args(args, defaults={}):
     _validate_modality_weight_decay("vision")
     _validate_modality_weight_decay("audio")
 
+    # Stochastic modality weight distributions.
+    def _parse_and_validate_modality_weight_probs(modality):
+        raw = getattr(args, f"{modality}_weight_probs", None)
+        if raw is None:
+            setattr(args, f"{modality}_weight_values", None)
+            setattr(args, f"{modality}_weight_probs_list", None)
+            return
+        assert not getattr(args, f"{modality}_weight_decay", False), \
+            f"--{modality}-weight-probs is mutually exclusive with --{modality}-weight-decay"
+        values, probs = [], []
+        for pair in raw.split(","):
+            parts = pair.strip().split(":")
+            assert len(parts) == 2, \
+                f"Invalid --{modality}-weight-probs entry '{pair.strip()}': expected 'weight:prob' format"
+            w, p = float(parts[0]), float(parts[1])
+            assert w >= 0.0, f"Weight must be >= 0.0, got {w}"
+            assert p > 0.0, f"Probability must be > 0.0, got {p}"
+            values.append(w)
+            probs.append(p)
+        assert abs(sum(probs) - 1.0) < 1e-6, \
+            f"Probabilities must sum to 1.0, got {sum(probs)}"
+        setattr(args, f"{modality}_weight_values", values)
+        setattr(args, f"{modality}_weight_probs_list", probs)
+
+    _parse_and_validate_modality_weight_probs("vision")
+    _parse_and_validate_modality_weight_probs("audio")
+
     # Differential attention halves the effective head dimension for RoPE. If the
     # user left rotary_percent at its default, pick 0.5 automatically to match the
     # reference implementation; otherwise keep their choice but warn.
@@ -3157,6 +3184,13 @@ def _add_data_args(parser):
     group.add_argument('--audio-weight', type=float, default=1.0,
                        help='Loss mask weight for audio tokens. '
                             'Default 1.0 (normal loss). Set to 0.0 to fully mask audio tokens.')
+    group.add_argument('--vision-weight-probs', dest='vision_weight_probs', type=str, default=None,
+                       help='Stochastic vision weight distribution. Format: "weight:prob,weight:prob,..." '
+                            'e.g. "0.0:0.3,0.5:0.5,1.0:0.2". Probabilities must sum to 1.0. '
+                            'Mutually exclusive with --vision-weight-decay.')
+    group.add_argument('--audio-weight-probs', type=str, default=None,
+                       help='Stochastic audio weight distribution. Same format as --vision-weight-probs. '
+                            'Mutually exclusive with --audio-weight-decay.')
     group.add_argument('--vision-weight-decay', dest='vision_weight_decay', action='store_true', default=False,
                        help='Enable dynamic decay of vision token loss weight during training.')
     group.add_argument('--vision-weight-max', dest='vision_weight_max', type=float, default=None,

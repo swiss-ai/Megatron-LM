@@ -557,6 +557,15 @@ def core_gpt_dataset_config_from_args(args):
         if weight is not None:
             modality_weights.setdefault(name, weight)
 
+    modality_weight_distributions = {}
+    for name in ("vision", "audio"):
+        values = getattr(args, f"{name}_weight_values", None)
+        probs = getattr(args, f"{name}_weight_probs_list", None)
+        if values is not None and probs is not None:
+            modality_weight_distributions[name] = (values, probs)
+            # Ensure modality appears in modality_weights so it enters _weighted_modality_specs
+            modality_weights.setdefault(name, 1.0)
+
     data_args = {
         "random_seed": args.seed,
         "sequence_length": args.seq_length,
@@ -583,6 +592,7 @@ def core_gpt_dataset_config_from_args(args):
         "goldfish_k": args.goldfish_k,
         "goldfish_h": args.goldfish_h,
         "modality_weights": modality_weights,
+        "modality_weight_distributions": modality_weight_distributions,
         "vision_weight": args.vision_weight,
         "audio_weight": args.audio_weight,
         "sft_plw": args.ap_sft_plw,
