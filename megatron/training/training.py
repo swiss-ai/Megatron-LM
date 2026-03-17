@@ -827,16 +827,6 @@ def pretrain(
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
         wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
 
-    if type(model) == list:
-        for model_chunk in model:
-            for n, p in model_chunk.named_parameters():
-                if "word_embeddings" not in n:
-                    p.requires_grad = False
-    else:
-        for n, p in model.named_parameters():
-            if "word_embeddings" not in n:
-                p.requires_grad = False
-
     if not args.skip_train:
         print_rank_0('training ...')
 

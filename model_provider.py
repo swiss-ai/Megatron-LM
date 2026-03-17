@@ -94,6 +94,21 @@ def model_provider(
     if args.log_pre_final_ln_norm:
         _register_pre_final_ln_norm_hook(model)
 
+    # import torch.distributed as dist
+    # import remote_pdb
+
+    # rank_t = dist.get_rank()
+    # remote_pdb.set_trace(host="0.0.0.0", port=1234+rank_t)
+
+    if type(model) == list:
+        for model_chunk in model:
+            for n, p in model_chunk.named_parameters():
+                if "word_embeddings" not in n:
+                    p.requires_grad = False
+    else:
+        for n, p in model.named_parameters():
+            if "word_embeddings" not in n:
+                p.requires_grad = False
     return model
 
 
