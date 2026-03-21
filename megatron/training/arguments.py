@@ -531,6 +531,12 @@ def validate_args(args, defaults={}):
                    for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) is False or \
             args.per_split_data_args_path is None
 
+    if args.phase_transition_iterations:
+        args.phase_transition_iterations = sorted(
+            int(x.strip()) for x in args.phase_transition_iterations.split(",")
+        )
+        assert args.rampup_batch_size is None, "multi-phase training does not support batch size ramp-up"
+
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
@@ -3101,6 +3107,10 @@ def _add_data_args(parser):
                        '(3) a list of prefixes e.g. prefix1 prefix2. '
                        'For (3), weights are inferred from the lengths of the contributing datasets. '
                        'This argument is exclusive to the other independent --*-data-path arguments.')
+    group.add_argument('--phase-transition-iterations', type=str, default=None,
+                       help='Comma-separated list of iterations where phase '
+                       'transitions occur. Requires fixed global batch size across phases. '
+                       'Does not support batch size ramp-up.')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
@@ -3178,6 +3188,11 @@ def _add_data_args(parser):
                        help='Dropout factor k for goldfish loss masking, where dropout probability is 1/k.')
     group.add_argument('--goldfish-h', type=int, default=50,
                         help='Context width for hashing in goldfish loss masking. Controls how many preceding tokens determine masking.')
+    group.add_argument('--loss-mask-token-ids', nargs='+', type=int, default=None,
+                       help='Token IDs to mask from the loss (loss_mask=0). '
+                            'Useful for task-control tokens (e.g. <|stt_transcribe|>, '
+                            '<|tts_continue|>) that should condition the model but never '
+                            'be predicted.')
     group.add_argument('--vision-weight', dest='vision_weight', type=float, default=1.0,
                        help='Loss mask weight for vision tokens between <|img_start|> and <|img_end|>. '
                             'Default 1.0 (normal loss). Set to 0.0 to fully mask vision tokens.')

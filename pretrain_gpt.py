@@ -595,6 +595,7 @@ def core_gpt_dataset_config_from_args(args):
         "modality_weight_distributions": modality_weight_distributions,
         "vision_weight": args.vision_weight,
         "audio_weight": args.audio_weight,
+        "loss_mask_token_ids": getattr(args, "loss_mask_token_ids", None),
         "sft_plw": args.ap_sft_plw,
         "sft_load_loss_mask": args.ap_sft_load_loss_mask,
         "sft_mask_special_tokens": args.ap_sft_mask_special_tokens,

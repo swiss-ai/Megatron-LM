@@ -18,6 +18,7 @@ runs/
 **/dist/
 core_nid*
 .idea/
+.claude/
 
 # Sphinx documentation
 docs/_build

@@ -77,6 +77,11 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     modality_weights: Optional[Dict[str, float]] = None
     """Per-modality loss weights keyed by modality name (e.g., vision/audio)."""
 
+    loss_mask_token_ids: Optional[List[int]] = None
+    """Token IDs whose predictions should be masked from the loss (loss_mask=0).
+    Useful for task-control tokens (e.g. <|stt_transcribe|>, <|tts_continue|>) that
+    should condition the model but never be predicted."""
+
     modality_weight_distributions: Optional[Dict[str, Tuple[List[float], List[float]]]] = None
     """Per-modality stochastic weight distributions. Maps modality name to (values, probabilities)."""
 
@@ -231,6 +236,15 @@ class GPTDataset(MegatronDataset):
                 dist_str = ", ".join(f"{v}:{p}" for v, p in zip(values, probs))
                 log_single_rank(logger, logging.INFO, f"  -> stochastic sampling: {dist_str}")
 
+        # Token IDs to mask from loss (e.g. task-control tokens like <|stt_transcribe|>).
+        self._loss_mask_token_ids = self.config.loss_mask_token_ids or []
+        if self._loss_mask_token_ids:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Loss-masked token IDs: {self._loss_mask_token_ids}",
+            )
+
         self.masks_and_position_ids_are_cacheable = not any(
             [
                 self.config.reset_position_ids,
@@ -238,6 +252,7 @@ class GPTDataset(MegatronDataset):
                 self.config.eod_mask_loss,
                 self.config.goldfish_loss,
                 bool(self._weighted_modality_specs),
+                bool(self._loss_mask_token_ids),
             ]
         )
 
@@ -394,6 +409,12 @@ class GPTDataset(MegatronDataset):
         # For padded sequences, ensure the embedding layer can map the token ID
         tokens[tokens == self._pad_token_id] = 0
         labels[labels == self._pad_token_id] = 0
+
+        # Hard-mask task-control tokens (e.g. <|stt_transcribe|>, <|tts_continue|>).
+        # Applied early: downstream steps (goldfish, modality weights, weight decay)
+        # all guard with `loss_mask > 0` so they cannot re-enable these.
+        for tid in self._loss_mask_token_ids:
+            loss_mask[labels == tid] = 0.0
 
         # Goldfish loss masking
         if self.config.goldfish_loss:
