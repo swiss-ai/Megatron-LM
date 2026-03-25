@@ -52,9 +52,11 @@ def get_args():
         args.input
     ), f"ERROR: {args.input} is not a directory or does not exist"
 
-    assert os.path.isdir(
-        os.path.dirname(args.output_prefix)
-    ), f"ERROR: {os.path.dirname(args.output_prefix)} is not a directory or does not exist"
+    output_dir = os.path.dirname(args.output_prefix)
+    if output_dir:
+        assert os.path.isdir(
+            output_dir
+        ), f"ERROR: {output_dir} is not a directory or does not exist"
 
     return args
 
@@ -63,6 +65,9 @@ def main(args):
     prefixes = set()
     for basename in os.listdir(args.input):
         prefix, ext = os.path.splitext(basename)
+
+        if ext not in (".bin", ".idx"):
+            continue
 
         if prefix in prefixes:
             continue
@@ -93,6 +98,10 @@ def main(args):
             del dataset
 
         builder.add_index(os.path.join(args.input, prefix))
+
+    if builder is None:
+        print("ERROR: No valid .bin/.idx datasets found in input directory")
+        return
 
     builder.finalize(get_idx_path(args.output_prefix))
 

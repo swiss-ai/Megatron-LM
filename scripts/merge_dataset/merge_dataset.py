@@ -74,7 +74,8 @@ def main():
     for i, prefix in enumerate(args.inputs):
         dataset = IndexedDataset(prefix, multimodal=args.multimodal)
         num_seq = len(dataset.index)
-        num_doc = len(dataset.document_indices)
+        # document_count = len(document_indices) = actual_docs + 1 (includes leading 0)
+        num_doc = len(dataset.document_indices) - 1
         print(f"  [{i}] {prefix}: {num_seq} sequences, {num_doc} documents")
         assert dataset.index.dtype == dtype, (
             f"dtype mismatch: expected {dtype}, got {dataset.index.dtype} for {prefix}"
@@ -89,9 +90,7 @@ def main():
 
     print(f"\nMerged {len(args.inputs)} datasets -> {args.output_prefix}")
     print(f"  Total sequences: {total_sequences}")
-    # Each part's document_indices includes a sentinel; the merged dataset has only one sentinel,
-    # so subtract the extra (N-1) sentinels from the sum.
-    print(f"  Total documents: {total_documents - (len(args.inputs) - 1)}")
+    print(f"  Total documents: {total_documents}")
 
 
 if __name__ == "__main__":

@@ -19,7 +19,8 @@ Usage:
 import argparse
 import os
 import struct
-import shutil
+import subprocess
+import sys
 
 import numpy
 
@@ -141,6 +142,79 @@ def copy_bin_range(src_bin_path, dst_bin_path, byte_start, byte_end):
             remaining -= len(data)
 
 
+def verify_split(args, split_points, src_seq_count, src_doc_count):
+    """Re-read every output part and check counts against the source dataset."""
+    print("\n" + "=" * 60)
+    print("VERIFICATION")
+    print("=" * 60)
+
+    total_seqs = 0
+    total_docs = 0
+    total_bytes = 0
+    part_prefixes = []
+
+    for part_idx in range(len(args.ratios)):
+        start_doc = split_points[part_idx]
+        end_doc = split_points[part_idx + 1]
+        if end_doc - start_doc == 0:
+            continue
+
+        part_prefix = f"{args.output_prefix}_part{part_idx}"
+        part_prefixes.append(part_prefix)
+
+        part_ds = IndexedDataset(part_prefix, multimodal=args.multimodal)
+        part_index = part_ds.index
+
+        total_seqs += part_index.sequence_count
+        # document_count is len(document_indices) which includes leading 0,
+        # so actual number of documents is document_count - 1
+        total_docs += part_index.document_count - 1
+        total_bytes += os.path.getsize(get_bin_path(part_prefix))
+
+        del part_ds
+
+    src_bin_size = os.path.getsize(get_bin_path(args.input))
+
+    ok = True
+
+    if total_seqs != src_seq_count:
+        print(f"  FAIL: Total sequences across parts ({total_seqs}) != source ({src_seq_count})")
+        ok = False
+    else:
+        print(f"  OK: Sequence count matches: {total_seqs}")
+
+    if total_docs != src_doc_count:
+        print(f"  FAIL: Total documents across parts ({total_docs}) != source ({src_doc_count})")
+        ok = False
+    else:
+        print(f"  OK: Document count matches: {total_docs}")
+
+    if total_bytes != src_bin_size:
+        print(f"  FAIL: Total .bin size across parts ({total_bytes:,}) != source ({src_bin_size:,})")
+        ok = False
+    else:
+        print(f"  OK: Binary size matches: {total_bytes:,} bytes")
+
+    if not ok:
+        print("\n  VERIFICATION FAILED!")
+
+    # Run inspect_idx on each part
+    inspect_script = os.path.join(os.path.dirname(__file__), "..", "inspect_idx.py")
+    inspect_script = os.path.abspath(inspect_script)
+
+    if os.path.exists(inspect_script):
+        print("\n" + "-" * 60)
+        print("INSPECT OUTPUT")
+        print("-" * 60)
+        for part_prefix in part_prefixes:
+            print()
+            subprocess.run([sys.executable, inspect_script, part_prefix], check=False)
+    else:
+        print(f"\n  Skipping inspect: {inspect_script} not found")
+
+    return ok
+
+
 def main():
     args = get_args()
 
@@ -152,10 +226,13 @@ def main():
     seq_pointers = index.sequence_pointers  # int64, length = sequence_count
     seq_modes = index.sequence_modes        # int8 or None
     dtype = index.dtype
-    num_docs = index.document_count
+    # document_count = len(doc_indices) = actual_num_docs + 1 (includes leading 0)
+    num_docs = index.document_count - 1
+
+    index_sequence_count = index.sequence_count
 
     print(f"Input: {args.input}")
-    print(f"  Sequences: {index.sequence_count}")
+    print(f"  Sequences: {index_sequence_count}")
     print(f"  Documents: {num_docs}")
 
     split_points = compute_split_points(num_docs, args.ratios)
@@ -173,8 +250,9 @@ def main():
             continue
 
         # Sequence range for this part
+        # doc_indices has num_docs+1 entries (0..num_docs), so doc_indices[end_doc] is always valid
         seq_start = int(doc_indices[start_doc])
-        seq_end = int(doc_indices[end_doc]) if end_doc < num_docs else index.sequence_count
+        seq_end = int(doc_indices[end_doc])
         num_seqs = seq_end - seq_start
 
         # Slice index arrays for this part
@@ -190,7 +268,7 @@ def main():
             part_seq_pointers[0] = 0
 
         # Adjust document indices relative to seq_start
-        # Include end_doc+1 to capture the sentinel entry (doc_indices always has num_docs+1 entries)
+        # Slice includes end_doc as sentinel (doc_indices has num_docs+1 entries)
         part_doc_indices = doc_indices[start_doc:end_doc + 1] - seq_start
 
         # Slice sequence modes if multimodal
@@ -221,12 +299,18 @@ def main():
         )
 
         print(f"\n  Part {part_idx}: {part_prefix}")
-        print(f"    Documents: {len(part_doc_indices)}")
+        print(f"    Documents: {num_part_docs}")
         print(f"    Sequences: {num_seqs}")
         print(f"    Bytes copied: {byte_end - byte_start:,}")
 
     del dataset
-    print("\nDone.")
+
+    ok = verify_split(args, split_points, index_sequence_count, num_docs)
+    if ok:
+        print("\nDone. All checks passed.")
+    else:
+        print("\nDone. Some checks FAILED!")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

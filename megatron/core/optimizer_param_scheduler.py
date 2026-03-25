@@ -353,6 +353,21 @@ class OptimizerParamScheduler:
             self.lr_decay_style, lr_decay_style_, 'learning rate decay style'
         )
 
+        # When overriding, also update per-param-group max_lr and min_lr.
+        # The optimizer checkpoint may store stale max_lr/min_lr values in param_groups
+        # (set during optimizer init). Without this, get_lr() would use the checkpoint's
+        # param_group['max_lr'] instead of the overridden self.max_lr.
+        # Only update groups using the default LR schedule (default_config=True),
+        # not decoupled LR groups which have intentionally different max_lr/min_lr.
+        if self.override_opt_param_scheduler:
+            for param_group in self.optimizer.param_groups:
+                if not param_group.get('default_config', True):
+                    continue
+                if 'max_lr' in param_group:
+                    param_group['max_lr'] = self.max_lr
+                if 'min_lr' in param_group:
+                    param_group['min_lr'] = self.min_lr
+
         if 'num_iters' in state_dict:
             num_steps = state_dict['num_iters']
         else:

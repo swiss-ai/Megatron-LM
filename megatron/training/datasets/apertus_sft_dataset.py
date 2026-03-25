@@ -74,8 +74,10 @@ class ApertusSFTDataset(GPTDataset):
         # Set pad token
         try:
             self._pad_token_id = self.tokenizer.pad
+            if self._pad_token_id is None:
+                raise ValueError("pad token ID is None")
             log_single_rank(logger, logging.INFO, f"Using tokenizer pad token ID: {self._pad_token_id}")
-        except (AttributeError, KeyError, TypeError, NotImplementedError) as e:
+        except (AttributeError, KeyError, TypeError, NotImplementedError, ValueError) as e:
             self._pad_token_id = _PAD_TOKEN_ID
             log_single_rank(logger, logging.WARNING,
                           f"Tokenizer pad token not available ({type(e).__name__}), using default: {self._pad_token_id}")
