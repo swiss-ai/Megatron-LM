@@ -3749,6 +3749,11 @@ def _add_sft_args(parser):
     group.add_argument('--ap-sft-pack-samples', action="store_true",
                        help='Pack multiple whole documents per sequence. Doesnt spread one document across sequences. '
                             'Only packs full sequences and adds padding to reach full seq len.')
+    group.add_argument('--ap-sft-packing-strategy', type=str, default='greedy',
+                       choices=['greedy', 'bfd'],
+                       help='Packing strategy for --ap-sft-pack-samples. '
+                            '"greedy" packs documents in shuffled order (current default). '
+                            '"bfd" (Best-Fit Decreasing) sorts by length for higher packing efficiency.')
     group.add_argument('--ap-sft-plw', type=float, default=0.0,
                        help='Prompt loss weight for user tokens (0 = fully masked)')
     group.add_argument('--ap-sft-load-loss-mask', action="store_true",

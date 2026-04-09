@@ -15,6 +15,8 @@
     - [Tokenization](#tokenization)
     - [Set the Datasets in Megatron](#set-the-datasets-in-megatron)
     - [Data mixtures](#data-mixtures)
+- [Supervised Fine-Tuning (SFT)](#supervised-fine-tuning-sft)
+    - [Apertus SFT with Sample Packing](#apertus-sft-with-sample-packing)
 - [Checkpointing](#checkpointing)
     - [Resuming from a checkpoint](#resuming-from-a-checkpoint)
     - [Converting checkpoints to huggingface](#converting-checkpoints-to-huggingface)
@@ -96,6 +98,63 @@ python3 scripts/tools/create_data_mixture.py --folders datasets/fineweb-edu fine
 Upon successfully creating a mixture, we will see its statistics, such as the number of tokens, the number of file prefixes per dataset, and the total size of the mixture.  
 
 Keep in mind that the mixture will be created **without repetition**. This means that we will construct the mixture while respecting the weights until a dataset is exhausted.
+
+# Supervised Fine-Tuning (SFT)
+
+This repository provides the **ApertusSFT** dataset (`--ap-sft`) for supervised fine-tuning on pre-tokenized Megatron indexed datasets (`.bin/.idx`). It supports sample packing, configurable loss masking, and works with the standard `pretrain_gpt.py` entry point.
+
+## Apertus SFT with Sample Packing
+
+Sample packing (`--ap-sft-pack-samples`) concatenates multiple whole documents into a single sequence to reduce padding waste. Position IDs and attention masks are reset at document boundaries so documents don't attend to each other.
+
+### Packing Strategies
+
+Two packing strategies are available via `--ap-sft-packing-strategy`:
+
+- **`greedy`** (default): Packs documents in shuffled order, filling each sequence until the next document doesn't fit. Fast O(n) index building.
+- **`bfd`** (Best-Fit Decreasing): Sorts documents by length and assigns each to the sequence with the least remaining space that still fits. Produces fewer sequences and less wasted padding, especially when document lengths vary widely.
+
+### Workflow
+
+Packed SFT training is a two-step process:
+
+**Step 1: Initialize the packing index** to determine the number of packed samples per epoch. This can be done on a single GPU regardless of your training topology. Model architecture args (`num-layers`, `hidden-size`, etc.) are required by Megatron's validation but don't affect the dataset — use any valid dummy values:
+```bash
+torchrun --nproc_per_node=1 initialize_sft_dataset.py \
+    --tensor-model-parallel-size 1 \
+    --pipeline-model-parallel-size 1 \
+    --num-layers 1 --hidden-size 128 --num-attention-heads 1 \
+    --max-position-embeddings 8192 \
+    --seq-length 8192 \
+    --micro-batch-size 1 --global-batch-size 64 \
+    --train-iters 10000 \
+    --data-path /path/to/sft-data \
+    --tokenizer-type HuggingFaceTokenizer \
+    --tokenizer-model /path/to/tokenizer \
+    --ap-sft --ap-sft-pack-samples \
+    --ap-sft-packing-strategy bfd \
+    --bf16
+```
+The script will log packing statistics including the number of packed samples per epoch. The cache hash depends on `seed`, `seq-length`, `split`, `train-iters`/`train-samples`, `global-batch-size`, `data-path`, tokenizer, and packing settings — these must match your training run. TP/PP/EP and model architecture args do **not** affect the hash.
+
+**Step 2: Run training** with `--train-samples` set to the reported packed sample count (or a multiple for multi-epoch):
+```bash
+sbatch submit-sft.sh  # with --ap-sft --ap-sft-pack-samples --train-samples <N>
+```
+The cached packing index from Step 1 is automatically reused as long as seed, seq-length, data-path, and packing settings match.
+
+### Key Flags
+
+| Flag | Description |
+|------|-------------|
+| `--ap-sft` | Enable Apertus SFT mode (requires `--calculate-per-token-loss`) |
+| `--ap-sft-pack-samples` | Enable multi-document packing |
+| `--ap-sft-packing-strategy {greedy,bfd}` | Packing algorithm (default: `greedy`) |
+| `--ap-sft-plw <float>` | Prompt loss weight for non-assistant tokens (default: `0.0` = fully masked) |
+| `--ap-sft-load-loss-mask` | Load pre-computed loss masks from the tokenized data |
+| `--ap-sft-mask-special-tokens` | Mask BOS/EOD/assistant-begin tokens from loss |
+| `--ap-sft-equalize-sample-loss` | Normalize loss per document within packed sequences |
+| `--ap-sft-truncate-right` | Truncate from the right (default is left truncation) |
 
 # Checkpointing
 >[!CAUTION]

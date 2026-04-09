@@ -100,6 +100,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     sft_truncate_right: bool = False
     """If sample is too long for context, throw away tokens in the end"""
 
+    sft_packing_strategy: str = "greedy"
+    """Packing strategy for SFT: 'greedy' (sequential) or 'bfd' (Best-Fit Decreasing)."""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()

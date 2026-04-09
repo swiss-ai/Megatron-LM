@@ -590,6 +590,7 @@ def core_gpt_dataset_config_from_args(args):
         "sft_load_loss_mask": args.ap_sft_load_loss_mask,
         "sft_mask_special_tokens": args.ap_sft_mask_special_tokens,
         "sft_pack_samples": args.ap_sft_pack_samples,
+        "sft_packing_strategy": args.ap_sft_packing_strategy,
         "sft_equalize_sample_loss": args.ap_sft_equalize_sample_loss,
         "sft_truncate_right": args.ap_sft_truncate_right
     }

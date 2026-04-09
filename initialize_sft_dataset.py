@@ -7,33 +7,40 @@ first phase of packed SFT training where you need to determine the actual
 number of packed samples without loading the full model.
 
 IMPORTANT REQUIREMENTS:
-    - SEED MUST MATCH your intended training run (determines packing)
-    - Parallelism settings (TP/PP/EP) MUST match your actual training run
-    - World size can be smaller (minimal DP) but TP/PP/EP must be identical
-    - Model architecture params are only needed for validation (not used in packing)
+    These arguments MUST match your intended training run (they affect the
+    cache hash that allows the training script to reuse the precomputed index):
+        --seed, --split, --seq-length, --global-batch-size,
+        --train-iters (or --train-samples), --data-path, --tokenizer-*,
+        --ap-sft-packing-strategy, --ap-sft-load-loss-mask
+
+    These arguments do NOT affect the packing index or its cache hash:
+        --tensor-model-parallel-size, --pipeline-model-parallel-size,
+        --expert-model-parallel-size, --num-layers, --hidden-size,
+        --num-attention-heads, --max-position-embeddings
+
+    Model architecture args (num-layers, hidden-size, num-attention-heads,
+    max-position-embeddings) are required by Megatron's argument validation
+    but have no effect on dataset construction. Use any valid dummy values.
 
 Usage:
-    python initialize_sft_dataset.py <same arguments as pretrain_gpt.py>
+    python initialize_sft_dataset.py <same data/training arguments as pretrain_gpt.py>
 
     Must include: --ap-sft --ap-sft-pack-samples
 
-Example (for a training run with TP=8, PP=4):
-    torchrun --nproc_per_node=32 initialize_sft_dataset.py \\
-        --tensor-model-parallel-size 8 \\
-        --pipeline-model-parallel-size 4 \\
-        --num-layers 32 \\
-        --hidden-size 4096 \\
-        --seq-length 2048 \\
+Example (single-GPU initialization for any training topology):
+    torchrun --nproc_per_node=1 initialize_sft_dataset.py \\
+        --tensor-model-parallel-size 1 \\
+        --pipeline-model-parallel-size 1 \\
+        --num-layers 1 --hidden-size 128 --num-attention-heads 1 \\
+        --max-position-embeddings 8192 \\
+        --seq-length 8192 \\
         --data-path /path/to/data \\
-        --tokenizer-type GPT2BPETokenizer \\
-        --vocab-file /path/to/vocab.json \\
-        --merge-file /path/to/merges.txt \\
-        --ap-sft \\
-        --ap-sft-pack-samples \\
+        --tokenizer-type HuggingFaceTokenizer \\
+        --tokenizer-model /path/to/tokenizer \\
+        --ap-sft --ap-sft-pack-samples \\
         --train-iters 1000 \\
-        --global-batch-size 8
-
-    # Note: nproc_per_node = TP * PP = 32 (world size can be = TP*PP*minimal_DP)
+        --global-batch-size 8 \\
+        --micro-batch-size 1
 """
 
 import sys
@@ -62,7 +69,11 @@ def is_dataset_built_on_rank():
 
 
 def core_gpt_dataset_config_from_args(args):
-    """Create GPTDatasetConfig from command line arguments."""
+    """Create GPTDatasetConfig from command line arguments.
+
+    Mirrors the config construction in pretrain_gpt.py so that the dataset
+    cache hash is identical for the same data/training arguments.
+    """
     if args.legacy_tokenizer:
         tokenizer = get_tokenizer()
     else:
@@ -130,6 +141,7 @@ def core_gpt_dataset_config_from_args(args):
         sft_mask_special_tokens=args.ap_sft_mask_special_tokens,
         sft_plw=args.ap_sft_plw,
         sft_pack_samples=args.ap_sft_pack_samples,
+        sft_packing_strategy=args.ap_sft_packing_strategy,
         sft_equalize_sample_loss=args.ap_sft_equalize_sample_loss,
         sft_load_loss_mask=args.ap_sft_load_loss_mask,
         sft_truncate_right=args.ap_sft_truncate_right,
@@ -170,7 +182,12 @@ def build_train_valid_test_datasets(train_val_test_num_samples):
 
 
 def get_train_val_test_num_samples():
-    """Train/valid/test sample counts aligned with megatron.training.training."""
+    """Train/valid/test sample counts aligned with megatron.training.training.
+
+    Must produce the same train_samples as the training script for the cache
+    hash to match. The formula is identical to get_train_valid_test_num_samples()
+    in megatron/training/training.py.
+    """
     args = get_args()
 
     if args.train_samples:
@@ -178,20 +195,21 @@ def get_train_val_test_num_samples():
     else:
         train_samples = args.train_iters * args.global_batch_size
 
-    if args.eval_interval is None or args.eval_iters is None or args.eval_iters == 0:
-        # For initialization, eval is not needed
-        eval_samples = 0
-        test_samples = 0
-    elif args.full_validation:
+    if args.full_validation:
         eval_samples = None
-        test_samples = args.eval_iters * args.global_batch_size
     else:
-        if args.skip_train:
-            eval_iters = args.eval_iters
+        if args.eval_interval is None or args.eval_iters is None or args.eval_iters == 0:
+            eval_samples = 0
+        elif args.skip_train:
+            eval_samples = args.eval_iters * args.global_batch_size
         else:
             assert args.train_iters is not None
             eval_iters = (args.train_iters // args.eval_interval + 1) * args.eval_iters
-        eval_samples = eval_iters * args.global_batch_size
+            eval_samples = eval_iters * args.global_batch_size
+
+    if args.eval_iters is None or args.eval_iters == 0:
+        test_samples = 0
+    else:
         test_samples = args.eval_iters * args.global_batch_size
 
     return [train_samples, eval_samples, test_samples]
@@ -225,27 +243,22 @@ def main():
 
     print_rank_0("=" * 80)
     print_rank_0("SFT Dataset Initialization Script")
-    print_rank_0("This script will build the dataset index and report ONE-EPOCH packing statistics")
+    print_rank_0("Builds the packing index and reports ONE-EPOCH packing statistics.")
     print_rank_0("=" * 80)
     print_rank_0("")
-    print_rank_0("IMPORTANT: SEED must match your intended training run! It determines packing and thus num of samples.")
-    print_rank_0(f"  Seed: {args.seed}")
-    print_rank_0("=" * 80)
+    print_rank_0("For cache reuse, these args MUST match your training run:")
+    print_rank_0("  seed, seq-length, split, train-samples/train-iters,")
+    print_rank_0("  global-batch-size, data-path, tokenizer, packing settings")
     print_rank_0("")
-    print_rank_0("IMPORTANT: Parallelism settings (TP/PP/EP) should match your training run!")
-    print_rank_0(f"  Tensor Parallel: {args.tensor_model_parallel_size}")
-    print_rank_0(f"  Pipeline Parallel: {args.pipeline_model_parallel_size}")
-    if args.expert_model_parallel_size > 1:
-        print_rank_0(f"  Expert Parallel: {args.expert_model_parallel_size}")
-    print_rank_0(f"  World Size: {args.world_size}")
+    print_rank_0("These do NOT affect the cache hash (any value works here):")
+    print_rank_0("  TP/PP/EP, num-layers, hidden-size, num-attention-heads")
     print_rank_0("")
-    print_rank_0("Note: Model architecture parameters (--num-layers, --hidden-size, etc.)")
-    print_rank_0("      are only needed to pass Megatron's validation. They don't affect")
-    print_rank_0("      the dataset packing calculation, which only depends on:")
-    print_rank_0("      - Data paths and tokenizer")
-    print_rank_0("      - Sequence length (--seq-length)")
-    print_rank_0("      - Global batch size (--global-batch-size)")
-    print_rank_0("      - Parallelism settings (TP/PP/EP)")
+    print_rank_0(f"  Seed:              {args.seed}")
+    print_rank_0(f"  Seq length:        {args.seq_length}")
+    print_rank_0(f"  Global batch size: {args.global_batch_size}")
+    train_samples = args.train_samples if args.train_samples else args.train_iters * args.global_batch_size
+    print_rank_0(f"  Train samples:     {train_samples}")
+    print_rank_0(f"  Packing strategy:  {args.ap_sft_packing_strategy}")
     print_rank_0("=" * 80)
     print_rank_0("")
 

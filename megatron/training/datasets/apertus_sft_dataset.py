@@ -2,6 +2,7 @@
 
 from typing import Dict, Optional, List, Tuple
 
+import bisect
 import time
 import os
 import logging
@@ -27,6 +28,103 @@ def _pad_sequence_if_needed(document, target_length: int, padding_value):
 
     padding_length = target_length - len(document)
     return np.concatenate([document, np.full(padding_length, padding_value, dtype=document.dtype)])
+
+
+def _build_sample_idx_bfd(
+    sequence_lengths: np.ndarray,
+    document_index: np.ndarray,
+    seq_length: int,
+    add_extra_token: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Best-Fit Decreasing bin packing for whole documents.
+
+    Sorts documents by decreasing length and assigns each to the bin with the
+    least remaining capacity that still fits. Produces fewer bins (less padding)
+    than greedy sequential packing when document lengths vary.
+
+    Args:
+        sequence_lengths: Array of document lengths indexed by document ID.
+        document_index: Shuffled document IDs for one epoch.
+        seq_length: Target sequence length.
+        add_extra_token: 0 or 1, added to seq_length for the effective bin capacity.
+
+    Returns:
+        reordered_document_index: Same document IDs as input, reordered so that
+            each bin's documents are contiguous.
+        sample_index: Shape (num_bins + 1, 2) boundary array. Column 0 holds
+            offsets into reordered_document_index; column 1 is always 0.
+    """
+    capacity = seq_length + add_extra_token
+    num_docs = len(document_index)
+
+    # Gather per-position lengths via vectorized lookup
+    doc_lengths = sequence_lengths[document_index].astype(np.int64)
+
+    # Sort positions by decreasing length (stable for determinism on ties)
+    sorted_positions = np.argsort(-doc_lengths, kind='stable')
+
+    # BFD assignment: maintain a sorted list of (remaining_capacity, bin_id)
+    # and use bisect to find the tightest-fitting bin in O(log B) per doc,
+    # where B is the number of open bins (typically much smaller than num_docs).
+    bins_sorted: List[Tuple[int, int]] = []  # sorted by remaining capacity ascending
+    bin_contents: List[List[int]] = []       # bin_id -> list of positions in document_index
+
+    for pos in sorted_positions:
+        length = int(doc_lengths[pos])
+
+        if length > capacity:
+            # Oversized document gets its own bin (truncated by downstream code)
+            bin_id = len(bin_contents)
+            bin_contents.append([int(pos)])
+            continue
+
+        if length == 0:
+            # Zero-length docs fit anywhere; place in the first open bin or a new one
+            if bins_sorted:
+                remaining, bin_id = bins_sorted[0]
+                bin_contents[bin_id].append(int(pos))
+            else:
+                bin_id = len(bin_contents)
+                bin_contents.append([int(pos)])
+                bisect.insort(bins_sorted, (capacity, bin_id))
+            continue
+
+        # Find the bin with the smallest remaining capacity >= length
+        idx = bisect.bisect_left(bins_sorted, (length,))
+
+        if idx < len(bins_sorted):
+            # Best-fit found: use this bin
+            remaining, bin_id = bins_sorted.pop(idx)
+            new_remaining = remaining - length
+            bin_contents[bin_id].append(int(pos))
+            if new_remaining > 0:
+                # Re-insert with updated capacity
+                bisect.insort(bins_sorted, (new_remaining, bin_id))
+        else:
+            # No bin fits: open a new one
+            bin_id = len(bin_contents)
+            bin_contents.append([int(pos)])
+            new_remaining = capacity - length
+            if new_remaining > 0:
+                bisect.insort(bins_sorted, (new_remaining, bin_id))
+
+    # Rebuild document_index so each bin's documents are contiguous
+    reordered = np.empty(num_docs, dtype=document_index.dtype)
+    boundaries = []
+    offset = 0
+    for contents in bin_contents:
+        boundaries.append(offset)
+        for pos in contents:
+            reordered[offset] = document_index[pos]
+            offset += 1
+    boundaries.append(offset)
+
+    # Build sample_index: (num_bins + 1, 2), column 1 always 0
+    sample_index = np.zeros((len(boundaries), 2), dtype=document_index.dtype)
+    sample_index[:, 0] = np.array(boundaries, dtype=document_index.dtype)
+
+    assert offset == num_docs, f"BFD placed {offset} docs but expected {num_docs}"
+    return reordered, sample_index
 
 
 class ApertusSFTDataset(GPTDataset):
@@ -139,6 +237,7 @@ class ApertusSFTDataset(GPTDataset):
             )
             self._using_packed_samples = True
         else:
+
             # Use simple single-document indexing
             self.document_index = self._build_single_document_indices()
             self._using_packed_samples = False
@@ -156,6 +255,7 @@ class ApertusSFTDataset(GPTDataset):
             "tokenizer",
             "add_extra_token_to_sequence",
             "sft_pack_samples",
+            "sft_packing_strategy",
             "sft_load_loss_mask",
         ]
 
@@ -240,13 +340,22 @@ class ApertusSFTDataset(GPTDataset):
             else:
                 sequence_lengths_for_cpp = self.dataset.sequence_lengths
 
-            # Build the sample index using whole-document packing
-            sample_index = helpers.build_sample_idx_packed_whole_docs(
-                sequence_lengths_for_cpp,
-                document_index,
-                sequence_length,
-                add_extra_token_to_sequence=self.config.add_extra_token_to_sequence,
-            )
+            # Build the sample index using the configured packing strategy
+            if self.config.sft_packing_strategy == "bfd":
+                log_single_rank(logger, logging.INFO, "Using Best-Fit Decreasing packing strategy")
+                document_index, sample_index = _build_sample_idx_bfd(
+                    sequence_lengths_for_cpp,
+                    document_index,
+                    sequence_length,
+                    add_extra_token=self.config.add_extra_token_to_sequence,
+                )
+            else:
+                sample_index = helpers.build_sample_idx_packed_whole_docs(
+                    sequence_lengths_for_cpp,
+                    document_index,
+                    sequence_length,
+                    add_extra_token_to_sequence=self.config.add_extra_token_to_sequence,
+                )
 
             # Log packing statistics for the single epoch
             self._log_packing_statistics(document_index, sample_index, from_cache=False)
