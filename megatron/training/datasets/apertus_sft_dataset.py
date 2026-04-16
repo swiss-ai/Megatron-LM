@@ -30,6 +30,258 @@ def _pad_sequence_if_needed(document, target_length: int, padding_value):
     return np.concatenate([document, np.full(padding_length, padding_value, dtype=document.dtype)])
 
 
+from dataclasses import dataclass
+
+@dataclass
+class SpecialTokenIDs:
+    """Integer IDs for special tokens used in SFT loss masking."""
+    system_start: int     # <|system_start|>
+    assistant_start: int  # <|assistant_start|>
+    assistant_end: int    # <|assistant_end|>
+    eod: int              # </s>
+    bos: int              # <s>
+    developer_start: int  # <|developer_start|>
+    user_start: int       # <|user_start|>
+
+
+def _get_synthetic_special_ids(tokenizer) -> SpecialTokenIDs:
+    """Resolve special token strings to integer IDs via the HF tokenizer."""
+    hf_tok = tokenizer._tokenizer.tokenizer
+    def _tok_id(token: str) -> int:
+        idx = hf_tok.convert_tokens_to_ids(token)
+        if idx == hf_tok.unk_token_id:
+            raise KeyError(f"Token '{token}' not found in tokenizer vocabulary.")
+        return idx
+    return SpecialTokenIDs(
+        system_start=_tok_id("<|system_start|>"),
+        assistant_start=_tok_id("<|assistant_start|>"),
+        assistant_end=_tok_id("<|assistant_end|>"),
+        developer_start=_tok_id("<|developer_start|>"),
+        user_start=_tok_id("<|user_start|>"),
+        eod=tokenizer.eod,
+        bos=tokenizer.bos,
+    )
+
+
+def _get_subdoc_spans_from_eos(eos_indices: np.ndarray, seq_len: int) -> List[Tuple[int, int]]:
+    """Convert per-doc last-token positions into (start, end) inclusive spans.
+
+    Skips degenerate spans (start > end) from duplicate eos indices or eos at seq_len - 1.
+    """
+    spans: List[Tuple[int, int]] = []
+    start = 0
+    for eod_idx in eos_indices:
+        end = min(int(eod_idx), seq_len - 1)
+        if start <= end:
+            spans.append((start, end))
+        start = end + 1
+        if start >= seq_len:
+            break
+    if start < seq_len:
+        spans.append((start, seq_len - 1))
+    return spans
+
+
+def _process_subdoc_masking(
+    data: torch.Tensor,
+    tokens: torch.Tensor,
+    loss_mask: torch.Tensor,
+    assistant_mask: torch.Tensor,
+    start: int,
+    end: int,
+    special_ids: SpecialTokenIDs,
+) -> None:
+    """Apply masking rules in-place for one sub-document [start, end] (inclusive).
+
+    Span does not begin with BOS -> cut fragment; mask each SFT turn from its opening
+                              marker (<|system_start|> or <|developer_start|>) through
+                              the paired <|assistant_end|> (inclusive), so the model is
+                              not trained on answers that reference missing context (e.g.
+                              CWE counting tasks). Pre-training tokens before the first
+                              marker are left unmasked.
+    No SYS, no ASST -> pure pre-training; loss_mask unchanged (stays 1).
+    SYS, no ASST    -> broken tail;  zero [SYS .. end].
+    Both present    -> normal SFT:   zero [SYS .. ASST] and [AEND];
+                       assistant_mask = True for answer tokens (ASST+1 .. AEND-1).
+    """
+
+    # Case 1: Document cut
+    if tokens[start] != special_ids.bos:
+        _sub = data[start : end + 1]
+        _SYS = special_ids.system_start
+        _DEV = special_ids.developer_start
+        _AEND = special_ids.assistant_end
+        _USST = special_ids.user_start
+        _turn_starts = sorted(
+            [int(p) for p in (_sub == _SYS).nonzero(as_tuple=True)[0]] +
+            [int(p) for p in (_sub == _DEV).nonzero(as_tuple=True)[0]] +
+            [int(p) for p in (_sub == _USST).nonzero(as_tuple=True)[0]]
+        )
+        _aend_positions = (_sub == _AEND).nonzero(as_tuple=True)[0].tolist()
+        for ts_pos in _turn_starts:
+            next_aend = next((a for a in _aend_positions if a > ts_pos), None)
+            mask_end = next_aend if next_aend is not None else (end - start)
+            loss_mask[start + ts_pos : start + mask_end + 1] = 0.0
+        return
+
+    sub = data[start : end + 1]
+
+    SYS  = special_ids.system_start
+    ASST = special_ids.assistant_start
+    AEND = special_ids.assistant_end
+    USST  = special_ids.user_start
+    DEV  = special_ids.developer_start
+
+    sys_positions = (sub == SYS).nonzero(as_tuple=True)[0].tolist()
+    asst_positions = (sub == ASST).nonzero(as_tuple=True)[0].tolist()
+    aend_positions = (sub == AEND).nonzero(as_tuple=True)[0].tolist()
+    usst_positions = (sub == USST).nonzero(as_tuple=True)[0].tolist()
+    dev_positions = (sub == DEV).nonzero(as_tuple=True)[0].tolist()
+
+    has_sys  = bool(sys_positions)
+    has_asst = bool(asst_positions)
+    has_user = bool(usst_positions)
+
+    # Case 2: pure pre-training
+    if not has_user and not has_asst:       
+        return
+    
+    first_turn = min(
+        sys_positions + usst_positions + dev_positions
+    )
+    loss_mask[start + first_turn : end + 1] = 0.0
+
+    # Case 3: broken tail, we mask all the chat
+    if has_user and not has_asst:
+        return
+
+    # Case 4: both SYS and ASST (possibly multi-turn)
+    for asst_pos in asst_positions:
+        # Find corresponding AEND
+        aend_pos = next((a for a in aend_positions if a > asst_pos), None)
+
+        if aend_pos is not None:
+            ans_start = start + asst_pos + 1
+            ans_end = start + aend_pos + 1
+
+            if ans_start < ans_end:
+                loss_mask[ans_start:ans_end] = 1.0
+                assistant_mask[ans_start:ans_end] = True
+        else:
+            # Broken tail: unmask until end
+            ans_start = start + asst_pos + 1
+            ans_end = end + 1
+
+            if ans_start < ans_end:
+                loss_mask[ans_start:ans_end] = 1.0
+                assistant_mask[ans_start:ans_end] = True
+
+def _build_virtual_docs(
+    document_index: np.ndarray,
+    sequence_lengths: np.ndarray,
+    capacity: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Split any document longer than *capacity* into capacity-sized chunks.
+
+    Documents that fit within *capacity* are kept as a single virtual entry.
+    Oversized documents produce multiple virtual entries, each loadable via
+    ``IndexedDataset.get(doc_id, offset=start, length=length)``.
+
+    Returns:
+        chunk_map: Shape (num_virtual, 3), int64. Columns:
+            [real_doc_id, chunk_start_token, chunk_length_tokens].
+        virtual_sizes: Shape (num_virtual,), int32. Length of each virtual chunk.
+    """
+    real_doc_ids = document_index.astype(np.int64)
+    doc_lens = sequence_lengths[real_doc_ids].astype(np.int64)
+
+    # Number of chunks each document produces (ceil division for oversized docs)
+    num_chunks = np.where(doc_lens <= capacity, 1, (doc_lens + capacity - 1) // capacity)
+    total_virtual = int(num_chunks.sum())
+
+    chunk_map = np.empty((total_virtual, 3), dtype=np.int64)
+    virtual_sizes = np.empty(total_virtual, dtype=np.int32)
+
+    # Cumulative output positions: chunk_offsets[i] = first output row for doc i
+    chunk_offsets = np.empty(len(num_chunks) + 1, dtype=np.int64)
+    chunk_offsets[0] = 0
+    np.cumsum(num_chunks, out=chunk_offsets[1:])
+
+    # Fast vectorised path for single-chunk docs (the common case)
+    single = num_chunks == 1
+    single_out = chunk_offsets[:-1][single]
+    chunk_map[single_out, 0] = real_doc_ids[single]
+    chunk_map[single_out, 1] = 0
+    chunk_map[single_out, 2] = doc_lens[single]
+    virtual_sizes[single_out] = doc_lens[single].astype(np.int32)
+
+    # Scalar loop only for oversized docs (rare)
+    for pos in np.where(~single)[0]:
+        rid = int(real_doc_ids[pos])
+        dlen = int(doc_lens[pos])
+        base = int(chunk_offsets[pos])
+        offset = 0
+        ci = 0
+        while offset < dlen:
+            clen = min(capacity, dlen - offset)
+            chunk_map[base + ci] = [rid, offset, clen]
+            virtual_sizes[base + ci] = clen
+            offset += capacity
+            ci += 1
+
+    return chunk_map, virtual_sizes
+
+
+def _load_bfd_c_library():
+    """Load (or compile then load) the C/C++ BFD packing library.
+
+    Uses a segment-tree + min-heap structure for O(n log C) best-fit lookup,
+    ~10-15x faster than pure-Python bisect at million-doc scale. Thread-safe.
+    Returns the loaded ctypes library, or None if unavailable.
+    """
+    import ctypes
+    import subprocess
+
+    _dir = os.path.dirname(os.path.abspath(__file__))
+    so_path  = os.path.join(_dir, "libbfd_pack.so")
+    cpp_path = os.path.join(_dir, "bfd_pack.cpp")
+
+    if os.path.isfile(so_path):
+        try:
+            lib = ctypes.CDLL(so_path)
+            lib.bfd_pack.argtypes = [
+                ctypes.POINTER(ctypes.c_int), # sorted_positions
+                ctypes.POINTER(ctypes.c_long), # doc_lengths
+                ctypes.c_int, # num_docs
+                ctypes.c_int, # capacity
+                ctypes.POINTER(ctypes.c_int), # document_index
+                ctypes.POINTER(ctypes.c_int), # doc_idx_out
+                ctypes.POINTER(ctypes.c_int), # boundaries_out
+                ctypes.POINTER(ctypes.c_int), # num_bins_out
+            ]
+            lib.bfd_pack.restype = None
+            return lib
+        except OSError:
+            pass
+
+    # Compile from source (prefer C++, fall back to C)
+    for src_path, compiler in [(cpp_path, "g++")]:
+        if os.path.isfile(src_path):
+            try:
+                subprocess.check_call(
+                    [compiler, "-O3", "-shared", "-fPIC", "-o", so_path, src_path],
+                    stderr=subprocess.DEVNULL,
+                )
+                return _load_bfd_c_library()
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
+
+    return None
+
+
+_bfd_c_lib = _load_bfd_c_library()
+
+
 def _build_sample_idx_bfd(
     sequence_lengths: np.ndarray,
     document_index: np.ndarray,
@@ -41,6 +293,9 @@ def _build_sample_idx_bfd(
     Sorts documents by decreasing length and assigns each to the bin with the
     least remaining capacity that still fits. Produces fewer bins (less padding)
     than greedy sequential packing when document lengths vary.
+
+    Uses the C-accelerated implementation when available, otherwise a pure-Python
+    bisect-based fallback.
 
     Args:
         sequence_lengths: Array of document lengths indexed by document ID.
@@ -54,6 +309,52 @@ def _build_sample_idx_bfd(
         sample_index: Shape (num_bins + 1, 2) boundary array. Column 0 holds
             offsets into reordered_document_index; column 1 is always 0.
     """
+    if _bfd_c_lib is not None:
+        return _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_extra_token)
+    return _build_sample_idx_bfd_python(sequence_lengths, document_index, seq_length, add_extra_token)
+
+
+def _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_extra_token):
+    """C-accelerated BFD bin packing via ctypes. See _build_sample_idx_bfd."""
+    import ctypes
+
+    capacity = seq_length + add_extra_token
+    num_docs = len(document_index)
+
+    doc_lengths = sequence_lengths[document_index].astype(np.int64)
+    sorted_positions = np.argsort(-doc_lengths, kind='stable').astype(np.int32)
+    doc_index_i32 = document_index.astype(np.int32)
+
+    doc_idx_out = np.empty(num_docs, dtype=np.int32)
+    boundaries_out = np.empty(num_docs + 1, dtype=np.int32)
+    num_bins_out = ctypes.c_int(0)
+
+    _bfd_c_lib.bfd_pack(
+        sorted_positions.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+        doc_lengths.ctypes.data_as(ctypes.POINTER(ctypes.c_long)),
+        num_docs, capacity,
+        doc_index_i32.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+        doc_idx_out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+        boundaries_out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+        ctypes.byref(num_bins_out),
+    )
+
+    nb = num_bins_out.value
+    reordered = doc_idx_out[:num_docs].astype(document_index.dtype)
+    sample_index = np.zeros((nb + 1, 2), dtype=document_index.dtype)
+    sample_index[:, 0] = boundaries_out[:nb + 1].astype(document_index.dtype)
+
+    assert boundaries_out[nb] == num_docs, f"BFD placed {boundaries_out[nb]} docs but expected {num_docs}"
+    return reordered, sample_index
+
+
+def _build_sample_idx_bfd_python(
+    sequence_lengths: np.ndarray,
+    document_index: np.ndarray,
+    seq_length: int,
+    add_extra_token: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Pure-Python BFD fallback using bisect. See _build_sample_idx_bfd."""
     capacity = seq_length + add_extra_token
     num_docs = len(document_index)
 
@@ -132,20 +433,22 @@ class ApertusSFTDataset(GPTDataset):
 
     Loads already-tokenized conversation data from Megatron indexed datasets (.bin/.idx).
     Supports single-document and multi-document packing modes (--ap-sft-pack-samples).
+    Supports mixed pre-training + SFT binaries: pre-training sub-documents (no
+    <|system_start|>) receive full loss; SFT sub-documents have their prompt scaffold
+    masked and only assistant answer tokens contribute to the loss.
+
+    Oversized documents (longer than seq_length) are split into capacity-sized virtual
+    chunks at index-build time via _build_virtual_docs, eliminating truncation.
 
     Loss masking operates in two modes:
       1. **From disk** (--ap-sft-load-loss-mask): Each document stores tokens and a pre-computed
          loss mask concatenated together ([tokens, loss_mask]). The dataset splits them at load
          time and uses the mask as-is.
-      2. **On the fly** (default): The loss mask is built at runtime by detecting assistant
-         response regions. This requires the tokenizer to expose ``sft_assistant_begin_sequence``
-         and ``sft_assistant_end_sequence`` attributes (see HuggingFaceTokenizer in
-         megatron/training/tokenizer/tokenizer.py). Everything outside assistant regions is
-         masked (or weighted by --ap-sft-plw). Special tokens (BOS, EOD, assistant begin) can
-         optionally be masked via --ap-sft-mask-special-tokens.
+      2. **On the fly** (default): loss_mask starts at 1 for all tokens. Per sub-document,
+         _process_subdoc_masking zeros scaffold regions for SFT docs and leaves pre-training
+         sub-documents (no <|system_start|>) fully unmasked.
 
     Note: Goldfish loss (--goldfish-loss) is not supported and will be ignored if enabled.
-    Note: Omnimodal weighting during loss mask creation is not supported. We simply have all assistant tokens unmasked.
     """
     def __init__(
         self,
@@ -182,33 +485,22 @@ class ApertusSFTDataset(GPTDataset):
         self._eod_token_id = self.tokenizer.eod
         self._bos_token_id = self.tokenizer.bos
 
-        # Load pre-computed SFT sequences from tokenizer config (tokenizer_config.json).
-        # These must be set as pre-tokenized token ID lists, e.g. by
-        # add_emu3_tokens_llama3_vision_instruct.py. Some models use separate assistant/user
-        # end sequences, others share a common eot token.
-        missing = [attr for attr in ('sft_assistant_begin_sequence', 'sft_assistant_end_sequence')
-                   if not hasattr(self.tokenizer, attr)]
-        if missing:
+        # Special token IDs for subdoc-based masking. Replaces the old
+        # sft_assistant_begin/end_sequence + tokens_to_mask machinery.
+        try:
+            self._special_ids = _get_synthetic_special_ids(self.tokenizer)
+            log_single_rank(logger, logging.INFO,
+                f"Synthetic masking IDs — SYS={self._special_ids.system_start}, "
+                f"ASST={self._special_ids.assistant_start}, "
+                f"AEND={self._special_ids.assistant_end}, "
+                f"BOS={self._special_ids.bos}, "
+                f"DEV={self._special_ids.developer_start}")
+        except KeyError as e:
             raise ValueError(
-                f"Tokenizer is missing required SFT attributes: {missing}. "
-                f"ApertusSFTDataset requires 'sft_assistant_begin_sequence' and "
-                f"'sft_assistant_end_sequence' (list of token IDs) to be defined in "
-                f"tokenizer_config.json."
-            )
-        self._sft_assistant_begin_sequence = torch.tensor(self.tokenizer.sft_assistant_begin_sequence, dtype=torch.long)
-        self._sft_assistant_end_sequence = torch.tensor(self.tokenizer.sft_assistant_end_sequence, dtype=torch.long)
-
-        # Configure token (sequences) to remove from loss calculation
-        self.tokens_to_mask = []
-        if self.config.sft_mask_special_tokens and not self.config.sft_load_loss_mask:
-            # add tokenizer special tokens like EOS, BOS and assistant begin to be masked. Never mask End of turn.
-            # TODO: in current apertus tokenizer eod is eot by default!!
-            self.tokens_to_mask.append(torch.tensor([self._eod_token_id], dtype=torch.long))
-            self.tokens_to_mask.append(torch.tensor([self._bos_token_id], dtype=torch.long))
-            self.tokens_to_mask.append(self._sft_assistant_begin_sequence)  # already a tensor
-            # user begin and end are masked by default as only assistant unmasked
-        if self.tokens_to_mask:
-            log_single_rank(logger, logging.INFO, f"On the fly masking the following tokens/token-sequences: {[t.tolist() for t in self.tokens_to_mask]}")
+                f"Tokenizer vocab is missing required special token: {e}. "
+                f"ApertusSFTDataset requires <|system_start|>, <|assistant_start|>, "
+                f"and <|assistant_end|> in the tokenizer vocabulary."
+            ) from e
 
         # Set actual model sequence length (config.sequence_length is doubled if loading loss masks from disk)
         if self.config.sft_load_loss_mask:
@@ -231,8 +523,8 @@ class ApertusSFTDataset(GPTDataset):
 
         # Build indices based on packing mode
         if self.config.sft_pack_samples:
-            # Use multi-document packing with sample_index
-            (self.document_index, self.sample_index, self.shuffle_index) = (
+            # Use multi-document packing with sample_index and virtual chunk map
+            (self.document_index, self.sample_index, self.shuffle_index, self.chunk_map) = (
                 self._build_packing_document_to_sample_indices()
             )
             self._using_packed_samples = True
@@ -240,6 +532,7 @@ class ApertusSFTDataset(GPTDataset):
 
             # Use simple single-document indexing
             self.document_index = self._build_single_document_indices()
+            self.chunk_map = None
             self._using_packed_samples = False
 
     @staticmethod
@@ -264,7 +557,7 @@ class ApertusSFTDataset(GPTDataset):
         Log statistics about packed samples.
 
         Args:
-            document_index: Array of document IDs
+            document_index: Array of document IDs (virtual chunk IDs in packing mode)
             sample_index: Array of sample boundaries
             from_cache: Whether the indices were loaded from cache
         """
@@ -291,23 +584,21 @@ class ApertusSFTDataset(GPTDataset):
     def _build_packing_document_to_sample_indices(self):
         """
         Build indices for packed document sampling. Always packs exactly one epoch so that
-        every document is used. If more samples are requested than one epoch provides, the
-        shuffle index is tiled with independent permutations (no re-packing).
+        every document is used. Oversized documents are pre-split into capacity-sized virtual
+        chunks via _build_virtual_docs so no tokens are lost to truncation. If more samples
+        are requested than one epoch provides, the shuffle index is tiled with independent
+        permutations (no re-packing).
 
-        Returns a tuple of three indices:
-        - document_index: Shuffled document IDs for one epoch
+        Returns a tuple of four indices:
+        - document_index: Permutation of virtual chunk IDs (0..num_virtual-1) in packing order
         - sample_index: Maps sample boundaries to (document_index position, offset) pairs
         - shuffle_index: Permutation indices, possibly tiled to meet num_samples
-
-        Returns:
-            Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
-                - document_index: Shape (num_documents,) - shuffled document IDs for one epoch
-                - sample_index: Shape (num_epoch_samples + 1, 2) - sample boundaries as [doc_idx_index, offset=0]
-                - shuffle_index: Shape (num_total_samples,) - permutation indices, tiled if needed
+        - chunk_map: Shape (num_virtual, 3) mapping virtual chunk ID to
+          [real_doc_id, chunk_start_token, chunk_length_tokens]
         """
         from megatron.core.datasets import helpers
 
-        index_names = ["document_index", "sample_index", "shuffle_index"]
+        index_names = ["document_index", "sample_index", "shuffle_index", "chunk_map"]
         cache_hit = self.cache_manager.cache_exists(index_names)
 
         if self.cache_manager.get_cache_path():
@@ -340,22 +631,38 @@ class ApertusSFTDataset(GPTDataset):
             else:
                 sequence_lengths_for_cpp = self.dataset.sequence_lengths
 
-            # Build the sample index using the configured packing strategy
+            # Build virtual document list: oversized docs are split into capacity-sized
+            # chunks so they never waste space. Each virtual entry maps to a slice of a
+            # real document loadable via dataset.get(doc_id, offset=start, length=length).
+            capacity = sequence_length + self.config.add_extra_token_to_sequence
+            chunk_map, virtual_sizes = _build_virtual_docs(
+                document_index, sequence_lengths_for_cpp, capacity
+            )
+            num_virtual = len(virtual_sizes)
+            virtual_idx = np.arange(num_virtual, dtype=np.int32)
+
+            n_extra = num_virtual - len(document_index)
+            log_single_rank(logger, logging.INFO,
+                f"  Document chunking: {len(document_index)} docs → {num_virtual} virtual chunks"
+                + (f" ({n_extra} extra chunks from oversized docs)" if n_extra > 0 else " (no oversized docs)"))
+
+            # Build the sample index using the configured packing strategy.
+            # We pass virtual_sizes as the sequence_lengths lookup table and virtual_idx
+            # as the document_index (identity: virtual_idx[i] == i).
             if self.config.sft_packing_strategy == "bfd":
-                log_single_rank(logger, logging.INFO, "Using Best-Fit Decreasing packing strategy")
+                _accel = "C-accelerated" if _bfd_c_lib is not None else "Python fallback"
+                log_single_rank(logger, logging.INFO,
+                    f"Using Best-Fit Decreasing packing strategy ({_accel})")
                 document_index, sample_index = _build_sample_idx_bfd(
-                    sequence_lengths_for_cpp,
-                    document_index,
-                    sequence_length,
+                    virtual_sizes, virtual_idx, sequence_length,
                     add_extra_token=self.config.add_extra_token_to_sequence,
                 )
             else:
                 sample_index = helpers.build_sample_idx_packed_whole_docs(
-                    sequence_lengths_for_cpp,
-                    document_index,
-                    sequence_length,
+                    virtual_sizes, virtual_idx, sequence_length,
                     add_extra_token_to_sequence=self.config.add_extra_token_to_sequence,
                 )
+                document_index = virtual_idx
 
             # Log packing statistics for the single epoch
             self._log_packing_statistics(document_index, sample_index, from_cache=False)
@@ -370,13 +677,14 @@ class ApertusSFTDataset(GPTDataset):
                 "description": self.unique_description,
                 "document_index": document_index,
                 "sample_index": sample_index,
-                "shuffle_index": shuffle_index
+                "shuffle_index": shuffle_index,
+                "chunk_map": chunk_map,
             })
 
             t_end = time.time()
             log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
-            return document_index, sample_index, shuffle_index
+            return document_index, sample_index, shuffle_index, chunk_map
 
         # Load from cache
         log_single_rank(
@@ -386,9 +694,10 @@ class ApertusSFTDataset(GPTDataset):
         document_index = indices["document_index"]
         sample_index = indices["sample_index"]
         shuffle_index = indices["shuffle_index"]
+        chunk_map = indices["chunk_map"]
         self._log_packing_statistics(document_index, sample_index, from_cache=True)
 
-        return document_index, sample_index, shuffle_index
+        return document_index, sample_index, shuffle_index, chunk_map
 
     def _build_shuffle_index_with_tiling(
         self, num_epoch_samples: int, numpy_random_state: np.random.RandomState
@@ -521,7 +830,8 @@ class ApertusSFTDataset(GPTDataset):
         Packs documents as defined in pre-computed index.
             - sample-index: defines ranges of documents to be packed together ex. sample i has interval ( doc-idx[sample-idx[i]], doc-idx[sample-idx[i+1]] (
             - shuffle-index: randomizes packed samples (positions in sample index)
-            - document-index: maps documents to low-level-dset documents (randomize raw doc order)
+            - document-index: permutation of virtual chunk IDs; each is looked up via chunk_map
+              to obtain [real_doc_id, chunk_start, chunk_len]
 
         Args:
             idx (int): Index of sample to retrieve
@@ -546,9 +856,13 @@ class ApertusSFTDataset(GPTDataset):
         doc_end_indices = [] # store positions of sample ends (use to reset pos id and attn mask)
 
         for i in range(doc_index_beg, doc_index_end):
-            # Get the actual document ID from document_index & load whole document
-            doc_id = self.document_index[i]
-            document = self.dataset.get(doc_id)
+            # chunk_map[virtual_id] = [real_doc_id, chunk_start, chunk_len]. Load exactly the
+            # chunk slice; no full-document load or truncation needed (chunks <= capacity).
+            virtual_id = int(self.document_index[i])
+            real_doc_id = int(self.chunk_map[virtual_id, 0])
+            chunk_start = int(self.chunk_map[virtual_id, 1])
+            chunk_len   = int(self.chunk_map[virtual_id, 2])
+            document = self.dataset.get(real_doc_id, offset=chunk_start, length=chunk_len)
 
             # If loading loss masks from disk, split the document into tokens and loss_mask
             if self.config.sft_load_loss_mask:
@@ -557,16 +871,11 @@ class ApertusSFTDataset(GPTDataset):
                 doc_tokens = document[:doc_len]
                 doc_loss_mask = document[doc_len:]
 
-                # Truncate document and end with EOD if too long
-                doc_tokens = self._truncate_sequence_if_needed(doc_tokens, target_length, self._eod_token_id)
-                doc_loss_mask = self._truncate_sequence_if_needed(doc_loss_mask, target_length, 0.0)
-
                 document_tokens.append(doc_tokens)
                 document_loss_masks.append(doc_loss_mask)
                 doc_end_indices.append(doc_tokens.size)
             else:
                 # Original behavior: no loss mask splitting
-                document = self._truncate_sequence_if_needed(document, target_length, self._eod_token_id)
                 document_tokens.append(document)
                 doc_end_indices.append(document.size)
 
@@ -589,7 +898,7 @@ class ApertusSFTDataset(GPTDataset):
             # This should never happen with correct packing - raise error
             raise RuntimeError(
                 f"Packed sample {idx} exceeded target length ({len(text)} > {target_length}). "
-                f"This indicates a bug in build_sample_idx_packed_whole_docs. "
+                f"This indicates a bug in _build_virtual_docs or the packing index. "
                 f"Sample contains {len(document_tokens)} documents."
             )
 
@@ -686,10 +995,12 @@ class ApertusSFTDataset(GPTDataset):
             labels = torch.roll(text, shifts=-1, dims=0)
             labels[-1] = self._pad_token_id
 
-        # Generate loss-mask, position-ids, assistant mask and optionally attention mask. If PLW activated, loss mask will have partial weight for user input tokens
+        # Generate loss-mask, position-ids, assistant mask and optionally attention mask.
+        # tokens are passed for BOS detection in subdoc masking; labels drive matching.
         attention_mask, loss_mask, position_ids, assistant_mask = self._get_ltor_masks_and_position_ids(
-            labels, # labels are used to create the loss and assistant mask
-            eos_idx, # eos_idx is based on tokens(NOT labels) and controls position-ids and attn mask reset
+            tokens,
+            labels,
+            eos_idx,
             torch.from_numpy(preloaded_loss_mask).float() if preloaded_loss_mask is not None else None
         )
 
@@ -716,11 +1027,16 @@ class ApertusSFTDataset(GPTDataset):
                 "assistant_mask": assistant_mask,
             }
 
-    def _get_ltor_masks_and_position_ids(self, data: torch.Tensor, eos_indices: np.ndarray, preloaded_loss_mask: Optional[torch.Tensor] = None) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def _get_ltor_masks_and_position_ids(self, tokens: torch.Tensor, data: torch.Tensor, eos_indices: np.ndarray, preloaded_loss_mask: Optional[torch.Tensor] = None) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
-        Build masks and position id for SFT data. Possibility to mask arbitrary (also special) token(sequences).
-            1. Can mask full user prompts or with prompt-loss-weight (plw)
-            2. Can mask arbitrary token sequences (e.g. assistant begin, assistant end, BOS, EOS)
+        Build masks and position ids for mixed pre-training + SFT data.
+        loss_mask starts at 1 for all tokens (pre-training default). Per-subdoc scaffold
+        masking via _process_subdoc_masking then zeros prompt regions for SFT sub-documents,
+        leaving pre-training sub-documents (no <|system_start|>) fully unmasked.
+        Also creates an assistant_mask to identify assistant response tokens (always built
+        on-the-fly, even when preloaded_loss_mask is used).
+            1. Can mask full user prompts (per-subdoc, always)
+            2. Special tokens are handled implicitly via _process_subdoc_masking
             3. Creates attention mask if configured. The attention mask will exclude padding tokens from attention.
             4. Can equalize sample loss for packed and non-packed sequences (loss = 1 for each sample in seq)
 
@@ -729,18 +1045,18 @@ class ApertusSFTDataset(GPTDataset):
             - Attention mask blocks cross-document attention at EOD boundaries
             - ASSUMES NO WRONG PLACED EOD (=ONLY PROPERLY BOUNDARY OF SAMPLES)
 
-        Also creates an assistant_mask to identify assistant response tokens for separate loss tracking.
-
         Args:
-            data:                   labels
+            tokens:                 tokens (text[:-1]), used only for BOS detection in subdoc masking.
+            data:                   labels (text[1:]).
             eos_indices:            indices of document boundaries (calculated based on sample loading from low level dataset as
                                     sft data can be contaminated with eod or eod missing).
-            preloaded_loss_mask:    Optional pre-computed loss mask loaded from disk. If provided, user prompt masking
-                                    and special token masking are skipped for loss_mask.
+            preloaded_loss_mask:    Optional pre-computed loss mask loaded from disk. If provided, scaffold
+                                    masking is skipped for loss_mask (but assistant_mask is still populated).
         """
 
         position_ids = torch.arange(self.model_seq_length, dtype=torch.long)
-        loss_mask = preloaded_loss_mask.to(device=data.device) if preloaded_loss_mask is not None else torch.zeros(self.model_seq_length, dtype=torch.float, device=data.device)
+        # Start at ones (pre-training default). Scaffold regions are zeroed by _process_subdoc_masking.
+        loss_mask = preloaded_loss_mask.to(device=data.device) if preloaded_loss_mask is not None else torch.ones(self.model_seq_length, dtype=torch.float, device=data.device)
 
         # 0) For packed samples: reset position IDs at document boundaries
         if self._using_packed_samples:
@@ -752,36 +1068,17 @@ class ApertusSFTDataset(GPTDataset):
                         to_subtract = position_ids[eod_idx].clone() + 1
                         position_ids[(eod_idx + 1):] -= to_subtract
 
-        # 1) unmask assistant parts and set rest to plw value (if not loaded from disk) otherwise assistant loss needed
-        #    to keep track of assistant loss
-        # NOTE: Left truncation can cut into an assistant response, leaving an orphaned end_seq
-        # with no preceding begin_seq. In that case tokens before the first end_seq are incorrectly
-        # treated as non-assistant. A fix would detect orphaned end markers and mask 0..first_end
-        # as assistant. Same applies to right truncation of pre-packed data cutting through a begin_seq.
-        begin_seq = self._sft_assistant_begin_sequence.to(dtype=data.dtype, device=data.device)
-        end_seq = self._sft_assistant_end_sequence.to(dtype=data.dtype, device=data.device)
-        assistant_mask = get_matching_mask_by_start_end(data, begin_seq, end_seq)
+        # 1) Per-subdoc scaffold masking + assistant_mask.
+        # Pre-training sub-documents pass through Case 1 of _process_subdoc_masking
+        # unchanged (loss_mask stays 1). SFT sub-documents have scaffold zeroed.
+        # When preloaded_loss_mask is given, scaffold writes go to a scratch tensor so the
+        # disk-loaded mask is preserved; assistant_mask is still populated.
+        assistant_mask = torch.zeros(self.model_seq_length, dtype=torch.bool, device=data.device)
+        scaffold_target = loss_mask if preloaded_loss_mask is None else torch.zeros_like(loss_mask)
+        for span_start, span_end in _get_subdoc_spans_from_eos(eos_indices, self.model_seq_length):
+            _process_subdoc_masking(data, tokens, scaffold_target, assistant_mask, span_start, span_end, self._special_ids)
 
-        # Only apply to loss_mask if NOT loading from disk
-        if preloaded_loss_mask is None:
-            loss_mask[assistant_mask] = 1
-            if self.sft_plw_value > 0:
-                loss_mask[~assistant_mask] = self.sft_plw_value # value is 0 by default for full masking
-
-
-        # 2) Mask loss for special tokens (if activated) - only if not load loss from disk
-        if preloaded_loss_mask is None:
-            for t in self.tokens_to_mask:
-                t_tensor = t.to(dtype=data.dtype, device=data.device)
-                if len(t_tensor) == 1:
-                    mask = (data == t_tensor[0])
-                elif len(t_tensor) > 1:
-                    mask = get_matching_mask(data, t_tensor, only_begin=False)
-                else:
-                    raise ValueError(f"Invalid token to mask: {t}")
-                loss_mask[mask] = 0.0
-
-        # 3) Create attention mask: mask attention from/to padding tokens
+        # 2) Create attention mask: mask attention from/to padding tokens
         if self.config.create_attention_mask:
             attention_mask = torch.tril(
                 torch.ones((self.model_seq_length, self.model_seq_length), device=data.device)
@@ -807,12 +1104,12 @@ class ApertusSFTDataset(GPTDataset):
         else:
             attention_mask = None
 
-        # 4) Make sure padding tokens are masked even if they are part of an assistant answer somehow TODO: check!
+        # 3) Make sure padding tokens are masked even if they are part of an assistant answer somehow TODO: check!
         loss_mask[data == self._pad_token_id] = 0.0
         if assistant_mask is not None:
             assistant_mask[data == self._pad_token_id] = False
 
-        # 5) Equalize sample loss
+        # 4) Equalize sample loss
         if self.config.sft_equalize_sample_loss:
             # Add small epsilon to prevent division by very small numbers
             eps = 1e-10
@@ -839,89 +1136,6 @@ class ApertusSFTDataset(GPTDataset):
                         loss_mask[start_idx:] = segment_mask / segment_loss_sum
 
         return attention_mask, loss_mask, position_ids, assistant_mask
-
-
-def get_matching_mask(sequence, query: torch.Tensor, only_begin:bool=True):
-    """
-    Given a sequence and a query, return a mask indicating which positions in the sequence match the query.
-    If the query has len > 1, only_begin arg will determine whether the mask is true only where
-    the query begins in the sequence. Otherwise, full query is masked.
-    """
-    query_len = len(query)
-    # Vectorized pattern matching using unfold
-    if query_len == 1:
-        matches = (sequence == query[0])
-    else:
-        # Create sliding windows
-        windows = sequence.unfold(0, query_len, 1)
-        # Compare all windows at once
-        matches = (windows == query).all(dim=1)
-        # Pad to original length
-        matches = F.pad(matches, (0, query_len - 1), value=False)
-        if not only_begin:
-            matches_float = matches.float().unsqueeze(0).unsqueeze(0)  # (1, 1, N)
-            kernel = torch.ones(1, 1, query_len, device=sequence.device)
-            expanded = F.conv1d(matches_float, kernel, padding=query_len - 1)
-            matches = (expanded.squeeze(0).squeeze(0)[:len(sequence)] > 0)
-    return matches
-
-
-def get_matching_mask_by_start_end(sequence, begin_seq: torch.Tensor, end_seq: torch.Tensor):
-    """
-    Given a sequence and a start and end query, return a mask indicating which positions in the sequence
-    are between the start and end queries (inclusive).
-
-    Limitation: If the sequence starts mid-region (e.g. due to left truncation), an orphaned end_seq
-    without a preceding begin_seq will be ignored, leaving those leading tokens unmasked.
-    """
-    mask = torch.zeros(len(sequence), dtype=torch.bool, device=sequence.device)
-    begin_len = len(begin_seq)
-    end_len = len(end_seq)
-
-    if 0 < begin_len <= len(sequence):
-        matches_begin = get_matching_mask(sequence, begin_seq, only_begin=True)
-
-        if 0 < end_len <= len(sequence):
-            matches_end = get_matching_mask(sequence, end_seq, only_begin=True)
-            end_indices = torch.where(matches_end)[0]
-        else:
-            end_indices = torch.empty(0, dtype=torch.long, device=sequence.device)
-
-        begin_indices = torch.where(matches_begin)[0]
-
-        # Vectorized masking
-        if len(begin_indices) > 0 and len(end_indices) > 0:
-            # For each begin, find the next ends (vectorized)
-            end_matrix = end_indices.unsqueeze(0) > begin_indices.unsqueeze(1)
-            has_valid_end = end_matrix.any(dim=1)
-            first_end_idx = end_matrix.int().argmax(dim=1)
-
-            # Compute end positions for each begin
-            end_positions = torch.where(
-                has_valid_end,
-                end_indices[first_end_idx] + end_len,
-                len(mask)
-            )
-
-            # Create ranges and mask in one go, Shape: (num_begins, max_range_len)
-            max_len = (end_positions - begin_indices).max().item()
-            ranges = torch.arange(max_len, device=sequence.device).unsqueeze(0)
-            lengths = (end_positions - begin_indices).unsqueeze(1)
-
-            # Get all indices to mask
-            mask_positions = begin_indices.unsqueeze(1) + ranges
-            valid_mask = ranges < lengths
-            indices_to_mask = mask_positions[valid_mask]
-
-            mask[indices_to_mask] = True
-        elif len(begin_indices) > 0:
-            # No end sequences, mask from each begin to the end
-            max_len = len(mask) - begin_indices.min().item()
-            ranges = torch.arange(max_len, device=sequence.device).unsqueeze(0)
-            mask_positions = begin_indices.unsqueeze(1) + ranges
-            valid = mask_positions < len(mask)
-            mask[mask_positions[valid]] = True
-    return mask
 
 
 class IndexCacheManager:
