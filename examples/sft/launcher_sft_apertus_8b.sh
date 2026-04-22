@@ -3,8 +3,8 @@
 #SBATCH --account=infra01
 #SBATCH --time=0:29:00
 #SBATCH --job-name=32k_baseline
-#SBATCH --output=/capstor/scratch/cscs/dtamayomela/megatron/project/logs/slurm/training/%x-%j.out
-#SBATCH --error=/capstor/scratch/cscs/dtamayomela/megatron/project/logs/slurm/training/%x-%j.err
+#SBATCH --output=./logs/slurm/training/%x-%j.out
+#SBATCH --error=./logs/slurm/training/%x-%j.err
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=72
@@ -257,7 +257,6 @@ mkdir -p $PROJECT_DIR
 mkdir -p $DEBUG_DIR
 mkdir -p $LOGGING_DIR
 export PYTHONPATH=$MEGATRON_LM_DIR
-export PYTHONPATH=/capstor/scratch/cscs/$USER/pip-packages:$PYTHONPATH
 
 # Data Args
 if [ "$MOCK_DATA" = true ]; then
