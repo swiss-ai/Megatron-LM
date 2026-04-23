@@ -47,7 +47,6 @@ class BlendedDataset(torch.utils.data.Dataset):
     ) -> None:
         assert len(datasets) == len(weights)
         assert len(datasets) < 32767
-        assert all(map(lambda _: type(_) == type(datasets[0]), datasets))
         assert all(map(lambda _: _.index_split == datasets[0].index_split, datasets))
         assert all(map(lambda _: _ > 0, weights))
         assert all(map(lambda _: type(_) == type(weights[0]), weights))

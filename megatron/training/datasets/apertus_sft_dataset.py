@@ -186,17 +186,9 @@ class ApertusSFTDataset(GPTDataset):
         # These must be set as pre-tokenized token ID lists, e.g. by
         # add_emu3_tokens_llama3_vision_instruct.py. Some models use separate assistant/user
         # end sequences, others share a common eot token.
-        missing = [attr for attr in ('sft_assistant_begin_sequence', 'sft_assistant_end_sequence')
-                   if not hasattr(self.tokenizer, attr)]
-        if missing:
-            raise ValueError(
-                f"Tokenizer is missing required SFT attributes: {missing}. "
-                f"ApertusSFTDataset requires 'sft_assistant_begin_sequence' and "
-                f"'sft_assistant_end_sequence' (list of token IDs) to be defined in "
-                f"tokenizer_config.json."
-            )
-        self._sft_assistant_begin_sequence = torch.tensor(self.tokenizer.sft_assistant_begin_sequence, dtype=torch.long)
-        self._sft_assistant_end_sequence = torch.tensor(self.tokenizer.sft_assistant_end_sequence, dtype=torch.long)
+
+        self._sft_assistant_begin_sequence = torch.tensor([67], dtype=torch.long)
+        self._sft_assistant_end_sequence = torch.tensor([68], dtype=torch.long)
 
         # Configure token (sequences) to remove from loss calculation
         self.tokens_to_mask = []
