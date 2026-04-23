@@ -12,7 +12,7 @@
 
 HF_PATH="/iopsstor/scratch/cscs/hyukhymenko/sft-1.1-mixes/v1p5-mix-v1-19-04-linearised"
 DATA_BASE="/capstor/scratch/cscs/dtamayomela/tokenize_it_data/sft_data/output.parquet"
-MEGATRON_PATH="/capstor/scratch/cscs/dtamayomela/megatron/pre-training/megatron_main"
+MEGATRON_PATH="/iopsstor/scratch/cscs/dtamayomela/megatron_folders/megatron_main"
 OUTPUT_FOLDER="datasets/sft_data"
 
 srun --environment=/capstor/scratch/cscs/dtamayomela/containers/data-pipeline.toml bash -c "\

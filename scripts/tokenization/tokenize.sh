@@ -7,6 +7,7 @@
 #SBATCH --cpus-per-task=288
 #SBATCH --environment=/capstor/scratch/cscs/dtamayomela/containers/data-pipeline.toml # WARN(tj.solergibert) Modify path to your own file
 #SBATCH --no-requeue
+#SBATCH --reservation=SD-69241-apertus-1-5
 
 input_folder=$1
 output_folder=$2

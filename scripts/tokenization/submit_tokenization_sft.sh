@@ -1,0 +1,42 @@
+#!/bin/bash
+
+# ⚠️ WARNING ⚠️
+# Make sure to prepare the dumps before tokenizing the data!
+# Check scripts/tokenization/prepare_dumps.py
+# ⚠️ WARNING ⚠️
+
+NUMBER_OF_DATATROVE_TASKS=64
+TOKENIZER=swiss-ai/Apertus-8B-Instruct-2509
+TOKENIZER_NAME=Apertus-8B-Instruct-2509
+DATASET_NAME=sft_data
+COLUMN_KEY=text
+
+REHYDRATE=False  # Set to True or False
+if [ "$REHYDRATE" = "True" ]; then
+  REHYDRATE_FLAG="--rehydrate"
+else
+  REHYDRATE_FLAG=""
+fi
+
+MEGATRON_LM_DIR=/iopsstor/scratch/cscs/dtamayomela/megatron_folders/megatron_main
+PATH_TO_PREPROCESSING_METADATA=$MEGATRON_LM_DIR/datasets/$DATASET_NAME # Where dumps are stored
+PATH_TO_DATATROVE_LOGGING_DIR=$MEGATRON_LM_DIR/logs/datatrove # Where datatrove logs are stored
+PATH_TO_SLURM_LOGGING_DIR=$MEGATRON_LM_DIR/logs/slurm/tokenization-$TOKENIZER_NAME-$DATASET_NAME
+PATH_TO_OUTPUT_FOLDER=/capstor/scratch/cscs/dtamayomela/data/tokenized_data_sft # Where tokenized datasets are stored
+
+DATASET_OUTPUT_FOLDER_NAME=$PATH_TO_OUTPUT_FOLDER/$TOKENIZER_NAME/$DATASET_NAME
+CSV_RESULTS_FILE=$PATH_TO_PREPROCESSING_METADATA/tokenize-$TOKENIZER_NAME-$DATASET_NAME.csv
+
+mkdir -p $DATASET_OUTPUT_FOLDER_NAME
+mkdir -p $PATH_TO_SLURM_LOGGING_DIR
+mkdir -p $PATH_TO_PREPROCESSING_METADATA/completed-dumps
+ln -sfn $DATASET_OUTPUT_FOLDER_NAME $PATH_TO_PREPROCESSING_METADATA/tokenized-dir-link
+
+echo "slurm_job_id,node,start,end,paths_file,output_folder,dataset_total_size,processed_total_size,number_of_workers_per_node,time,bw,total_tokens_processed,throughput (Million Tokens/Second/Node)" > $CSV_RESULTS_FILE
+# Iterate through all dumps paths files
+for paths_file in "$PATH_TO_PREPROCESSING_METADATA/dumps"/*; do
+  dump=$(grep -oP '(?<=paths_file_)\d+(?=\.txt)' <<< $paths_file)
+  output_folder=$DATASET_OUTPUT_FOLDER_NAME/dump-$dump
+  logging_dir=$PATH_TO_DATATROVE_LOGGING_DIR/$TOKENIZER_NAME/$DATASET_NAME/dump-$dump
+  sbatch --job-name=tokenize-$DATASET_NAME-dump-$dump --output=$PATH_TO_SLURM_LOGGING_DIR/R-%x-%j.out --error=$PATH_TO_SLURM_LOGGING_DIR/R-%x-%j.err $MEGATRON_LM_DIR/scripts/tokenization/tokenize.sh $PATH_TO_PREPROCESSING_METADATA/raw-dataset-link $output_folder $TOKENIZER $logging_dir $CSV_RESULTS_FILE $paths_file $NUMBER_OF_DATATROVE_TASKS $MEGATRON_LM_DIR $COLUMN_KEY $REHYDRATE_FLAG
+done  
