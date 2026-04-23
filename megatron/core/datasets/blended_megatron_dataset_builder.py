@@ -443,8 +443,6 @@ class BlendedMegatronDatasetBuilder(object):
         else:
             dataset_cls = GPTDataset
 
-        print(f"Dataset {dataset_path} has {dataset_cls} class")
-
         synchronize_ranks = (
             False
             if (
