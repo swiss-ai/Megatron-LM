@@ -52,8 +52,7 @@ def add_arguments(parser):
     group.add_argument('--extend-vocab-to', type=int, default=None,
                        help='If set, pad the input/output embedding tables to this vocab size '
                             '(used for adding multimodal / image tokens before training). '
-                            'New rows are initialized from the mean of the existing embeddings '
-                            'plus small Gaussian jitter.')
+                            'New rows are initialized from the mean and std of the existing embeddings ')
 
 
 def load_args_from_checkpoint(args, load_dir):
@@ -97,9 +96,7 @@ def extend_embedding_table(weight: torch.Tensor, new_vocab_size: int) -> torch.T
     """Append rows to an embedding / lm_head weight table up to ``new_vocab_size``.
 
     The new rows are sampled from a Gaussian whose per-dimension mean and std
-    match the empirical distribution of the existing rows. This matches the
-    statistics of the pretrained tokens and converges faster than fixed-std
-    or zero init.
+    match the empirical distribution of the existing rows.
 
     The first ``weight.shape[0]`` rows of the returned tensor are exactly the
     input rows (in the same dtype), so any forward pass that only indexes
