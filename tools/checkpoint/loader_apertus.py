@@ -49,6 +49,11 @@ def add_arguments(parser):
                        help='Base directory of Megatron repository')
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Make vocab size divisible by this value')
+    group.add_argument('--extend-vocab-to', type=int, default=None,
+                       help='If set, pad the input/output embedding tables to this vocab size '
+                            '(used for adding multimodal / image tokens before training). '
+                            'New rows are initialized from the mean of the existing embeddings '
+                            'plus small Gaussian jitter.')
 
 
 def load_args_from_checkpoint(args, load_dir):
@@ -86,6 +91,35 @@ def load_args_from_checkpoint(args, load_dir):
     args.iteration = 1  # '0' doesn't work with some savers
 
     return args
+
+
+def extend_embedding_table(weight: torch.Tensor, new_vocab_size: int) -> torch.Tensor:
+    """Append rows to an embedding / lm_head weight table up to ``new_vocab_size``.
+
+    The new rows are sampled from a Gaussian whose per-dimension mean and std
+    match the empirical distribution of the existing rows. This matches the
+    statistics of the pretrained tokens and converges faster than fixed-std
+    or zero init.
+
+    The first ``weight.shape[0]`` rows of the returned tensor are exactly the
+    input rows (in the same dtype), so any forward pass that only indexes
+    token IDs ``< weight.shape[0]`` is bit-identical to the original.
+    """
+    old_vocab_size = weight.shape[0]
+    if new_vocab_size < old_vocab_size:
+        raise ValueError(
+            f"new_vocab_size={new_vocab_size} is smaller than current vocab size "
+            f"({old_vocab_size}); shrinking is not supported."
+        )
+    if new_vocab_size == old_vocab_size:
+        return weight
+
+    n_new = new_vocab_size - old_vocab_size
+    w_f32 = weight.to(torch.float32)
+    mean = w_f32.mean(dim=0, keepdim=True)
+    std = w_f32.std(dim=0, keepdim=True)
+    new_rows = mean + std * torch.randn(n_new, w_f32.shape[1], dtype=torch.float32)
+    return torch.cat([weight, new_rows.to(weight.dtype)], dim=0)
 
 
 def _load_checkpoint(queue, args):
@@ -169,6 +203,36 @@ def _load_checkpoint(queue, args):
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.tokenizer_model, trust_remote_code=True)
     true_vocab_size = len(tokenizer)
 
+    # Optionally extend the embedding / lm_head tables (e.g. for adding image tokens).
+    # We do the padding here, on the source HF tensors, so that the saver only sees a
+    # checkpoint that already has the new vocab size. This avoids any runtime module
+    # surgery, plays nicely with TP/PP/FSDP, and correctly handles tied embeddings.
+    # It was previously done in megatron/training/checkpointing.py but that
+    # caused various complications and edge cases especially for TP/PP/FSDP.
+    word_embed = hf_model.model.embed_tokens.weight.data
+    lm_head_weight = hf_model.lm_head.weight.data if margs.untie_embeddings_and_output_weights else None
+
+    if args.extend_vocab_to is not None:
+        old_vocab_size = word_embed.shape[0]
+        new_vocab_size = args.extend_vocab_to
+        if new_vocab_size > old_vocab_size:
+            print(f"Extending vocab from {old_vocab_size} to {new_vocab_size} "
+                  f"(+{new_vocab_size - old_vocab_size} rows)")
+            word_embed = extend_embedding_table(word_embed, new_vocab_size)
+            if lm_head_weight is not None:
+                lm_head_weight = extend_embedding_table(lm_head_weight, new_vocab_size)
+
+            # Reflect the new vocab size in args/metadata so the saver builds a model
+            # of the right size and chunks the embedding correctly across TP.
+            true_vocab_size = new_vocab_size
+            margs.vocab_size = new_vocab_size
+            margs.padded_vocab_size = new_vocab_size
+        elif new_vocab_size < old_vocab_size:
+            raise ValueError(
+                f"--extend-vocab-to={new_vocab_size} is smaller than the current vocab size "
+                f"({old_vocab_size}); shrinking is not supported."
+            )
+
     # Build metadata
     md = types.SimpleNamespace()
     md.model_type = args.model_type
@@ -207,7 +271,7 @@ def _load_checkpoint(queue, args):
 
     # Send embeddings
     message = {
-        "word embeddings": hf_model.model.embed_tokens.weight.data,
+        "word embeddings": word_embed,
     }
     queue_put("embeddings", message)
 
@@ -283,7 +347,7 @@ def _load_checkpoint(queue, args):
     # Send output layer (lm_head)
     if md.output_layer:
         message = {
-            "weight": hf_model.lm_head.weight.data,
+            "weight": lm_head_weight,
         }
         queue_put("output layer", message)
 
