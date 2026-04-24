@@ -287,9 +287,17 @@ class ApertusSFTDataset(GPTDataset):
         # add_emu3_tokens_llama3_vision_instruct.py. Some models use separate assistant/user
         # end sequences, others share a common eot token.
 
-        self._sft_assistant_begin_sequence = torch.tensor([67], dtype=torch.long)
-        self._sft_assistant_end_sequence = torch.tensor([68], dtype=torch.long)
-        self._sft_system_start_sequence = torch.tensor([61], dtype=torch.long)
+
+        special_tokens = {
+            "assistant_begin": "<|assistant_start|>",
+            "assistant_end": "<|assistant_end|>",
+            "system_start": "<|system_start|>"
+        }
+
+        for attr, string in special_tokens.items():
+            token_id = self.tokenizer._tokenizer.tokenizer.encode(string, add_special_tokens=False)
+            token_list = token_id if isinstance(token_id, list) else [token_id]
+            setattr(self, f"_sft_{attr}_sequence", torch.tensor(token_list, dtype=torch.long))
 
         # Configure token (sequences) to remove from loss calculation
         self.tokens_to_mask = []

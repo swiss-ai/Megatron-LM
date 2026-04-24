@@ -98,6 +98,24 @@ python3 scripts/tools/create_data_mixture.py --folders datasets/fineweb-edu fine
 Upon successfully creating a mixture, we will see its statistics, such as the number of tokens, the number of file prefixes per dataset, and the total size of the mixture.  
 
 Keep in mind that the mixture will be created **without repetition**. This means that we will construct the mixture while respecting the weights until a dataset is exhausted.
+# Pre-Training
+
+This framework supports document packing for pre-training using greedy sampling (default) and best-fit decreasing (BFD) strategies.
+
+To enable best-fit decreasing packing, add the following arguments to your launcher script:
+
+```bash
+--pretraining-packing-strategy bfd
+--max_docs_per_bin 64
+```
+
+- `--pretraining-packing-strategy` controls the packing algorithm:
+  - `greedy` (default) standard greedy sampling.
+  - `bfd` best-fit decreasing packing for improved packing efficiency.
+
+- `--max_docs_per_bin` sets the maximum number of documents per packed bin.
+  - Default: `0` (no limit).
+  - Useful when working with many small documents, where packing too many documents into a bin can reduce throughput.
 
 # Supervised Fine-Tuning (SFT)
 

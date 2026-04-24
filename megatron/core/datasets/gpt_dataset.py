@@ -140,9 +140,8 @@ def _build_virtual_docs(document_index, sequence_lengths, capacity, eod_token_id
     return chunk_map, virtual_sizes
 
 
-def _build_sample_idx_bfd(sequence_lengths, document_index, seq_length, add_extra_token):
+def _build_sample_idx_bfd(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin):
     """Best-Fit Decreasing bin packing for whole documents. C-accelerated when available."""
-    max_docs_per_bin = int(os.environ.get("SFT_MAX_DOCS_PER_BIN", "0") or "0")
     if _bfd_c_lib is not None:
         return _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin)
     return _build_sample_idx_bfd_python(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin)
@@ -320,6 +319,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
 
     sft_packing_strategy: str = "bfd"
     """Packing strategy for SFT: 'greedy' (sequential) or 'bfd' (Best-Fit Decreasing)."""
+
+    pretraining_packing_strategy: str = "greedy"
+    """Packing strategy for SFT: 'greedy' (sequential) or 'bfd' (Best-Fit Decreasing)."""
+
+    max_docs_per_bin: int = 0
+    """Maximum number of documents allowed per sample in bfd, 0 means no limit"""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
@@ -683,8 +688,9 @@ class GPTDataset(MegatronDataset):
         Returns:
             Tuple[numpy.ndarray, numpy.ndarray]: The text ids and document ids
         """
-        if self.config.sft_packing_strategy == "bfd":
+        if self.config.pretraining_packing_strategy == "bfd":
             return self._query_bfd_packed_sample(idx)
+        
         if self.shuffle_index is None:
             # NOTE(asolergi-nv): Lazy memmap the indexes
             self.shuffle_index = numpy.load(
@@ -828,6 +834,7 @@ class GPTDataset(MegatronDataset):
             document_index, sample_index = _build_sample_idx_bfd(
                 virtual_sizes, virtual_idx, sequence_length,
                 add_extra_token=self.config.add_extra_token_to_sequence,
+                max_docs_per_bin=self.config.max_docs_per_bin
             )
             self._log_bfd_packing_statistics(
                 num_docs=len(real_doc_index),
@@ -970,7 +977,7 @@ class GPTDataset(MegatronDataset):
             index, and the shuffle index
         """
 
-        if self.config.sft_packing_strategy == "bfd":
+        if self.config.pretraining_packing_strategy == "bfd":
             return self._build_bfd_packing_indices()
         if self.config.defer_npy_index_mmap:
             # NOTE(asolergi-nv): Direct path to lazy memmap the indexes
