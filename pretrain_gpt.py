@@ -119,10 +119,16 @@ def get_batch(data_iterator, vp_stage=None):
         # Step 1b: merge sequences that are too short for CP 
         _divisibility = 2 * cp_size
         _seq_lens = cu_seq[1:] - cu_seq[:-1]
+
+        _keep = _seq_lens >= _divisibility
+
+        # Expand to match cu_seq size and force first/last to stay
         _keep = torch.cat([
-            torch.tensor([True], device=device),
-            _seq_lens >= _divisibility,
+            torch.tensor([True], device=device),  # always keep first
+            _keep
         ])
+        _keep[-1] = True  # always keep last
+
         cu_seq = cu_seq[_keep]
 
         if cp_size > 1:
@@ -147,6 +153,7 @@ def get_batch(data_iterator, vp_stage=None):
                 padding_token_id=tokenizer.eod,
                 padding_label_id=-100,
             )
+
             input_ids_padded = input_ids_padded.to(device)
             labels_padded = labels_padded.to(device)
             cu_seqlens_padded = cu_seqlens_padded.to(device=device, dtype=torch.int32)
@@ -499,6 +506,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     current_modality_weights=current_modality_weights,
                 )
             else:
+                
                 output_tensor = model(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask,
                     packed_seq_params=packed_seq_params
@@ -592,7 +600,9 @@ def core_gpt_dataset_config_from_args(args):
         "sft_pack_samples": args.ap_sft_pack_samples,
         "sft_packing_strategy": args.ap_sft_packing_strategy,
         "sft_equalize_sample_loss": args.ap_sft_equalize_sample_loss,
-        "sft_truncate_right": args.ap_sft_truncate_right
+        "sft_truncate_right": args.ap_sft_truncate_right,
+        "pretraining_packing_strategy": args.pretraining_packing_strategy,
+        "max_docs_per_bin": args.max_docs_per_bin,
     }
 
     # add FIM args to the config
