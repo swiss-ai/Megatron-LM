@@ -41,7 +41,12 @@ def _load_bfd_c_library():
     so_path  = os.path.join(_dir, "libbfd_pack.so")
     cpp_path = os.path.join(_dir, "bfd_pack.cpp")
 
-    if os.path.isfile(so_path):
+    # Rebuild if source is newer (e.g. after the max_docs_per_bin signature change).
+    so_is_fresh = (
+        os.path.isfile(so_path)
+        and (not os.path.isfile(cpp_path) or os.path.getmtime(so_path) >= os.path.getmtime(cpp_path))
+    )
+    if so_is_fresh:
         try:
             lib = ctypes.CDLL(so_path)
             lib.bfd_pack.argtypes = [
@@ -49,6 +54,7 @@ def _load_bfd_c_library():
                 ctypes.POINTER(ctypes.c_long), # doc_lengths
                 ctypes.c_int,                  # num_docs
                 ctypes.c_int,                  # capacity
+                ctypes.c_int,                  # max_docs_per_bin (0 = no cap)
                 ctypes.POINTER(ctypes.c_int),  # document_index
                 ctypes.POINTER(ctypes.c_int),  # doc_idx_out
                 ctypes.POINTER(ctypes.c_int),  # boundaries_out
@@ -136,12 +142,13 @@ def _build_virtual_docs(document_index, sequence_lengths, capacity, eod_token_id
 
 def _build_sample_idx_bfd(sequence_lengths, document_index, seq_length, add_extra_token):
     """Best-Fit Decreasing bin packing for whole documents. C-accelerated when available."""
+    max_docs_per_bin = int(os.environ.get("SFT_MAX_DOCS_PER_BIN", "0") or "0")
     if _bfd_c_lib is not None:
-        return _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_extra_token)
-    return _build_sample_idx_bfd_python(sequence_lengths, document_index, seq_length, add_extra_token)
+        return _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin)
+    return _build_sample_idx_bfd_python(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin)
 
 
-def _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_extra_token):
+def _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin=0):
     """C-accelerated BFD bin packing via ctypes. See _build_sample_idx_bfd."""
     import ctypes
 
@@ -159,7 +166,7 @@ def _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_ex
     _bfd_c_lib.bfd_pack(
         sorted_positions.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
         doc_lengths.ctypes.data_as(ctypes.POINTER(ctypes.c_long)),
-        num_docs, capacity,
+        num_docs, capacity, int(max_docs_per_bin),
         doc_index_i32.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
         doc_idx_out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
         boundaries_out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
@@ -175,7 +182,7 @@ def _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_ex
     return reordered, sample_index
 
 
-def _build_sample_idx_bfd_python(sequence_lengths, document_index, seq_length, add_extra_token):
+def _build_sample_idx_bfd_python(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin=0):
     """Pure-Python BFD fallback using bisect. See _build_sample_idx_bfd."""
     capacity = seq_length + add_extra_token
     num_docs = len(document_index)
@@ -186,6 +193,10 @@ def _build_sample_idx_bfd_python(sequence_lengths, document_index, seq_length, a
     bins_sorted = []
     bin_contents = []
 
+    # A bin is at the cap iff max_docs_per_bin > 0 and it already holds that many docs.
+    def _capped(bid):
+        return max_docs_per_bin > 0 and len(bin_contents[bid]) >= max_docs_per_bin
+
     for pos in sorted_positions:
         length = int(doc_lengths[pos])
         if length > capacity:
@@ -195,23 +206,26 @@ def _build_sample_idx_bfd_python(sequence_lengths, document_index, seq_length, a
             if bins_sorted:
                 _, bin_id = bins_sorted[0]
                 bin_contents[bin_id].append(int(pos))
+                if _capped(bin_id):
+                    bins_sorted.pop(0)
             else:
                 bin_id = len(bin_contents)
                 bin_contents.append([int(pos)])
-                bisect.insort(bins_sorted, (capacity, bin_id))
+                if not _capped(bin_id):
+                    bisect.insort(bins_sorted, (capacity, bin_id))
             continue
         idx = bisect.bisect_left(bins_sorted, (length,))
         if idx < len(bins_sorted):
             remaining, bin_id = bins_sorted.pop(idx)
             new_remaining = remaining - length
             bin_contents[bin_id].append(int(pos))
-            if new_remaining > 0:
+            if new_remaining > 0 and not _capped(bin_id):
                 bisect.insort(bins_sorted, (new_remaining, bin_id))
         else:
             bin_id = len(bin_contents)
             bin_contents.append([int(pos)])
             new_remaining = capacity - length
-            if new_remaining > 0:
+            if new_remaining > 0 and not _capped(bin_id):
                 bisect.insort(bins_sorted, (new_remaining, bin_id))
 
     reordered = numpy.empty(num_docs, dtype=document_index.dtype)

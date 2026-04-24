@@ -8,6 +8,10 @@
 // regardless of how many bins are open.
 //
 // Thread-safe: all state is local to each bfd_pack() call.
+//
+// max_docs_per_bin: when >0, bins are withheld from the segment tree once
+// they reach the cap, clamping the upper tail of docs-per-sample. Pass 0
+// to disable.
 
 #include <vector>
 #include <queue>
@@ -82,6 +86,7 @@ extern "C" void bfd_pack(
     const long *doc_lengths,        // length of each document (indexed by position)
     int         num_docs,           // total number of documents
     int         capacity,           // bin capacity (seq_length + extra_token)
+    int         max_docs_per_bin,   // <=0 means no cap
     const int  *document_index,     // maps position -> actual document ID
     // outputs:
     int        *doc_idx_out,        // reordered document IDs  (size: num_docs)
@@ -90,6 +95,14 @@ extern "C" void bfd_pack(
 ) {
     SegmentTree tree(capacity);
     std::vector<std::vector<int>> bins;     // bins[bin_id] = list of positions
+
+    // A bin is eligible for more docs iff it has room AND is below the cap.
+    auto try_insert_bin = [&](int bin_id, int new_remaining) {
+        if (new_remaining <= 0) return;
+        if (max_docs_per_bin > 0 &&
+            static_cast<int>(bins[bin_id].size()) >= max_docs_per_bin) return;
+        tree.add_bin(new_remaining, bin_id);
+    };
 
     for (int i = 0; i < num_docs; i++) {
         int  pos    = sorted_positions[i];
@@ -107,11 +120,11 @@ extern "C" void bfd_pack(
             if (r >= 0) {
                 int bid = tree.pop_bin(r);
                 bins[bid].push_back(pos);
-                tree.add_bin(r, bid);               // remaining unchanged
+                try_insert_bin(bid, r);             // remaining unchanged
             } else {
                 int bid = static_cast<int>(bins.size());
                 bins.push_back({pos});
-                tree.add_bin(capacity, bid);
+                try_insert_bin(bid, capacity);
             }
             continue;
         }
@@ -122,12 +135,12 @@ extern "C" void bfd_pack(
             int bid   = tree.pop_bin(r);
             int new_r = r - static_cast<int>(length);
             bins[bid].push_back(pos);
-            if (new_r > 0) tree.add_bin(new_r, bid);
+            try_insert_bin(bid, new_r);
         } else {
             int bid   = static_cast<int>(bins.size());
             int new_r = capacity - static_cast<int>(length);
             bins.push_back({pos});
-            if (new_r > 0) tree.add_bin(new_r, bid);
+            try_insert_bin(bid, new_r);
         }
     }
 
