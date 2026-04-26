@@ -3345,10 +3345,6 @@ def _add_vision_args(parser):
                        dest='data_sharding')
     group.add_argument('--head-lr-mult', type=float, default=1.0,
                        help='learning rate multiplier for head during finetuning')
-    group.add_argument('--extend-model-vocab', action='store_true',
-                       help='Extend model vocabulary with vision tokens. '
-                       'This is useful for multimodal models.')
-
     # pretraining type and backbone selection`
     group.add_argument('--vision-pretraining', action='store_true',
                        help='flag to indicate vision pretraining')
