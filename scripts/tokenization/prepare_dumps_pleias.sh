@@ -1,4 +1,4 @@
-DATA_BASE="/iopsstor/scratch/cscs/bmessmer/pleias_synth/data/output"
+DATA_BASE="/capstor/scratch/cscs/snajemmeyer/SYNTH-preprocessed/data/output"
 
 OUTPUT_FOLDER="datasets/PleIAs-SYNTH"
 

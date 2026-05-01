@@ -8,10 +8,10 @@
 NUMBER_OF_DATATROVE_TASKS=20
 TOKENIZER=swiss-ai/Apertus-70B-2509
 TOKENIZER_NAME=Apertus-70B-2509
-DATASET_NAME=finetranslations # ⚠️ Change here
+DATASET_NAME=finepdfs-edu-preprocessed # ⚠️ Change here
 COLUMN_KEY=text
 
-REHYDRATE=False  # ⚠️ Set to True or False
+REHYDRATE=True  # ⚠️ Set to True or False
 if [ "$REHYDRATE" = "True" ]; then
   REHYDRATE_FLAG="--rehydrate"
 else
@@ -19,10 +19,10 @@ else
 fi
 
 MEGATRON_LM_DIR=/users/snajemmeyer/Megatron-LM
-PATH_TO_PREPROCESSING_METADATA=/capstor/store/cscs/swissai/infra01/datasets_tokenized/finetranslations_preprocessed # ⚠️ change
+PATH_TO_PREPROCESSING_METADATA=/capstor/store/cscs/swissai/infra01/datasets_tokenized/finepdfs-edu-preprocessed # ⚠️ change
 PATH_TO_DATATROVE_LOGGING_DIR=$MEGATRON_LM_DIR/logs/datatrove # Where datatrove logs are stored
 PATH_TO_SLURM_LOGGING_DIR=$MEGATRON_LM_DIR/logs/slurm/tokenization-$TOKENIZER_NAME-$DATASET_NAME
-PATH_TO_OUTPUT_FOLDER=/capstor/store/cscs/swissai/infra01/datasets_tokenized/finetranslations_preprocessed # ⚠️ Change Where tokenized datasets are stored
+PATH_TO_OUTPUT_FOLDER=/capstor/store/cscs/swissai/infra01/datasets_tokenized/finepdfs-edu-preprocessed # ⚠️ Change Where tokenized datasets are stored
 
 DATASET_OUTPUT_FOLDER_NAME=$PATH_TO_OUTPUT_FOLDER/$TOKENIZER_NAME/$DATASET_NAME
 # CSV_RESULTS_FILE=$PATH_TO_PREPROCESSING_METADATA/tokenize-$TOKENIZER_NAME-$DATASET_NAME.csv
@@ -40,5 +40,5 @@ for paths_file in "$PATH_TO_PREPROCESSING_METADATA/dumps"/*; do
   dump=$(grep -oP '(?<=paths_file_)\d+(?=\.txt)' <<< $paths_file)
   output_folder=$DATASET_OUTPUT_FOLDER_NAME/dump-$dump
   logging_dir=$PATH_TO_DATATROVE_LOGGING_DIR/$TOKENIZER_NAME/$DATASET_NAME/dump-$dump
-  sbatch --job-name=tokenize-$DATASET_NAME-dump-$dump --reservation=SD-69241-apertus-1-5 --output=$PATH_TO_SLURM_LOGGING_DIR/R-%x-%j.out --error=$PATH_TO_SLURM_LOGGING_DIR/R-%x-%j.err $MEGATRON_LM_DIR/scripts/tokenization/tokenize.sh $PATH_TO_PREPROCESSING_METADATA/raw-dataset-link $output_folder $TOKENIZER $logging_dir $CSV_RESULTS_FILE $paths_file $NUMBER_OF_DATATROVE_TASKS $MEGATRON_LM_DIR $COLUMN_KEY $REHYDRATE_FLAG
+  sbatch --reservation=SD-69241-apertus-1-5 --job-name=tokenize-$DATASET_NAME-dump-$dump --output=$PATH_TO_SLURM_LOGGING_DIR/R-%x-%j.out --error=$PATH_TO_SLURM_LOGGING_DIR/R-%x-%j.err $MEGATRON_LM_DIR/scripts/tokenization/tokenize.sh $PATH_TO_PREPROCESSING_METADATA/raw-dataset-link $output_folder $TOKENIZER $logging_dir $CSV_RESULTS_FILE $paths_file $NUMBER_OF_DATATROVE_TASKS $MEGATRON_LM_DIR $COLUMN_KEY $REHYDRATE_FLAG
 done  

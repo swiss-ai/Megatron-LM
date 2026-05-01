@@ -10,8 +10,8 @@ NUMBER_OF_DATATROVE_TASKS=5
 TOKENIZER=swiss-ai/Apertus-70B-2509
 TOKENIZER_NAME=Apertus-70B-2509
 COLUMN_KEY=text
-MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/data_ablations/Megatron-LM
-PATH_TO_OUTPUT_BASE=/capstor/store/cscs/swissai/infra01/users/bmessmer/apertus-datasets/
+MEGATRON_LM_DIR=/users/$USER/Megatron-LM
+PATH_TO_OUTPUT_BASE=/capstor/store/cscs/swissai/infra01/datasets_tokenized/
 
 MAX_SUBMISSIONS=500
 CURRENT_SUBMISSION_COUNT=0
@@ -41,7 +41,7 @@ fi
 
 
 # Define the directory where your metadata folders (finepdfs-edu-*) are located
-BASE_METADATA_DIR=$MEGATRON_LM_DIR/datasets
+BASE_METADATA_DIR=$PATH_TO_OUTPUT_BASE
 
 for dataset_path in "$BASE_METADATA_DIR"/finepdfs-edu-*; do
 
@@ -102,6 +102,7 @@ for dataset_path in "$BASE_METADATA_DIR"/finepdfs-edu-*; do
             --job-name=tok-$DATASET_NAME-$dump \
             --output=$PATH_TO_SLURM_LOGGING_DIR/R-%x-%j.out \
             --error=$PATH_TO_SLURM_LOGGING_DIR/R-%x-%j.err \
+            --reservation=SD-69241-apertus-1-5 \
             $MEGATRON_LM_DIR/scripts/tokenization/tokenize.sh \
             $PATH_TO_PREPROCESSING_METADATA/raw-dataset-link \
             $output_folder \

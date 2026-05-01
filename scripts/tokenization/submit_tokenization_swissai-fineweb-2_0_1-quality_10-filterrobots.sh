@@ -8,10 +8,10 @@
 NUMBER_OF_DATATROVE_TASKS=20
 TOKENIZER=swiss-ai/Apertus-70B-2509
 TOKENIZER_NAME=Apertus-70B-2509
-DATASET_NAME=finetranslations # ⚠️ Change here
+DATASET_NAME=swissai-fineweb-2_0_1-quality_10-filterrobots # ⚠️ Change here
 COLUMN_KEY=text
 
-REHYDRATE=False  # ⚠️ Set to True or False
+REHYDRATE=True  # ⚠️ Set to True or False
 if [ "$REHYDRATE" = "True" ]; then
   REHYDRATE_FLAG="--rehydrate"
 else
@@ -19,10 +19,10 @@ else
 fi
 
 MEGATRON_LM_DIR=/users/snajemmeyer/Megatron-LM
-PATH_TO_PREPROCESSING_METADATA=/capstor/store/cscs/swissai/infra01/datasets_tokenized/finetranslations_preprocessed # ⚠️ change
+PATH_TO_PREPROCESSING_METADATA=/capstor/store/cscs/swissai/infra01/datasets_tokenized/fineweb-2_0_1-quality_10-100_langs-filterrobots # ⚠️ change
 PATH_TO_DATATROVE_LOGGING_DIR=$MEGATRON_LM_DIR/logs/datatrove # Where datatrove logs are stored
 PATH_TO_SLURM_LOGGING_DIR=$MEGATRON_LM_DIR/logs/slurm/tokenization-$TOKENIZER_NAME-$DATASET_NAME
-PATH_TO_OUTPUT_FOLDER=/capstor/store/cscs/swissai/infra01/datasets_tokenized/finetranslations_preprocessed # ⚠️ Change Where tokenized datasets are stored
+PATH_TO_OUTPUT_FOLDER=/capstor/store/cscs/swissai/infra01/datasets_tokenized/fineweb-2_0_1-quality_10-100_langs-filterrobots # ⚠️ Change Where tokenized datasets are stored
 
 DATASET_OUTPUT_FOLDER_NAME=$PATH_TO_OUTPUT_FOLDER/$TOKENIZER_NAME/$DATASET_NAME
 # CSV_RESULTS_FILE=$PATH_TO_PREPROCESSING_METADATA/tokenize-$TOKENIZER_NAME-$DATASET_NAME.csv
