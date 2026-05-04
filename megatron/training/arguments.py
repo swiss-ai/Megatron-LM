@@ -3145,6 +3145,14 @@ def _add_data_args(parser):
                        'end-of-document token.')
     group.add_argument('--variable-seq-lengths', action='store_true',
                        help='Compute the length of the tensor you send in PP groups, not fixed. Relevant with CP.')
+    group.add_argument('--pretraining-packing-strategy', type=str, default='greedy',
+                       choices=['greedy', 'bfd'],
+                       help='Packing strategy for pre-training. '
+                            '"greedy" packs documents in shuffled order (current default). '
+                            '"bfd" (Best-Fit Decreasing) sorts by length for higher packing '
+                            'efficiency and don\'t cut the samples if < sequence_length.')
+    group.add_argument('--max-docs-per-bin', type=int, default=0,
+                       help='Maximum number of documents allowed per sample in bfd, 0 means no limit. ')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
     group.add_argument('--use-packed-seq-params', action='store_true',

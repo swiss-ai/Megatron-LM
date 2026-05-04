@@ -661,6 +661,8 @@ def core_gpt_dataset_config_from_args(args):
         "vision_weight": args.vision_weight,
         "audio_weight": args.audio_weight,
         "loss_mask_token_ids": getattr(args, "loss_mask_token_ids", None),
+        "pretraining_packing_strategy": args.pretraining_packing_strategy,
+        "max_docs_per_bin": args.max_docs_per_bin,
     }
 
     # add FIM args to the config
