@@ -362,7 +362,7 @@ class ApertusSFTDataset(GPTDataset):
 
     def _log_packing_statistics(self, document_index, sample_index, from_cache=False):
         """
-        Log statistics about packed samples.
+        Log statistics about packed samples (one epoch).
 
         Args:
             document_index: Array of document IDs
@@ -371,23 +371,44 @@ class ApertusSFTDataset(GPTDataset):
         """
         num_samples_available = sample_index.shape[0] - 1
         sequence_length = self.config.sequence_length
-        num_tokens_per_epoch = int(np.sum(self.dataset.sequence_lengths[self.indices]))
-        total_tokens_in_samples = num_samples_available * sequence_length
-        avg_tokens_per_sample = num_tokens_per_epoch / num_samples_available if num_samples_available > 0 else 0
-        avg_documents_per_sample = len(document_index) / num_samples_available if num_samples_available > 0 else 0
+        capacity = sequence_length + self.config.add_extra_token_to_sequence
+
+        raw_lengths = self.dataset.sequence_lengths[self.indices]
+        raw_tokens_per_epoch = int(raw_lengths.sum())
+        # Oversized docs get their own bin and are truncated at `capacity` in
+        # _get_packed_sample, so only `capacity` of each contributes to a sample.
+        effective_tokens_per_epoch = int(np.minimum(raw_lengths, capacity).sum())
+        truncated_tokens = raw_tokens_per_epoch - effective_tokens_per_epoch
+
+        total_capacity = num_samples_available * capacity
+        avg_tokens_per_sample = (
+            effective_tokens_per_epoch / num_samples_available if num_samples_available > 0 else 0
+        )
+        avg_documents_per_sample = (
+            len(document_index) / num_samples_available if num_samples_available > 0 else 0
+        )
+        packing_efficiency = (
+            100 * effective_tokens_per_epoch / total_capacity if total_capacity > 0 else 0
+        )
+
+        # When loss masks are loaded from disk, each stored "doc" is [tokens, loss_mask]
+        # concatenated, so config.sequence_length and raw lengths are both 2x. Halve
+        # displayed absolute counts so the reader sees real model-token quantities.
+        display_divisor = 2 if self.config.sft_load_loss_mask else 1
+        display_seq_len = sequence_length // display_divisor
 
         cache_suffix = " (loaded from cache)" if from_cache else ""
-        packing_efficiency = 100 * num_tokens_per_epoch / total_tokens_in_samples if total_tokens_in_samples > 0 else 0
 
         log_single_rank(logger, logging.INFO, f"> ===== SFT Packing Statistics (ONE EPOCH){cache_suffix} =====")
-        log_single_rank(logger, logging.INFO, f" > #docs in epoch:                    {len(document_index):>12}")
-        log_single_rank(logger, logging.INFO, f" > #tokens in epoch:                  {num_tokens_per_epoch:>12,}")
-        log_single_rank(logger, logging.INFO, f" > Sequence length:                   {sequence_length:>12}")
-        log_single_rank(logger, logging.INFO, f" > #packed samples (per epoch):       {num_samples_available:>12,}")
-        log_single_rank(logger, logging.INFO, f" > #tokens(incl. padding) in samples: {total_tokens_in_samples:>12,}")
-        log_single_rank(logger, logging.INFO, f" > Average #tokens/sample:            {avg_tokens_per_sample:>12.1f}")
-        log_single_rank(logger, logging.INFO, f" > Average #documents/sample:         {avg_documents_per_sample:>12.2f}")
-        log_single_rank(logger, logging.INFO, f" > Packing efficiency:                {packing_efficiency:>11.2f}%\n\n")
+        log_single_rank(logger, logging.INFO, f" > #docs in epoch:                       {len(document_index):>12}")
+        log_single_rank(logger, logging.INFO, f" > #tokens in epoch (raw):               {raw_tokens_per_epoch // display_divisor:>12,}")
+        log_single_rank(logger, logging.INFO, f" > #tokens lost to truncation:           {truncated_tokens // display_divisor:>12,}")
+        log_single_rank(logger, logging.INFO, f" > Model sequence length:                {display_seq_len:>12}")
+        log_single_rank(logger, logging.INFO, f" > #packed samples (per epoch):          {num_samples_available:>12,}")
+        log_single_rank(logger, logging.INFO, f" > Total bin capacity:                   {total_capacity // display_divisor:>12,}")
+        log_single_rank(logger, logging.INFO, f" > Avg #tokens/sample (effective):       {avg_tokens_per_sample / display_divisor:>12.1f}")
+        log_single_rank(logger, logging.INFO, f" > Avg #documents/sample:                {avg_documents_per_sample:>12.2f}")
+        log_single_rank(logger, logging.INFO, f" > Packing efficiency:                   {packing_efficiency:>11.2f}%\n\n")
 
     def _build_packing_document_to_sample_indices(self):
         """
