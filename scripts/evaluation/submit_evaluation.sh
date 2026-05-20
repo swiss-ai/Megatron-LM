@@ -3,18 +3,19 @@ GPUS_PER_NODE=4
 
 DEF_MEGATRON_PATH=$(dirname $(dirname $( cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )))  # Grandparent of current file location.
 DEF_LOGS_ROOT=$PWD/eval-logs
-# DEF_CONTAINER_PATH=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml
-DEF_CONTAINER_PATH=/iopsstor/scratch/cscs/dfan/ngc_pt_jan.toml
-DEF_ACCOUNT=a-infra01-1
+DEF_CONTAINER_PATH=/capstor/store/cscs/swissai/infra01/containers/ngc_pt_jan.toml
+DEF_ACCOUNT=infra01
 DEF_TOKENIZER=dyfan/swissai-tokenizer-wcontext
 
 ITERATIONS=(latest)
-TASKS=scripts/evaluation/swissai_eval
+TASKS=scripts/evaluation/english_eval
 LIMIT=null
 BS=1
 CONVERT_TO_HF=false
+ADD_BOS_TOKEN=false
+PARTITION=normal
 
-TASK_GROUPS="mmlu_continuation global_mmlu"
+TASK_GROUPS="english_eval mmlu_continuation"
 
 # Usage function.
 usage () {
@@ -111,6 +112,10 @@ while [[ $# -gt 0 ]]; do
 			NAME=$2; shift 2;;
 		--convert-to-hf)
 			CONVERT_TO_HF=true; shift;;
+		--add-bos-token)
+			ADD_BOS_TOKEN=true; shift;;
+		--partition)
+			PARTITION=$2; shift 2;;
 		--iterations)
 			IFS=',' read -ra ITERATIONS <<< "$2"; shift 2;;
 		--revisions)
@@ -228,7 +233,7 @@ fi
 JOBNAME=evaluate_$NAME
 ENDPOINT_PORT=5000
 
-COMMON_EVAL_ARGS="--trust_remote_code --batch_size=$BS --tasks=$TASKS --output=$EVAL_DIR/eval_\$SLURM_JOBID $LIMIT_ARGS $WANDB_ARGS"
+COMMON_EVAL_ARGS="--trust_remote_code --batch_size=$BS --tasks=$TASKS --output=$EVAL_DIR/eval_\$SLURM_JOBID --log_samples $LIMIT_ARGS $WANDB_ARGS"
 if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ] && [ $CONVERT_TO_HF != true ]; then
 	if [ ${#ITERATIONS[@]} -ge 1 ]; then
 		echo Non converted megatron checkpoints only support a single iteration. >&2
@@ -271,7 +276,10 @@ else
 		fi
 	fi
 
-	CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION --num_fewshot 5 $COMMON_EVAL_ARGS"
+	if [ $ADD_BOS_TOKEN = true ]; then
+		MAYBE_BOS_TOKEN=",add_bos_token=True"
+	fi
+	CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION$MAYBE_BOS_TOKEN --num_fewshot 5 $COMMON_EVAL_ARGS"
 fi
 
 # The big loop.
@@ -300,7 +308,8 @@ EOM
 # Now let's prepare the sbatch.
 cat > $SBATCH_PATH <<- EOM
 #!/bin/bash
-#SBATCH --account=a-infra01-1
+#SBATCH --account=$ACCOUNT
+#SBATCH --partition=$PARTITION
 #SBATCH --cpus-per-task=288
 #SBATCH --gres=gpu:4
 #SBATCH --environment=$CONTAINER_PATH
@@ -310,10 +319,9 @@ cat > $SBATCH_PATH <<- EOM
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=$LOGS_DIR/${JOBNAME}_%j.out
 #SBATCH --error=$LOGS_DIR/${JOBNAME}_%j.err
-#SBATCH --time=02:00:00
+#SBATCH --time=00:30:00
 #SBATCH --exclusive
 #SBATCH --dependency=singleton
-#SBATCH --exclude=nid[006569,006601,006609,006622-006623,006628-006629,006632,006638,006651,006653-006655,006658-006662,006664-006665,006669-006671,006674-006677,006571,006636,006640,006642,006644,006673,006740,006772,006798,006804,006855,006857-006858,006860,006866,006877,006885-006886,006894-006895,007338,006574-006575,006577-006578,006585-006590,006592,006598,006603-006606,006608,006611-006614]
 
 # Step 0: Some useful logs.
 export MASTER_ADDR=\$(hostname)
