@@ -127,6 +127,14 @@ if __name__ == "__main__":
         default="megatron",
         help="Output format: 'megatron' outputs space-separated weights and prefixes, 'verbose' shows breakdown",
     )
+    parser.add_argument(
+        "--dataset-type",
+        type=str,
+        choices=["sft", "pretrain", "none"],
+        default="none",
+        help="Prepend an explicit dataset-type marker ('sft:' or 'pretrain:') to each emitted "
+             "prefix. 'none' (default) emits bare prefixes for backward compatibility.",
+    )
     args = parser.parse_args()
 
     paths = [x.strip() for x in args.paths.split(",")]
@@ -138,6 +146,8 @@ if __name__ == "__main__":
 
     weighted_prefixes = calculate_proportional_weights(prefixes, args.weight)
 
+    marker = f"{args.dataset_type}:" if args.dataset_type != "none" else ""
+
     if args.format == "verbose":
         print(f"Found {len(prefixes)} datasets with total weight {args.weight}")
         print(f"{'Weight':<12} {'Percentage':<12} {'Size':<15} {'Prefix'}")
@@ -145,7 +155,7 @@ if __name__ == "__main__":
         for weight, prefix in weighted_prefixes:
             size = get_dataset_size(prefix)
             percentage = (weight / args.weight) * 100
-            print(f"{weight:<12.6f} {percentage:<12.2f} {size:<15,} {prefix}")
+            print(f"{weight:<12.6f} {percentage:<12.2f} {size:<15,} {marker}{prefix}")
         print("-" * 80)
         total = sum(w for w, _ in weighted_prefixes)
         print(f"Total weight: {total:.6f}")
@@ -155,6 +165,6 @@ if __name__ == "__main__":
     # Output in Megatron format: weight1 prefix1 weight2 prefix2 ...
     output_parts = []
     for weight, prefix in weighted_prefixes:
-        output_parts.extend([f"{weight:.6f}", prefix])
+        output_parts.extend([f"{weight:.6f}", f"{marker}{prefix}"])
 
     print(*output_parts, sep=" ")

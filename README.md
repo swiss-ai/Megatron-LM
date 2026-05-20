@@ -16,6 +16,7 @@
     - [Set the Datasets in Megatron](#set-the-datasets-in-megatron)
     - [Data mixtures](#data-mixtures)
 - [Supervised Fine-Tuning (SFT)](#supervised-fine-tuning-sft)
+    - [Selecting SFT vs Pretrain Datasets](#selecting-sft-vs-pretrain-datasets)
     - [Apertus SFT with Sample Packing](#apertus-sft-with-sample-packing)
 - [Checkpointing](#checkpointing)
     - [Resuming from a checkpoint](#resuming-from-a-checkpoint)
@@ -120,6 +121,27 @@ To enable best-fit decreasing packing, add the following arguments to your launc
 # Supervised Fine-Tuning (SFT)
 
 This repository provides the **ApertusSFT** dataset (`--ap-sft`) for supervised fine-tuning on pre-tokenized Megatron indexed datasets (`.bin/.idx`). It supports sample packing, configurable loss masking, and works with the standard `pretrain_gpt.py` entry point.
+
+## Selecting SFT vs Pretrain Datasets
+
+Each entry in `--data-path` (and `--train-data-path` / `--valid-data-path` / `--test-data-path`, `--data-args-path`, `--per-split-data-args-path`) can carry an explicit dataset-type marker that decides whether the entry is built as `ApertusSFTDataset` or `GPTDataset`. This lets you mix SFT and pretrain data in the same weighted blend.
+
+Marker syntax: prefix the path with `sft:` or `pretrain:` (case-insensitive — `SFT:` works too). Only the **leading** marker is stripped, so a literal `sft:` in the underlying path is preserved (e.g. `sft:sft:/data/x` resolves to type `sft` with clean path `sft:/data/x`). Example mixed blend:
+```bash
+--data-path 0.3 sft:/data/dolly_prefix 0.7 pretrain:/data/fineweb_prefix
+```
+
+For entries **without** a marker, dispatch is decided in this order:
+
+1. **`--ap-sft` is set** → unmarked entries are treated as SFT (`ApertusSFTDataset`). No warning. This preserves backward compatibility for existing all-SFT launchers (e.g. `--ap-sft --data-path 1.0 /data/dolly`).
+2. **`--ap-sft` is not set, but the path string contains the substring `"apertus_sft"`** → `ApertusSFTDataset` with a one-time `DeprecationWarning`. Legacy fallback for datasets whose directory names encode their type. Migrate to explicit `sft:` markers.
+3. **Otherwise** → `GPTDataset` (pretrain). Default for any bare path.
+
+Explicit `sft:` / `pretrain:` markers always override these three rules. Use them whenever you mix types in one blend.
+
+`--ap-sft` is still required for any SFT run (including mixed blends), because it also gates the `--calculate-per-token-loss` assertion needed for correct SFT loss normalization. The marker controls **per-entry dispatch**; the flag controls **run-level SFT mode**.
+
+The helper `scripts/tools/create_weighted_data_config.py` accepts `--dataset-type {sft,pretrain,none}` to emit marker-prefixed entries automatically.
 
 ## Apertus SFT with Sample Packing
 
