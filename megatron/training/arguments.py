@@ -3079,6 +3079,9 @@ def _add_data_args(parser):
                        '(2) a list of weight prefix pairs e.g. weight1 prefix1 weight2 prefix2, '
                        '(3) a list of prefixes e.g. prefix1 prefix2. '
                        'For (3), weights are inferred from the lengths of the contributing datasets. '
+                       'Each prefix may be tagged with a reserved dataset-type marker (case-insensitive): '
+                       '"sft:<prefix>" builds ApertusSFTDataset, "pretrain:<prefix>" builds GPTDataset. '
+                       'See the README "Selecting SFT vs Pretrain Datasets" section for precedence rules. '
                        'This argument is exclusive to the other independent --*-data-path arguments.')
     group.add_argument('--phase-transition-iterations', type=str, default=None,
                        help='Comma-separated list of iterations where phase '
@@ -3744,7 +3747,9 @@ def _add_sft_args(parser):
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
     group.add_argument('--ap-sft', action="store_true",
-                       help='Enable Apertus model SFT training. Assumes --calculate-per-token-loss is activated.')
+                       help='Enable Apertus model SFT training. Requires --calculate-per-token-loss. '
+                            'In a mixed blend, also auto-tags any unmarked --data-path entry as SFT '
+                            '(entries with an explicit "sft:"/"pretrain:" marker are unaffected).')
     group.add_argument('--ap-sft-pack-samples', action="store_true",
                        help='Pack multiple whole documents per sequence. Doesnt spread one document across sequences. '
                             'Only packs full sequences and adds padding to reach full seq len.')

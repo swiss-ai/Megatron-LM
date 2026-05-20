@@ -729,6 +729,7 @@ def core_gpt_dataset_config_from_args(args):
         "sft_truncate_right": args.ap_sft_truncate_right,
         "pretraining_packing_strategy": args.pretraining_packing_strategy,
         "max_docs_per_bin": args.max_docs_per_bin,
+        "ap_sft_auto_tag": args.ap_sft,
     }
 
     # add FIM args to the config

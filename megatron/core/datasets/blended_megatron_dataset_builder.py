@@ -2,17 +2,18 @@
 
 import logging
 import math
+import warnings
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Iterable, List, Optional, Type, Union
+from typing import Any, Callable, Iterable, List, Optional, Tuple, Type, Union
 
 import numpy
 import torch
 
 from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, GPTDataset
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, GPTDataset, MockGPTDataset
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
-from megatron.core.datasets.utils import Split, normalize
+from megatron.core.datasets.utils import Split, normalize, split_dataset_type_marker
 from megatron.core.utils import log_single_rank
 from megatron.training.datasets.apertus_sft_dataset import ApertusSFTDataset
 
@@ -414,6 +415,40 @@ class BlendedMegatronDatasetBuilder(object):
 
         return megatron_datasets
 
+    def _resolve_dataset_class(
+        self, dataset_path: Optional[str]
+    ) -> Tuple[Type[MegatronDataset], Optional[str]]:
+        """Decide which dataset class builds ``dataset_path``.
+
+        Precedence:
+          1. Explicit ``sft:`` / ``pretrain:`` marker on the path.
+          2. ``GPTDatasetConfig.ap_sft_auto_tag`` (set by ``--ap-sft``) → SFT for
+             any unmarked path.
+          3. Legacy ``"apertus_sft"`` substring → SFT with a DeprecationWarning.
+          4. Default → ``GPTDataset``.
+
+        Returns the chosen class and the marker-stripped path. Mock configs and
+        ``None`` paths short-circuit to ``MockGPTDataset``.
+        """
+        if self.config.mock or dataset_path is None:
+            return MockGPTDataset, None
+        dtype, clean = split_dataset_type_marker(dataset_path)
+        if dtype == "sft":
+            return ApertusSFTDataset, clean
+        if dtype == "pretrain":
+            return GPTDataset, clean
+        if getattr(self.config, "ap_sft_auto_tag", False):
+            return ApertusSFTDataset, clean
+        if clean and "apertus_sft" in clean:
+            warnings.warn(
+                "Inferring SFT dataset from 'apertus_sft' substring in "
+                f"'{clean}' is deprecated; prefix the path with 'sft:' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return ApertusSFTDataset, clean
+        return GPTDataset, clean
+
     def _build_megatron_dataset_splits(
         self,
         dataset_path: Optional[str],
@@ -438,10 +473,7 @@ class BlendedMegatronDatasetBuilder(object):
             List[Optional[MidLevelDataset]]: The MidLevelDataset (or None) per split
         """
 
-        if "apertus_sft" in dataset_path:
-            dataset_cls = ApertusSFTDataset
-        else:
-            dataset_cls = GPTDataset
+        dataset_cls, dataset_path = self._resolve_dataset_class(dataset_path)
 
         synchronize_ranks = (
             False
