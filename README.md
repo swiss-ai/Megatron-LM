@@ -134,7 +134,7 @@ Marker syntax: prefix the path with `sft:` or `pretrain:` (case-insensitive — 
 For entries **without** a marker, dispatch is decided in this order:
 
 1. **`--ap-sft` is set** → unmarked entries are treated as SFT (`ApertusSFTDataset`). No warning. This preserves backward compatibility for existing all-SFT launchers (e.g. `--ap-sft --data-path 1.0 /data/dolly`).
-2. **`--ap-sft` is not set, but the path string contains the substring `"apertus_sft"`** → `ApertusSFTDataset` with a one-time `DeprecationWarning`. Legacy fallback for datasets whose directory names encode their type. Migrate to explicit `sft:` markers.
+2. **`--ap-sft` is not set, but the path contains a legacy SFT substring (`"apertus_sft"` or `"apertus1p5_sft"`, matched case-insensitively)** → `ApertusSFTDataset` with a one-time `DeprecationWarning`. Legacy fallback for datasets whose directory names encode their type. Migrate to explicit `sft:` markers.
 3. **Otherwise** → `GPTDataset` (pretrain). Default for any bare path.
 
 Explicit `sft:` / `pretrain:` markers always override these three rules. Use them whenever you mix types in one blend.

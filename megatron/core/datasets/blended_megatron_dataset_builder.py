@@ -27,6 +27,11 @@ DistributedDataset = Union[
     TopLevelDataset, MidLevelDataset, LowLevelDataset, torch.utils.data.Dataset
 ]
 
+# Legacy: paths whose name contains one of these substrings (matched
+# case-insensitively) are inferred to be SFT datasets. Deprecated in favor of
+# explicit "sft:" markers.
+LEGACY_SFT_PATH_SUBSTRINGS = ("apertus_sft", "apertus1p5_sft")
+
 
 class BlendedMegatronDatasetBuilder(object):
     """Builder class for the BlendedDataset and MegatronDataset classes
@@ -424,7 +429,9 @@ class BlendedMegatronDatasetBuilder(object):
           1. Explicit ``sft:`` / ``pretrain:`` marker on the path.
           2. ``GPTDatasetConfig.ap_sft_auto_tag`` (set by ``--ap-sft``) → SFT for
              any unmarked path.
-          3. Legacy ``"apertus_sft"`` substring → SFT with a DeprecationWarning.
+          3. Legacy substring (one of ``LEGACY_SFT_PATH_SUBSTRINGS``, e.g.
+             ``"apertus_sft"`` / ``"apertus1p5_sft"``, matched case-insensitively)
+             → SFT with a DeprecationWarning.
           4. Default → ``GPTDataset``.
 
         Returns the chosen class and the marker-stripped path. Mock configs and
@@ -439,14 +446,19 @@ class BlendedMegatronDatasetBuilder(object):
             return GPTDataset, clean
         if getattr(self.config, "ap_sft_auto_tag", False):
             return ApertusSFTDataset, clean
-        if clean and "apertus_sft" in clean:
-            warnings.warn(
-                "Inferring SFT dataset from 'apertus_sft' substring in "
-                f"'{clean}' is deprecated; prefix the path with 'sft:' instead.",
-                DeprecationWarning,
-                stacklevel=2,
+        if clean:
+            clean_lower = clean.lower()
+            matched = next(
+                (s for s in LEGACY_SFT_PATH_SUBSTRINGS if s in clean_lower), None
             )
-            return ApertusSFTDataset, clean
+            if matched is not None:
+                warnings.warn(
+                    f"Inferring SFT dataset from '{matched}' substring in "
+                    f"'{clean}' is deprecated; prefix the path with 'sft:' instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                return ApertusSFTDataset, clean
         return GPTDataset, clean
 
     def _build_megatron_dataset_splits(

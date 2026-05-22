@@ -89,6 +89,23 @@ def test_resolve_legacy_substring_emits_deprecation():
     assert path == "/data/legacy_apertus_sft_set"
 
 
+def test_resolve_legacy_apertus1p5_substring_emits_deprecation():
+    builder = _make_builder()
+    with pytest.warns(DeprecationWarning, match="apertus1p5_sft"):
+        cls, path = builder._resolve_dataset_class("/data/Apertus1p5_sft_v2")
+    assert cls is ApertusSFTDataset
+    assert path == "/data/Apertus1p5_sft_v2"
+
+
+def test_resolve_legacy_substring_case_insensitive():
+    builder = _make_builder()
+    with pytest.warns(DeprecationWarning):
+        cls, path = builder._resolve_dataset_class("/data/APERTUS_SFT_SET")
+    assert cls is ApertusSFTDataset
+    # Matching is case-insensitive but the original-cased path is preserved.
+    assert path == "/data/APERTUS_SFT_SET"
+
+
 def test_resolve_default_pretrain():
     cls, path = _make_builder()._resolve_dataset_class("/data/fineweb")
     assert cls is GPTDataset
