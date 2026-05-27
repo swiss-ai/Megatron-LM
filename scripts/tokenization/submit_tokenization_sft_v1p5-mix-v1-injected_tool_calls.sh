@@ -8,7 +8,7 @@
 NUMBER_OF_DATATROVE_TASKS=64
 TOKENIZER=/capstor/store/cscs/swissai/infra01/hf_tokenizers/tokenizers/Apertus-v1p5-tool_output_toks-think_toks/tokenizer.json
 TOKENIZER_NAME=Apertus-v1p5-tool_output_toks-think_toks
-DATASET_NAME=Toucan-1.5M_filtered_corr
+DATASET_NAME=v1p5-mix-v1-23-05-cleaned-linearised-fixed_injected_tool_calls
 COLUMN_KEY=text
 
 REHYDRATE=False  # Set to True or False
@@ -23,7 +23,7 @@ PATH_TO_PREPROCESSING_METADATA=$MEGATRON_LM_DIR/datasets/$DATASET_NAME # Where d
 PATH_TO_DATATROVE_LOGGING_DIR=$MEGATRON_LM_DIR/logs/datatrove # Where datatrove logs are stored
 PATH_TO_SLURM_LOGGING_DIR=$MEGATRON_LM_DIR/logs/slurm/tokenization-$TOKENIZER_NAME-$DATASET_NAME
 # PATH_TO_OUTPUT_FOLDER=/capstor/scratch/cscs/dtamayomela/data/tokenized_data_sft10 # Where tokenized datasets are stored
-PATH_TO_OUTPUT_FOLDER=/capstor/store/cscs/swissai/infra01/datasets_tokenized/apertus_sft_datasets/Toucan-1.5M_filtered_corr
+PATH_TO_OUTPUT_FOLDER=/capstor/store/cscs/swissai/infra01/datasets_tokenized/apertus_sft_datasets/v1p5-mix-v1-23-05-cleaned-linearised-fixed_injected_tool_calls
 
 DATASET_OUTPUT_FOLDER_NAME=$PATH_TO_OUTPUT_FOLDER/$TOKENIZER_NAME/$DATASET_NAME
 CSV_RESULTS_FILE=$PATH_TO_PREPROCESSING_METADATA/tokenize-$TOKENIZER_NAME-$DATASET_NAME.csv
@@ -39,5 +39,5 @@ for paths_file in "$PATH_TO_PREPROCESSING_METADATA/dumps"/*; do
   dump=$(grep -oP '(?<=paths_file_)\d+(?=\.txt)' <<< $paths_file)
   output_folder=$DATASET_OUTPUT_FOLDER_NAME/dump-$dump
   logging_dir=$PATH_TO_DATATROVE_LOGGING_DIR/$TOKENIZER_NAME/$DATASET_NAME/dump-$dump
-  sbatch -d afterany:2403002 --job-name=tokenize-$DATASET_NAME-dump-$dump --output=$PATH_TO_SLURM_LOGGING_DIR/R-%x-%j.out --error=$PATH_TO_SLURM_LOGGING_DIR/R-%x-%j.err $MEGATRON_LM_DIR/scripts/tokenization/tokenize.sh $PATH_TO_PREPROCESSING_METADATA/raw-dataset-link $output_folder $TOKENIZER $logging_dir $CSV_RESULTS_FILE $paths_file $NUMBER_OF_DATATROVE_TASKS $MEGATRON_LM_DIR $COLUMN_KEY $REHYDRATE_FLAG
+  sbatch -d afterany:2406313 --job-name=tokenize-$DATASET_NAME-dump-$dump --output=$PATH_TO_SLURM_LOGGING_DIR/R-%x-%j.out --error=$PATH_TO_SLURM_LOGGING_DIR/R-%x-%j.err $MEGATRON_LM_DIR/scripts/tokenization/tokenize.sh $PATH_TO_PREPROCESSING_METADATA/raw-dataset-link $output_folder $TOKENIZER $logging_dir $CSV_RESULTS_FILE $paths_file $NUMBER_OF_DATATROVE_TASKS $MEGATRON_LM_DIR $COLUMN_KEY $REHYDRATE_FLAG
 done  

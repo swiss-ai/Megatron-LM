@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=envScaler
+#SBATCH --job-name=tok
 #SBATCH --output=scripts/tokenization/logs/tok_%j.out
 #SBATCH --error=scripts/tokenization/logs/tok_%j.err
 #SBATCH --partition=normal
@@ -11,10 +11,10 @@
 #SBATCH --reservation=SD-69241-apertus-1-5-0
 
 # HF_PATH="/iopsstor/scratch/cscs/hyukhymenko/sft-1.1-mixes/v1p5-mix-v1-26-04-cleaned"
-HF_PATH="/capstor/store/cscs/swissai/infra01/tmp_data/EnvScaler-SFT-Traj-9K"
-DATA_BASE="/capstor/scratch/cscs/dtamayomela/tokenize_it_data/EnvScaler-SFT-Traj-9K_corr/output.parquet"
+HF_PATH="/capstor/store/cscs/swissai/infra01/tmp_data/v1p5-mix-v1-23-05-cleaned-linearised-fixed_injected_tool_calls"
+DATA_BASE="/capstor/scratch/cscs/dtamayomela/tokenize_it_data/v1p5-mix-v1-23-05-cleaned-linearised-fixed_injected_tool_calls/output.parquet"
 MEGATRON_PATH="/capstor/scratch/cscs/dtamayomela/megatron/pre-training/megatron_tok_or"
-OUTPUT_FOLDER="datasets/EnvScaler-SFT-Traj-9K_corr"
+OUTPUT_FOLDER="datasets/v1p5-mix-v1-23-05-cleaned-linearised-fixed_injected_tool_calls"
 
 srun --environment=/capstor/scratch/cscs/dtamayomela/containers/data-pipeline.toml bash -c "\
     export PYTHONPATH=${MEGATRON_PATH}
@@ -22,7 +22,7 @@ srun --environment=/capstor/scratch/cscs/dtamayomela/containers/data-pipeline.to
     python scripts/tokenization/apply_chat_template.py \
         --input $HF_PATH \
         --output $DATA_BASE \
-        --tokenizer /capstor/store/cscs/swissai/infra01/hf_tokenizers/tokenizers/Apertus-v1p5-tool_output_toks-think_toks \
+        --tokenizer /capstor/scratch/cscs/dtamayomela/process_tokenizer/tokenizer_tool_tokens \
         --num-proc 15 \
         --tasks-per-worker 16"
         # --tokenizer swiss-ai/Apertus-8B-Instruct-2509

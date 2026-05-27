@@ -12,9 +12,9 @@
 
 # HF_PATH="/iopsstor/scratch/cscs/hyukhymenko/sft-1.1-mixes/v1p5-mix-v1-26-04-cleaned"
 HF_PATH="/capstor/store/cscs/swissai/infra01/tmp_data/Toucan-1.5M_filtered"
-DATA_BASE="/capstor/scratch/cscs/dtamayomela/tokenize_it_data/Toucan-1.5M_filtered/output.parquet"
+DATA_BASE="/capstor/scratch/cscs/dtamayomela/tokenize_it_data/Toucan-1.5M_filtered_corr/output.parquet"
 MEGATRON_PATH="/capstor/scratch/cscs/dtamayomela/megatron/pre-training/megatron_tok_or"
-OUTPUT_FOLDER="datasets/Toucan-1.5M_filtered"
+OUTPUT_FOLDER="datasets/Toucan-1.5M_filtered_corr"
 
 srun --environment=/capstor/scratch/cscs/dtamayomela/containers/data-pipeline.toml bash -c "\
     export PYTHONPATH=${MEGATRON_PATH}
@@ -22,7 +22,7 @@ srun --environment=/capstor/scratch/cscs/dtamayomela/containers/data-pipeline.to
     python scripts/tokenization/apply_chat_template.py \
         --input $HF_PATH \
         --output $DATA_BASE \
-        --tokenizer /capstor/scratch/cscs/dtamayomela/tokenizer_fixed \
+        --tokenizer /capstor/store/cscs/swissai/infra01/hf_tokenizers/tokenizers/Apertus-v1p5-tool_output_toks-think_toks \
         --num-proc 15 \
         --tasks-per-worker 16"
         # --tokenizer swiss-ai/Apertus-8B-Instruct-2509

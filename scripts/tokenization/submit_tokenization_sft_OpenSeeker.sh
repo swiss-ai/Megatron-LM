@@ -6,9 +6,9 @@
 # ⚠️ WARNING ⚠️
 
 NUMBER_OF_DATATROVE_TASKS=64
-TOKENIZER=swiss-ai/Apertus-8B-Instruct-2509
-TOKENIZER_NAME=Apertus-8B-Instruct-2509
-DATASET_NAME=OpenSeeker-v1-Data
+TOKENIZER=/capstor/store/cscs/swissai/infra01/hf_tokenizers/tokenizers/Apertus-v1p5-tool_output_toks-think_toks/tokenizer.json
+TOKENIZER_NAME=Apertus-v1p5-tool_output_toks-think_toks
+DATASET_NAME=OpenSeeker-v1-Data_corr
 COLUMN_KEY=text
 
 REHYDRATE=False  # Set to True or False
@@ -23,7 +23,7 @@ PATH_TO_PREPROCESSING_METADATA=$MEGATRON_LM_DIR/datasets/$DATASET_NAME # Where d
 PATH_TO_DATATROVE_LOGGING_DIR=$MEGATRON_LM_DIR/logs/datatrove # Where datatrove logs are stored
 PATH_TO_SLURM_LOGGING_DIR=$MEGATRON_LM_DIR/logs/slurm/tokenization-$TOKENIZER_NAME-$DATASET_NAME
 # PATH_TO_OUTPUT_FOLDER=/capstor/scratch/cscs/dtamayomela/data/tokenized_data_sft10 # Where tokenized datasets are stored
-PATH_TO_OUTPUT_FOLDER=/capstor/store/cscs/swissai/infra01/datasets_tokenized/apertus_sft_datasets/OpenSeeker-v1-Data
+PATH_TO_OUTPUT_FOLDER=/capstor/store/cscs/swissai/infra01/datasets_tokenized/apertus_sft_datasets/OpenSeeker-v1-Data_corr
 
 DATASET_OUTPUT_FOLDER_NAME=$PATH_TO_OUTPUT_FOLDER/$TOKENIZER_NAME/$DATASET_NAME
 CSV_RESULTS_FILE=$PATH_TO_PREPROCESSING_METADATA/tokenize-$TOKENIZER_NAME-$DATASET_NAME.csv
