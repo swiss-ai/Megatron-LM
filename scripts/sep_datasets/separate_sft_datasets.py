@@ -32,18 +32,15 @@ logger = logging.getLogger(__name__)
 
 DATASETS = {
     "EnvScaler-SFT-Traj-9K":
-        "/capstor/store/cscs/swissai/infra01/datasets_tokenized/apertus_sft_datasets"
-        "/EnvScaler-SFT-Traj-9K/Apertus-8B-Instruct-2509/EnvScaler-SFT-Traj-9K"
-        "/dump-0/00000_tokens",
+        "/capstor/store/cscs/swissai/infra01/datasets_tokenized/apertus_sft_datasets/EnvScaler-SFT-Traj-9K_corr/tokenizer_tool_tokens/EnvScaler-SFT-Traj-9K_corr/dump-0/00000_tokens",
     "OpenSeeker-v1-Data":
-        "/capstor/store/cscs/swissai/infra01/datasets_tokenized/apertus_sft_datasets"
-        "/OpenSeeker-v1-Data/Apertus-8B-Instruct-2509/OpenSeeker-v1-Data"
-        "/dump-0/00000_tokens",
+        "/capstor/store/cscs/swissai/infra01/datasets_tokenized/apertus_sft_datasets/OpenSeeker-v1-Data_corr/tokenizer_tool_tokens/OpenSeeker-v1-Data_corr/dump-0/00000_tokens",
     "Toucan-1.5M_filtered":
-        "/capstor/store/cscs/swissai/infra01/datasets_tokenized/apertus_sft_datasets"
-        "/Toucan-1.5M_filtered/Apertus-8B-Instruct-2509/Toucan-1.5M_filtered"
-        "/dump-0/00000_tokens",
+        "/capstor/store/cscs/swissai/infra01/datasets_tokenized/apertus_sft_datasets/Toucan-1.5M_filtered_corr/tokenizer_tool_tokens/Toucan-1.5M_filtered_corr/dump-0/00000_tokens",
 }
+
+
+
 
 # Half-open intervals [lo, hi) on per-document token count.
 # gt_65k uses a very large upper bound as a sentinel.
