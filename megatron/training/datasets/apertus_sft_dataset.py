@@ -287,11 +287,12 @@ class ApertusSFTDataset(GPTDataset):
         # add_emu3_tokens_llama3_vision_instruct.py. Some models use separate assistant/user
         # end sequences, others share a common eot token.
 
-
         special_tokens = {
             "assistant_begin": "<|assistant_start|>",
             "assistant_end": "<|assistant_end|>",
-            "system_start": "<|system_start|>"
+            "system_start": "<|system_start|>",
+            "tool_output_start": "<|tool_output_start|>",
+            "tool_output_end": "<|tool_output_end|>", 
         }
 
         for attr, string in special_tokens.items():
@@ -901,6 +902,18 @@ class ApertusSFTDataset(GPTDataset):
                 loss_mask[: sys_pos[0].item() + sys_start_seq.numel()] = 1
 
             loss_mask[get_matching_mask(data, sys_start_seq, only_begin=False)] = 0
+
+        # 1b) Mask tool output tokens from both loss_mask and assistant_mask.
+        # Tool output spans (<|tool_output_start|> ... <|tool_output_end|>) must never
+        # be trained on, regardless of whether the loss mask was loaded from disk or built
+        # on the fly, and must not be counted as assistant tokens.
+        tool_output_start_seq = self._sft_tool_output_start_sequence.to(dtype=data.dtype, device=data.device)
+        tool_output_end_seq   = self._sft_tool_output_end_sequence.to(dtype=data.dtype, device=data.device)
+        tool_output_mask = get_matching_mask_by_start_end(data, tool_output_start_seq, tool_output_end_seq)
+
+        loss_mask[tool_output_mask] = 0.0
+        if assistant_mask is not None:
+            assistant_mask[tool_output_mask] = False
 
         # 2) Mask loss for special tokens (if activated) - only if not load loss from disk
         if preloaded_loss_mask is None:
