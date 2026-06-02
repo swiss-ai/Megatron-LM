@@ -1,0 +1,9 @@
+image = "/capstor/store/cscs/swissai/infra01/MLLM/containers/nvcr.io#nvidia+nemo+25.11.aarch64.sqsh"
+
+mounts = ["/capstor", "/iopsstor", "/users"]
+writable = true
+workdir = "/workspace"
+
+[annotations]
+com.hooks.aws_ofi_nccl.enabled = "true"
+com.hooks.aws_ofi_nccl.variant = "cuda12"
