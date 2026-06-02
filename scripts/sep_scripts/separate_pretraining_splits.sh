@@ -64,17 +64,17 @@ srun --environment="/capstor/scratch/cscs/$USER/containers/nemo.toml" bash -c "\
         --min-tokens 8193 \
         --seed 42 && \
     echo '--- [2/4] fineweb-2_0_1' && \
-    python -u ${PIPELINE_DIR}/separate_corr_now.py \
+    python -u ${PIPELINE_DIR}/separate.py \
         --input-dir  '${INPUT_DIR_FINEWEB}' \
         --output-dir '${OUTPUT_DIR_FINEWEB}' \
         --seed 42 && \
     echo '--- [3/4] finetranslations' && \
-    python -u ${PIPELINE_DIR}/separate_corr_now.py \
+    python -u ${PIPELINE_DIR}/separate.py \
         --input-dir  '${INPUT_DIR_TRANSLATIONS}' \
         --output-dir '${OUTPUT_DIR_TRANSLATIONS}' \
         --seed 42 && \
     echo '--- [4/4] finepdfs-edu-multilingual' && \
-    python -u ${PIPELINE_DIR}/separate_corr_now.py \
+    python -u ${PIPELINE_DIR}/separate.py \
         --input-dir  '${INPUT_DIR_MULTILINGUAL}' \
         --output-dir '${OUTPUT_DIR_MULTILINGUAL}' \
         --seed 42"
