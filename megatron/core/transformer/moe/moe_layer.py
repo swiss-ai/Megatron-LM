@@ -423,19 +423,19 @@ class MoELayer(BaseMoELayer):
                 not self.shared_expert_overlap
             ), "Shared expert overlap not supported when MoE latent projections are used."
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
-        hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+        hidden_states, hidden_states_sf, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
-        return hidden_states, probs
+        return hidden_states, hidden_states_sf, probs
 
-    def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+    def dispatch(self, hidden_states: torch.Tensor, hidden_states_sf: Optional[torch.Tensor], probs: torch.Tensor):
         """Dispatches tokens to assigned expert ranks via communication.
 
         This method performs the actual communication (e.g., All-to-All) to distribute
         tokens and their associated probabilities to the devices hosting their assigned
         experts.
         """
-        return self.token_dispatcher.token_dispatch(hidden_states, probs)
+        return self.token_dispatcher.token_dispatch(hidden_states, hidden_states_sf, probs)
 
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
     def shared_experts_compute(self, hidden_states: torch.Tensor):
@@ -466,7 +466,12 @@ class MoELayer(BaseMoELayer):
         return shared_expert_output
 
     @internal_api
-    def routed_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+    def routed_experts_compute(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_sf: Optional[torch.Tensor],
+        probs: torch.Tensor,
+    ):
         """Computes the output of the routed experts on the dispatched tokens.
 
         This method first post-processes the dispatched input to get permuted tokens
@@ -474,7 +479,7 @@ class MoELayer(BaseMoELayer):
         The output from the experts is preprocessed for the combine step.
         """
         dispatched_input, tokens_per_expert, permuted_probs = (
-            self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
+            self.token_dispatcher.dispatch_postprocess(hidden_states, hidden_states_sf, probs)
         )
         if (
             hasattr(self, "_inference_token_dispatcher")
@@ -518,8 +523,8 @@ class MoELayer(BaseMoELayer):
         """This method is a combined method of route and preprocess. Deprecated."""
 
         probs, routing_map = self.route(hidden_states)
-        hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
-        return hidden_states, probs, residual
+        hidden_states, hidden_states_sf, probs = self.preprocess(hidden_states, probs, routing_map)
+        return hidden_states, hidden_states_sf, probs
 
     def forward(
         self,
@@ -558,10 +563,10 @@ class MoELayer(BaseMoELayer):
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(hidden_states, padding_mask)
-                    hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                    hidden_states, hidden_states_sf, probs = self.preprocess(hidden_states, probs, routing_map)
 
                     if intermediate_tensors is not None:
-                        return hidden_states, probs, shared_expert_output
+                        return hidden_states, hidden_states_sf, probs, shared_expert_output
 
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
@@ -573,10 +578,10 @@ class MoELayer(BaseMoELayer):
 
             if "expert_compute" in self.fwd_execution_map:
                 if intermediate_tensors is not None:
-                    hidden_states, probs = intermediate_tensors
+                    hidden_states, hidden_states_sf, probs = intermediate_tensors
 
-                dispatched_input, probs = self.dispatch(hidden_states, probs)
-                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                dispatched_input, dispatched_input_sf, probs = self.dispatch(hidden_states, hidden_states_sf, probs)
+                output, mlp_bias = self.routed_experts_compute(dispatched_input, dispatched_input_sf, probs)
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"

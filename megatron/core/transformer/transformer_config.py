@@ -750,6 +750,10 @@ class TransformerConfig(ModelParallelConfig):
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
 
+    moe_use_fp8_dispatch: bool = False
+    """Whether to use FP8 for MoE dispatch. Specifically, the token tensors will be
+    quantized into FP8 before dispatch and dequantized back to original precision after dispatch."""
+
     moe_use_fp8_activation: bool = False
     """Whether to use FP8 activation for MoE layer. Specifically, the activations of MoE layer will
     be quantized into FP8 for storage."""

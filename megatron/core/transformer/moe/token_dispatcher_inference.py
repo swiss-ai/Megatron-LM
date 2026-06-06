@@ -157,7 +157,7 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         ).maybe_get_tensor(list(x.size()), dtype=x.dtype)
         return symm_mem_buffer
 
-    def token_dispatch(self, hidden_states, probs):
+    def token_dispatch(self, hidden_states, hidden_states_sf, probs):
         """Gathers tokens from all EP ranks using AllGather.
 
         Performs all-gather on routing_map (stored in self.routing_map), probs,
@@ -168,19 +168,21 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         Args:
             hidden_states (torch.Tensor): Local hidden states,
                 shape [local_tokens, hidden_dim].
+            hidden_states_sf (torch.Tensor or None): Scale factor for FP8 tokens.
             probs (torch.Tensor): Local routing probabilities,
                 shape [local_tokens, topk]. Normalized weights for each token's
                 selected experts.
 
         Returns:
-            tuple: (hidden_states, probs) gathered across all EP ranks.
+            tuple: (hidden_states, hidden_states_sf, probs) gathered across all EP ranks.
                 - hidden_states (torch.Tensor): Shape [global_tokens, hidden_dim].
+                - hidden_states_sf (torch.Tensor or None): Scale factor for FP8 tokens.
                 - probs (torch.Tensor): Shape [global_tokens, topk].
                 Also updates self.routing_map in-place to the gathered
                 shape [global_tokens, topk].
         """
         if self.ep_size == 1:
-            return hidden_states, probs
+            return hidden_states, hidden_states_sf, probs
 
         # 1. Check inputs only: if inputs are 16-byte divisible,
         #  outputs (world_size * input) are too.
@@ -241,9 +243,9 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
                 hidden_states, group=self.tp_ep_group
             )
 
-        return hidden_states, probs
+        return hidden_states, hidden_states_sf, probs
 
-    def dispatch_postprocess(self, hidden_states, probs):
+    def dispatch_postprocess(self, hidden_states, hidden_states_sf, probs):
         """Pass-through: returns inputs directly without permutation.
 
         Unlike the training dispatcher, this does not permute tokens or compute
@@ -254,6 +256,7 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         Args:
             hidden_states (torch.Tensor): Gathered hidden states,
                 shape [global_tokens, hidden_dim].
+            hidden_states_sf (torch.Tensor or None): Scale factor for FP8 tokens.
             probs (torch.Tensor): Gathered routing probabilities,
                 shape [global_tokens, topk].
 

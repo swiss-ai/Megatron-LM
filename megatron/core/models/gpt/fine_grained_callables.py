@@ -477,7 +477,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     sequence_len_offset=sequence_len_offset,
                 )
                 if not isinstance(layer.mlp, MoELayer):
-                    return hidden_states, None, None, None
+                    return hidden_states, None, None, None, None
                 if layer.recompute_pre_mlp_layernorm:
                     layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
                     with off_interface(
@@ -496,12 +496,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
-                local_tokens, probs = layer.mlp.preprocess(
+                local_tokens, local_tokens_sf, probs = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
                 )
-                return hidden_states, local_tokens, probs, shared_expert_output
+                return hidden_states, local_tokens, local_tokens_sf, probs, shared_expert_output
 
-        hidden_states, local_tokens, probs, shared_expert_output = forward_func(
+        hidden_states, local_tokens, local_tokens_sf, probs, shared_expert_output = forward_func(
             hidden_states=hidden_states,
             attention_mask=node.chunk_state.attention_mask,
             rotary_pos_emb=node.chunk_state.rotary_pos_emb,
@@ -519,10 +519,13 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # Detach here for shared expert connection in moe_combine
             node.layer_state.shared_expert_output = node.detach(shared_expert_output)
 
-        return local_tokens, probs
+        return local_tokens, local_tokens_sf, probs
 
     def submodule_dispatch_forward(
-        node: ScheduleNode, local_tokens: torch.Tensor, probs: torch.Tensor
+        node: ScheduleNode,
+        local_tokens: torch.Tensor,
+        local_tokens_sf: Optional[torch.Tensor],
+        probs: torch.Tensor,
     ):
         """
         Dispatches tokens to the experts based on the router output.
@@ -533,15 +536,21 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # backward graph from connecting to attn submodule
             token_dispatcher._comm_manager.token_probs = probs
 
-        dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
+        dispatched_tokens, dispatched_tokens_sf, dispatched_probs = layer.mlp.dispatch(
+            local_tokens, local_tokens_sf, probs
+        )
 
         # `dispatched_probs` is needed by backward pass of swiglu, therefore it's
         # passed to moe_forward within `layer_state` to avoid the free_input process
         # of the input tensors.
         node.layer_state.dispatched_probs = node.detach(dispatched_probs)
-        return dispatched_tokens
+        return dispatched_tokens, dispatched_tokens_sf
 
-    def submodule_moe_forward(node: ScheduleNode, dispatched_tokens: torch.Tensor):
+    def submodule_moe_forward(
+        node: ScheduleNode,
+        dispatched_tokens: torch.Tensor,
+        dispatched_tokens_sf: Optional[torch.Tensor],
+    ):
         """
         Run forward pass for computations between dispatch and combine:
             post dispatch->experts->combine preprocess
@@ -553,7 +562,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # backward graph from connecting to dispatch submodule
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
 
-        expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
+        expert_output, _ = layer.mlp.routed_experts_compute(
+            dispatched_tokens, dispatched_tokens_sf, dispatched_probs
+        )
 
         # For HybridEP, tokens_per_expert is generated on comm stream, as the input to
         # `routed_experts_compute`, a ref is needed to prevent it from being freed.

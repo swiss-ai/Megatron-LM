@@ -34,6 +34,10 @@ from megatron.core.transformer.moe.moe_utils import (
     sort_chunks_by_idxs,
     unpermute,
 )
+from megatron.core.transformer.moe.fp8_utils import (
+    fp8_cast,
+    fp8_decast,
+)
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -102,12 +106,17 @@ class MoETokenDispatcher:
             probs (torch.Tensor): The routing probability tensor, [num_tokens, num_experts].
 
         Returns:
-            A tuple of preprocessed tokens and probabilities.
+            A tuple of preprocessed tokens, scale factor (or None), and probabilities.
         """
         raise NotImplementedError("dispatch_preprocess function not implemented.")
 
     @abstractmethod
-    def token_dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+    def token_dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_sf: Optional[torch.Tensor],
+        probs: torch.Tensor,
+    ):
         """Dispatches tokens to expert devices using communication.
 
         This method performs the main communication (e.g., All-to-All) to send
@@ -115,15 +124,21 @@ class MoETokenDispatcher:
 
         Args:
             hidden_states (torch.Tensor): Preprocessed hidden states to be dispatched.
+            hidden_states_sf (torch.Tensor or None): Scale factor for FP8 tokens.
             probs (torch.Tensor): Preprocessed probabilities for each token-expert pair.
 
         Returns:
-            A tuple of dispatched tokens and probabilities.
+            A tuple of dispatched tokens, scale factor (or None), and probabilities.
         """
         raise NotImplementedError("token_dispatch function not implemented.")
 
     @abstractmethod
-    def dispatch_postprocess(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+    def dispatch_postprocess(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_sf: Optional[torch.Tensor],
+        probs: torch.Tensor,
+    ):
         """Performs local processing after token dispatch communication.
 
         This method handles post-communication tasks like token reordering and
@@ -251,9 +266,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # [S/TP, B, H] -> [S*B/TP, H]
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
         self.routing_map = routing_map
-        return hidden_states, probs
+        return hidden_states, None, probs
 
-    def token_dispatch(self, hidden_states, probs):
+    def token_dispatch(self, hidden_states, hidden_states_sf, probs):
         """Gathers tokens from all TP*EP ranks using AllGather."""
 
         # Permute the tokens across the expert parallel devices.
@@ -275,9 +290,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
                 hidden_states, group=self.tp_ep_group, use_global_buffer=True
             )
 
-        return hidden_states, probs
+        return hidden_states, hidden_states_sf, probs
 
-    def dispatch_postprocess(self, hidden_states, probs):
+    def dispatch_postprocess(self, hidden_states, hidden_states_sf, probs):
         """After gathering in token_dispatch, this method identifies tokens for local experts and
         permutes them for expert processing.
         """
@@ -388,38 +403,65 @@ class MoEAlltoAllTokenDispatcherFunction(torch.autograd.Function):
         output_splits,
         input_splits,
         permutated_local_input_tokens, 
+        permutated_local_input_tokens_sf,
         permuted_probs,
     ):
         ctx.ep_group = ep_group
         ctx.output_splits = output_splits
         ctx.input_splits = input_splits
+        ctx.fp8_dispatch = permutated_local_input_tokens_sf is not None
 
+        # dispatch probs
         global_probs = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
             ep_group, permuted_probs, output_splits, input_splits
         )
-        global_input_tokens = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
-            ep_group, permutated_local_input_tokens, output_splits, input_splits
-        )
-        return global_input_tokens, global_probs
+
+        # dispatch tokens
+        global_input_tokens_sf = None
+        if permutated_local_input_tokens_sf is not None:
+            global_input_tokens_sf = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+                ep_group, permutated_local_input_tokens_sf, output_splits, input_splits
+            )
+            global_input_tokens = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+                ep_group, permutated_local_input_tokens, output_splits, input_splits
+            )
+        else:
+            global_input_tokens = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+                ep_group, permutated_local_input_tokens, output_splits, input_splits
+            )
+        return global_input_tokens, global_input_tokens_sf, global_probs
 
     @staticmethod
     def backward(
         ctx, 
         grad_hidden_states, 
+        grad_hidden_states_sf,
         grad_probs
     ):
         ep_group = ctx.ep_group
         output_splits = ctx.output_splits
         input_splits = ctx.input_splits
+        fp8_dispatch = ctx.fp8_dispatch
 
         # The backward of token dispatch is the same as token combine.
         global_grad_probs = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
             ep_group, grad_probs, input_splits, output_splits
         )
-        global_grad_hidden_states = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
-            ep_group, grad_hidden_states, input_splits, output_splits
-        )
-        return None, None, None, global_grad_hidden_states, global_grad_probs
+
+        global_grad_hidden_states_sf = None
+        if fp8_dispatch and grad_hidden_states_sf is not None:
+            global_grad_hidden_states_sf = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+                ep_group, grad_hidden_states_sf, input_splits, output_splits
+            )
+            global_grad_hidden_states = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+                ep_group, grad_hidden_states, input_splits, output_splits
+            )
+        else:
+            global_grad_hidden_states = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+                ep_group, grad_hidden_states, input_splits, output_splits
+            )
+        # Trailing None corresponds to the non-tensor `fp8_dispatch` forward arg.
+        return None, None, None, global_grad_hidden_states, global_grad_hidden_states_sf, global_grad_probs
 
 class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     """
@@ -720,9 +762,21 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
         )
-        return permutated_local_input_tokens, permuted_probs
 
-    def token_dispatch(self, permutated_local_input_tokens, permuted_probs):
+        permutated_local_input_tokens_sf = None
+        if self.config.moe_use_fp8_dispatch:
+            permutated_local_input_tokens, permutated_local_input_tokens_sf = fp8_cast(
+                permutated_local_input_tokens
+            )
+
+        return permutated_local_input_tokens, permutated_local_input_tokens_sf, permuted_probs
+
+    def token_dispatch(
+        self,
+        permutated_local_input_tokens,
+        permutated_local_input_tokens_sf,
+        permuted_probs,
+    ):
         """
         Perform all-to-all communication for dispatching tokens.
 
@@ -732,10 +786,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         Args:
             permutated_local_input_tokens (torch.Tensor): Pre-permuted input tokens.
+            permutated_local_input_tokens_sf (torch.Tensor or None): Scale factor for FP8 tokens.
             permuted_probs (torch.Tensor): Pre-permuted probabilities.
 
         Returns:
-            A tuple of tokens and probabilities after All-to-All.
+            A tuple of tokens, scale factor (or None), and probabilities after All-to-All.
         """
 
         # Perform expert parallel AlltoAll communication
@@ -762,23 +817,18 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 f"hidden_shape={self.hidden_shape}"
             )
         # ---- END DEBUG ----
-        global_input_tokens, global_probs = MoEAlltoAllTokenDispatcherFunction.apply(
+        global_input_tokens, global_input_tokens_sf, global_probs = MoEAlltoAllTokenDispatcherFunction.apply(
             self.ep_group,
             self.output_splits,
             self.input_splits,
             permutated_local_input_tokens,
+            permutated_local_input_tokens_sf,
             permuted_probs,
         )
-        # global_probs = all_to_all(
-        #     self.ep_group, permuted_probs, self.output_splits, self.input_splits
-        # )
-        # global_input_tokens = all_to_all(
-        #     self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
-        # )
 
-        return global_input_tokens, global_probs
+        return global_input_tokens, global_input_tokens_sf, global_probs
 
-    def dispatch_postprocess(self, global_input_tokens, global_probs):
+    def dispatch_postprocess(self, global_input_tokens, global_input_tokens_sf, global_probs):
         """Post-processes tokens after All-to-All communication.
 
         This involves an All-Gather in the tensor parallel dimension and sorting
@@ -786,11 +836,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         Args:
             global_input_tokens (torch.Tensor): Tokens after All-to-All.
+            global_input_tokens_sf (torch.Tensor or None): Scale factor for FP8 tokens.
             global_probs (torch.Tensor): Probabilities after All-to-All.
 
         Returns:
             A tuple of processed tokens, token counts per expert, and processed probabilities.
         """
+        if self.config.moe_use_fp8_dispatch:
+            global_input_tokens = fp8_decast(global_input_tokens, global_input_tokens_sf)
         if self.shared_experts is not None:
             self.shared_experts.linear_fc1_forward_and_act(global_input_tokens)
 
@@ -1540,11 +1593,12 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         routing_map, probs = self._initialize_metadata(routing_map, probs)
 
         self._comm_manager.setup_metadata(routing_map, probs)
-        return hidden_states, self._comm_manager.token_probs
+        return hidden_states, None, self._comm_manager.token_probs
 
     def token_dispatch(
         self,
         hidden_states: torch.Tensor,
+        hidden_states_sf: Optional[torch.Tensor],
         probs: Optional[torch.Tensor] = None,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
@@ -1559,19 +1613,21 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         Args:
             hidden_states (torch.Tensor): Preprocessed hidden states to be dispatched
+            hidden_states_sf (torch.Tensor or None): Scale factor for FP8 tokens.
             probs (torch.Tensor): Routing probabilities (unused in current implementation)
             async_finish (bool): Whether to use asynchronous communication completion
             allocate_on_comm_stream (bool): Whether to allocate buffers on communication stream
 
         Returns:
-            A tuple of dispatched tokens and probabilities.
+            A tuple of dispatched tokens, scale factor (or None), and probabilities.
         """
         return (
             self._comm_manager.dispatch(hidden_states, async_finish, allocate_on_comm_stream),
+            hidden_states_sf,
             self._comm_manager.dispatched_probs,
         )
 
-    def dispatch_postprocess(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+    def dispatch_postprocess(self, hidden_states: torch.Tensor, hidden_states_sf: Optional[torch.Tensor], probs: torch.Tensor):
         """Converts dispatched tokens to a per-expert format for expert processing.
 
         This method transforms the output of the fused dispatch into the tensor
@@ -1579,6 +1635,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         Args:
             hidden_states (torch.Tensor): Hidden states after fused dispatch
+            hidden_states_sf (torch.Tensor or None): Scale factor for FP8 tokens.
             probs (torch.Tensor): Routing probabilities after fused dispatch
 
         Returns:

@@ -17,11 +17,19 @@ from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
 
+def rel_diff(actual, reference):
+    """Relative L2 difference: ||actual - ref|| / ||ref||."""
+    return (
+        torch.norm(actual.float() - reference.float()).item()
+        / torch.norm(reference.float()).item()
+    )
+
+
 def token_permutation(token_dispatcher, hidden_states, probs, indices):
-    hidden_states, probs = token_dispatcher.dispatch_preprocess(hidden_states, indices, probs)
-    hidden_states, probs = token_dispatcher.token_dispatch(hidden_states, probs)
+    hidden_states, hidden_states_sf, probs = token_dispatcher.dispatch_preprocess(hidden_states, indices, probs)
+    hidden_states, hidden_states_sf, probs = token_dispatcher.token_dispatch(hidden_states, hidden_states_sf, probs)
     hidden_states, tokens_per_expert, permuted_probs = token_dispatcher.dispatch_postprocess(
-        hidden_states, probs
+        hidden_states, hidden_states_sf, probs
     )
     return hidden_states, tokens_per_expert, permuted_probs
 
@@ -153,6 +161,49 @@ class MoEModelTestContainer:
         torch.testing.assert_close(
             hidden_states.grad, ans
         ), "Restored hidden states do not match original hidden states"
+
+    @pytest.mark.internal
+    def dispatcher_fp8_test(self, rel_tol=0.03):
+        """Test the FP8 all-to-all token dispatch round-trip.
+
+        Tokens are quantized to FP8 (e4m3) before the dispatch all-to-all and
+        dequantized afterwards, so the round-trip is lossy. Instead of an exact
+        match we require the relative L2 error of the restored hidden states
+        (and the gradient) to stay within ``rel_tol``.
+        """
+        moe_layer = self.new_moe_layer(moe_use_fp8_dispatch=True)
+        bs = 32
+        seql = 8
+        hidden_states = torch.randn((bs, seql, moe_layer.config.hidden_size), dtype=self.test_dtype)
+        hidden_states = hidden_states.cuda()
+        # Permute and then unpermute data are supposed to (approximately) restore original data.
+        ans = hidden_states
+        hidden_states.requires_grad = True
+        probs, indices = apply_module(moe_layer.router)(hidden_states)
+        probs = torch.ones_like(probs) / moe_layer.router.topk
+
+        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
+            moe_layer.token_dispatcher, hidden_states, probs, indices
+        )
+
+        permuted_local_hidden_states = permuted_local_hidden_states * permuted_probs.unsqueeze(-1)
+        permuted_local_hidden_states = permuted_local_hidden_states.to(dtype=self.test_dtype)
+
+        restored_hidden_states, restored_bias = token_unpermutation(
+            moe_layer.token_dispatcher, permuted_local_hidden_states
+        )
+
+        # reduce across TP rank equals to multiply data by a scale of ETP
+        scale = moe_layer.config.expert_tensor_parallel_size
+        restored_hidden_states = restored_hidden_states / scale
+
+        fwd_diff = rel_diff(restored_hidden_states, ans)
+        assert fwd_diff < rel_tol, f"forward rel_diff={fwd_diff:.4f} exceeds {rel_tol}"
+
+        # check if the grad of the hidden states is (approximately) the same as the hidden states
+        torch.autograd.backward(restored_hidden_states, hidden_states)
+        grad_diff = rel_diff(hidden_states.grad, ans)
+        assert grad_diff < rel_tol, f"backward rel_diff={grad_diff:.4f} exceeds {rel_tol}"
 
     @pytest.mark.internal
     def dispatcher_capacity_test(self):
@@ -400,6 +451,42 @@ class TestAllgatherDispatcher:
         )
 
         container.dispatcher_dropless_test()
+
+
+def is_fp8_dispatch_available():
+    """FP8 dispatch needs CUDA and an FP8-capable GPU (compute capability >= 8.9)."""
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return (major, minor) >= (8, 9)
+
+
+class TestAlltoAllFp8Dispatcher:
+    def setup_method(self, method):
+        pass
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not is_fp8_dispatch_available(),
+        reason="FP8 dispatch requires an FP8-capable GPU (compute capability >= 8.9)",
+    )
+    @pytest.mark.internal
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 4), (2, 2), (4, 1)])
+    def test_fp8_forward_backward(self, tp_size, ep_size):
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="alltoall",
+            hidden_size=256,
+            test_dtype=torch.bfloat16,
+        )
+        container.dispatcher_fp8_test()
 
 
 def is_deep_ep_available():

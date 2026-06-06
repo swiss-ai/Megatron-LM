@@ -9,6 +9,10 @@ except ImportError:
 import matplotlib.pyplot as plt
 
 from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
+from megatron.core.transformer.moe.fp8_jit import (
+    per_token_cast_to_fp8,
+    per_token_dequant_from_fp8,
+)
 
 def diff_tensor_norm(t1, t2):
     t1f = t1.to(torch.float)
@@ -302,3 +306,45 @@ def multi_stream_fp8_gemm_nt_1d1d(
                 disable_ue8m0_cast=True,
             )
     return output
+
+class FP8CastFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx, 
+        input,
+    ):
+        fp8_input, sf = per_token_cast_to_fp8(input, use_ue8m0=False)
+        return fp8_input, sf
+
+    @staticmethod
+    def backward(
+        ctx, 
+        fp8_input, 
+        sf,
+    ):
+        grad_input = per_token_dequant_from_fp8(fp8_input, sf)
+        return grad_input
+    
+def fp8_cast(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    return FP8CastFunction.apply(input)
+    
+class FP8DeCastFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx, 
+        fp8_input, 
+        sf,
+    ):
+        input = per_token_dequant_from_fp8(fp8_input, sf)
+        return input
+
+    @staticmethod
+    def backward(
+        ctx, 
+        grad_input,
+    ):
+        fp8_grad_input, sf = per_token_cast_to_fp8(grad_input, use_ue8m0=False)
+        return fp8_grad_input, sf
+    
+def fp8_decast(fp8_input: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
+    return FP8DeCastFunction.apply(fp8_input, sf)

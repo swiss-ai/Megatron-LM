@@ -1205,9 +1205,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # and should be skipped here.
             if self.config.overlap_moe_expert_parallel_comm:
                 probs, routing_map = self.mlp.route(hidden_states)
-                hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
+                hidden_states, hidden_states_sf, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 nvtx_range_pop(suffix="mlp")
-                return residual, hidden_states, probs, shared_expert_output
+                return residual, hidden_states, hidden_states_sf, probs, shared_expert_output
             mlp_output_with_bias = self.mlp(hidden_states)
             self.mlp.cudagraph_tensor_store.clear()
             nvtx_range_pop(suffix="mlp")
@@ -1224,7 +1224,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 assert len(cuda_graph_output) == 1, "CUDA Graph output should be the layer output."
                 residual = cuda_graph_output.pop()
                 if not self.is_moe_layer:
-                    return residual, None, None, None
+                    return residual, None, None, None, None
                 hidden_states = apply_module(self.pre_mlp_layernorm)(residual)
                 if isinstance(hidden_states, tuple):
                     if len(hidden_states) != 2:
@@ -1237,8 +1237,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
                 shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
                 probs, routing_map = self.mlp.route(hidden_states)
-                hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
-                return residual, hidden_states, probs, shared_expert_output
+                hidden_states, hidden_states_sf, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
+                return residual, hidden_states, hidden_states_sf, probs, shared_expert_output
 
             # CUDA Graph does not capture the MLP/MoE part at all.
             output = self._forward_mlp(*cuda_graph_output)
@@ -1475,7 +1475,7 @@ class MoETransformerLayer(TransformerLayer):
 
         return residual, *router_outputs
 
-    def _forward_mlp_expert_compute(self, hidden_states, probs):
+    def _forward_mlp_expert_compute(self, hidden_states, hidden_states_sf, probs):
         """
         Executes the actual computation of the experts.
 
@@ -1492,7 +1492,7 @@ class MoETransformerLayer(TransformerLayer):
             setattr(obj, hier_attr_name[-1], attr)
 
         self.mlp.fwd_execution_map = "expert_compute"
-        return self.mlp(None, intermediate_tensors=(hidden_states, probs))
+        return self.mlp(None, intermediate_tensors=(hidden_states, hidden_states_sf, probs))
 
     def _forward_mlp_postprocess(self, residual, output, shared_expert_output, mlp_bias):
         """
@@ -1532,7 +1532,7 @@ class MoETransformerLayer(TransformerLayer):
         def _forward_mlp_partial_cudagraphs(
             hidden_states, inference_context=None, padding_mask=None
         ):
-            residual, hidden_states, probs, shared_expert_output = self._forward_mlp_router(
+            residual, hidden_states, hidden_states_sf, probs, shared_expert_output = self._forward_mlp_router(
                 hidden_states, padding_mask=padding_mask
             )
 
@@ -1545,7 +1545,7 @@ class MoETransformerLayer(TransformerLayer):
             for name, attr in self.token_dispatcher_attrs.items():
                 setattr(self.mlp.token_dispatcher, name, attr)
 
-            expert_output, mlp_bias = self._forward_mlp_expert_compute(hidden_states, probs)
+            expert_output, mlp_bias = self._forward_mlp_expert_compute(hidden_states, hidden_states_sf, probs)
             return self._forward_mlp_postprocess(
                 residual, expert_output, shared_expert_output, mlp_bias
             )
