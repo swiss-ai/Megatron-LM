@@ -543,6 +543,7 @@ def get_pg_size(group=None):
         if not torch.distributed.is_initialized():
             return 1
         return torch.distributed.get_world_size()
+
     return group.size()
 
 

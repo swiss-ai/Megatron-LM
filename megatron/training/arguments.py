@@ -802,7 +802,7 @@ def validate_args(args, defaults={}):
     # across batches/microbatches. Due to additional communication overhead
     # during pipeline parallelism, it should not be set if sequence length
     # is constant during training.
-    args.variable_seq_lengths = False
+    # args.variable_seq_lengths = False
 
     # Iteration-based training.
     if args.train_iters:
@@ -3147,6 +3147,8 @@ def _add_data_args(parser):
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention mask after '
                        'end-of-document token.')
+    group.add_argument('--variable-seq-lengths', action='store_true',
+                       help='Compute the length of the tensor you send in PP groups, not fixed. Relevant with CP.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
     group.add_argument('--use-packed-seq-params', action='store_true',
@@ -3349,9 +3351,6 @@ def _add_vision_args(parser):
                        dest='data_sharding')
     group.add_argument('--head-lr-mult', type=float, default=1.0,
                        help='learning rate multiplier for head during finetuning')
-    group.add_argument('--extend-model-vocab', action='store_true',
-                       help='Extend model vocabulary with vision tokens. '
-                       'This is useful for multimodal models.')
 
     # pretraining type and backbone selection`
     group.add_argument('--vision-pretraining', action='store_true',

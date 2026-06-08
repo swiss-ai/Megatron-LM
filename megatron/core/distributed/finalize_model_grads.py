@@ -148,7 +148,9 @@ def _get_shared_word_embedding_weight(
     return None
 
 
-def _get_position_embedding_weight(model_module: torch.nn.Module) -> torch.nn.Parameter:
+def _get_position_embedding_weight(
+    model_module: torch.nn.Module,
+) -> Optional[torch.nn.Parameter]:
     """Return the position-embedding weight tensor from the given model module.
 
     Args:
@@ -156,9 +158,19 @@ def _get_position_embedding_weight(model_module: torch.nn.Module) -> torch.nn.Pa
             position-embedding parameter.
 
     Returns:
-        The position-embedding weight tensor.
+        The position-embedding weight tensor if learned position embeddings
+        exist on this model chunk, otherwise ``None``.
     """
-    return getattr(model_module, 'position_embeddings').weight  # type: ignore[attr-defined]
+    position_embeddings = getattr(model_module, 'position_embeddings', None)
+    if position_embeddings is not None:
+        return position_embeddings.weight
+
+    embedding = getattr(model_module, 'embedding', None)
+    position_embeddings = getattr(embedding, 'position_embeddings', None)
+    if position_embeddings is not None:
+        return position_embeddings.weight
+
+    return None
 
 
 def _allreduce_word_embedding_grads(
@@ -188,8 +200,9 @@ def _allreduce_word_embedding_grads(
     """
     if embd_group is None:
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
-        if get_pg_size(embd_group) > 1:
-            assert pp_group is None
+        if embd_group is None:
+            return
+        if pp_group is None and get_pg_size(embd_group) > 1:
             pp_group = parallel_state.get_pipeline_model_parallel_group()
 
     _allreduce_embedding_grad(
@@ -199,8 +212,8 @@ def _allreduce_word_embedding_grads(
 
 def _allreduce_embedding_grad(
     model: List[torch.nn.Module],
-    embd_group: torch.distributed.ProcessGroup,
-    pp_group: torch.distributed.ProcessGroup,
+    embd_group: Optional[torch.distributed.ProcessGroup],
+    pp_group: Optional[torch.distributed.ProcessGroup],
     weight_getter: Callable[[torch.nn.Module], Optional[torch.nn.Parameter]],
     skip_if_none: bool = True,
 ):
@@ -208,9 +221,10 @@ def _allreduce_embedding_grad(
 
     Args:
         model (List[torch.nn.Module]): A list of model chunks (PP/VPP).
-        embd_group (torch.distributed.ProcessGroup): The process group over which to reduce.
-        pp_group (torch.distributed.ProcessGroup): The pipeline parallel process group for
-            first/last stage detection.
+        embd_group (torch.distributed.ProcessGroup, optional): The process group over which to
+            reduce. If ``None``, the all-reduce is skipped.
+        pp_group (torch.distributed.ProcessGroup, optional): The pipeline parallel process group
+            for first/last stage detection.
         weight_getter (Callable[[torch.nn.Module], Optional[torch.nn.Parameter]]): A function
             that takes the *pre-process* model chunk and returns the parameter to be reduced
             (or ``None`` if not applicable).
@@ -218,9 +232,12 @@ def _allreduce_embedding_grad(
             gradient is ``None``. Defaults to True.
     """
 
+    if embd_group is None:
+        return
+
     if (
-        # embd_group can be None in cases there is no embd_group
-        # get_pg_size(embd_group) will return 1 and the all-reduce will be skipped.
+        # Missing embedding groups are skipped above. Do not call get_pg_size(None)
+        # here because it falls back to the default distributed group.
         get_pg_size(embd_group) > 1
         and torch.distributed.get_rank() in torch.distributed.get_process_group_ranks(embd_group)
     ):
@@ -254,8 +271,8 @@ def _allreduce_embedding_grad(
 def _allreduce_position_embedding_grads(
     model: List[torch.nn.Module],
     config: TransformerConfig,
-    pos_emb_group: torch.distributed.ProcessGroup,
-    pp_group: torch.distributed.ProcessGroup,
+    pos_emb_group: Optional[torch.distributed.ProcessGroup],
+    pp_group: Optional[torch.distributed.ProcessGroup],
 ):
     """
     All-reduce position_embeddings grad across encoder and decoder stages to ensure that position
@@ -263,7 +280,7 @@ def _allreduce_position_embedding_grads(
     """
 
     _allreduce_embedding_grad(
-        model, pos_emb_group, pp_group, _get_position_embedding_weight, skip_if_none=False
+        model, pos_emb_group, pp_group, _get_position_embedding_weight, skip_if_none=True
     )
 
 

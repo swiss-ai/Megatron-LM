@@ -77,13 +77,6 @@ def model_provider(
 
         torch._C._cuda_attach_out_of_memory_observer(oom_observer)
 
-    # Logic to handle additional vocab size for multimodal models
-    if getattr(args, "base_vocab_size", None) is not None and args.base_vocab_size != args.padded_vocab_size:
-        args.total_multimodal_vocab_size = args.padded_vocab_size
-        if args.extend_model_vocab:
-            # Build model with base vocab size first; checkpointing.py will extend embeddings
-            args.padded_vocab_size = args.base_padded_vocab_size
-
     if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):
         # [ModelOpt]: Use custom builder + spec when modelopt is enabled
         model_builder = modelopt_gpt_mamba_builder

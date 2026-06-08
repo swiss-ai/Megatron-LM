@@ -19,6 +19,8 @@ runs/
 core_nid*
 .idea/
 .claude/
+.codex
+code-*.out
 
 # Sphinx documentation
 docs/_build

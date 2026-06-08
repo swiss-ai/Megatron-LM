@@ -10,13 +10,34 @@ from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import (
     _allreduce_non_tensor_model_parallel_grads,
+    _allreduce_position_embedding_grads,
     _allreduce_word_embedding_grads,
+    _get_position_embedding_weight,
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_missing_embedding_groups_are_skipped(monkeypatch):
+    monkeypatch.setattr(parallel_state, "get_embedding_group", lambda check_initialized=True: None)
+
+    _allreduce_word_embedding_grads([], object())
+    _allreduce_position_embedding_grads([], object(), None, None)
+
+
+def test_missing_position_embedding_weight_returns_none():
+    assert _get_position_embedding_weight(torch.nn.Module()) is None
+
+
+def test_nested_position_embedding_weight_is_found():
+    model = torch.nn.Module()
+    model.embedding = torch.nn.Module()
+    model.embedding.position_embeddings = torch.nn.Embedding(4, 8)
+
+    assert _get_position_embedding_weight(model) is model.embedding.position_embeddings.weight
 
 
 class TestAllReduceLNGrads:

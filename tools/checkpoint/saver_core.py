@@ -28,6 +28,23 @@ def add_arguments(parser):
     group.add_argument('--saver-transformer-impl', default='transformer_engine',
                        choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.')
+    group.add_argument('--vocab-extension-source-size', type=int, default=None,
+                       help='Original non-padded vocab size whose rows must be preserved before '
+                            'deterministic vocab extension. Used with --vocab-extension-target-size.')
+    group.add_argument('--vocab-extension-target-size', type=int, default=None,
+                       help='Target real vocab size after adding tokenizer-addressable tokens. '
+                            'Rows from source size to this size are deterministically initialized '
+                            'before Megatron padding and TP sharding.')
+    group.add_argument('--vocab-extension-seed', type=int, default=1234,
+                       help='Seed used for deterministic vocab extension rows.')
+    group.add_argument('--vocab-extension-init-method', type=str, default='mean-std',
+                       choices=['mean-std', 'megatron-original'],
+                       help='How to initialize appended vocab rows. mean-std samples from '
+                            'source-row statistics; megatron-original repeats the final source '
+                            'row, matching Megatron converter padding.')
+    group.add_argument('--vocab-extension-make-vocab-size-divisible-by', type=int, default=None,
+                       help='Override make_vocab_size_divisible_by for the output checkpoint when '
+                            'using --vocab-extension-target-size.')
 
 
 class MegatronCheckpointSaverLLM(MegatronCheckpointSaverBase):

@@ -1634,8 +1634,7 @@ class TransformerConfig(ModelParallelConfig):
                         ) or "moe" not in self.recompute_modules, (
                             "moe_input_jitter_eps is not supported with graphed moe recomputation."
                         )
-
-        if self.moe_token_dispatcher_type in ["allgather"]:
+        if self.moe_token_dispatcher_type in ["allgather"] and self.num_moe_experts != None:
             if self.variable_seq_lengths is True:
                 raise ValueError(
                     f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "

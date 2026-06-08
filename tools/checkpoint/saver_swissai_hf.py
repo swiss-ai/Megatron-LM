@@ -22,6 +22,11 @@ except ModuleNotFoundError:
     print("Unable to import Megatron. Exiting.")
     exit(1)
 
+# Apertus stops generation on any of these — HF accepts an eos_token_id list so generation
+# halts at end-of-sequence, end-of-assistant-turn, or end-of-tools-section.
+APERTUS_EOS_TOKENS = ["</s>", "<|assistant_end|>", "<|tools_suffix|>"]
+
+
 def add_arguments(parser):
     group = parser.add_argument_group(title="Llama HF saver.")
     group.add_argument(
@@ -374,19 +379,32 @@ def save_checkpoint(queue: mp.Queue, args):
     model.save_pretrained(args.save_dir, safe_serialization=True)
 
     ### save chat config
+    if args.hf_tokenizer:
+        resolved_ids = []
+        unk_id = getattr(tokenizer, "unk_token_id", None)
+        for tok_str in APERTUS_EOS_TOKENS:
+            tok_id = tokenizer.convert_tokens_to_ids(tok_str)
+            if tok_id == unk_id and tok_str != tokenizer.unk_token:
+                print(f"Warning: eos token {tok_str!r} not in tokenizer, skipping.")
+                continue
+            resolved_ids.append(tok_id)
+        eos_token_id_for_gen = resolved_ids if resolved_ids else llama_conf.eos_token_id
+        print(f"Apertus eos token ids: {eos_token_id_for_gen}")
+    else:
+        eos_token_id_for_gen = llama_conf.eos_token_id
     generation_config = (
         GenerationConfig(
             do_sample=True,
             temperature=0.6,
             top_p=0.9,
             bos_token_id=llama_conf.bos_token_id,
-            eos_token_id=llama_conf.eos_token_id,
+            eos_token_id=eos_token_id_for_gen,
         )
         if args.save_chat_model
         else GenerationConfig(
             _from_model_config=True,
             bos_token_id=llama_conf.bos_token_id,
-            eos_token_id=llama_conf.eos_token_id,
+            eos_token_id=eos_token_id_for_gen,
         )
     )
     print(f"Saving chat config to {args.save_dir}")

@@ -20,7 +20,6 @@ import torch
 from typing import Optional, Union, List, Dict, Any
 from torch.distributed.checkpoint import FileSystemReader, default_planner
 
-from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
@@ -1715,48 +1714,68 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
 
-    def load_model_state_dict(module, state_dict, strict: bool):
+    def _report_load_mismatches(model_name, load_return):
+        if load_return is None:
+            return
+        missing_keys = getattr(load_return, "missing_keys", ())
+        unexpected_keys = getattr(load_return, "unexpected_keys", ())
+        if not missing_keys and not unexpected_keys:
+            return
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        logger.warning(
+            "Checkpoint load mismatch on rank %s %s: missing_keys=%d %s; "
+            "unexpected_keys=%d %s. Missing keys remain initialized.",
+            rank,
+            model_name,
+            len(missing_keys),
+            list(missing_keys)[:20],
+            len(unexpected_keys),
+            list(unexpected_keys)[:20],
+        )
+
+    def load_model_state_dict(module, state_dict, strict: bool, model_name: str):
         """Helper function to load state dict with fallback for missing extra states."""
         try:
-            module.load_state_dict(state_dict, strict=strict)
+            load_return = module.load_state_dict(state_dict, strict=strict)
+            _report_load_mismatches(model_name, load_return)
         except Exception as e:
             if strict:
                 # Fallback support for backward compatibility breaking changes in TransformerEngine
                 load_return = module.load_state_dict(state_dict, strict=False)
                 print(f"load_return: {load_return}")
+                _report_load_mismatches(model_name, load_return)
     # Model.
     strict = False if args.retro_add_retriever else strict
     if not skip_load_to_model_and_opt:
         if len(ddp_model) == 1:
-            load_model_state_dict(ddp_model[0], state_dict['model'], strict)
+            load_model_state_dict(ddp_model[0], state_dict['model'], strict, 'model')
         else:
+            has_vpp_model_keys = any('model%d' % i in state_dict for i in range(len(ddp_model)))
+            if 'model' in state_dict and not has_vpp_model_keys:
+                raise RuntimeError(
+                    "Checkpoint contains a single non-VPP 'model' state, but this run built "
+                    f"{len(ddp_model)} virtual pipeline model chunks. Convert or resave the "
+                    "checkpoint with the same --num-layers-per-virtual-pipeline-stage setting "
+                    "instead of loading it into a VPP run."
+                )
             for i in range(len(ddp_model)):
                 # If there is no corresponding model in the state_dict, it will be ignored.
                 # It means that this is an empty stage.
                 if 'model%d' % i not in state_dict:
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    logger.warning(
+                        "Checkpoint load mismatch on rank %s model%d: checkpoint key missing; "
+                        "this model chunk remains initialized.",
+                        rank,
+                        i,
+                    )
                     continue
-                load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
-
-    # Expand the embedding size to make the model multimodal
-    if args.extend_model_vocab:
-        assert args.pipeline_model_parallel_size == 1, \
-            "--extend-model-vocab requires PP=1. Run conversion separately, then train with any PP (requires save as torch_dist cp which is topology agnostic)"
-    if getattr(args, 'total_multimodal_vocab_size', None) is not None and model[0].vocab_size != args.total_multimodal_vocab_size:
-        print_rank_0(f"Expanding model vocab size from {model[0].vocab_size} to {args.total_multimodal_vocab_size}")
-        model[0].vocab_size = args.total_multimodal_vocab_size
-        extend_vocab_and_load_weights(model, state_dict, args.base_vocab_size, mpu)
+                load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict, f'model{i}')
 
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
     print_rank_0(f' checkpoint version {checkpoint_version}')
     fix_query_key_value_ordering(model, checkpoint_version)
-    if args.extend_model_vocab:
-        # Save the extended model and stop training since the optimizer state is not compatible
-        # After this you can start a new training with the extended model, just remove the --extend-model-vocab flag
-        # And specify the correct load path
-        # TODO (nirmiger): would it be possible to continue training directly?
-        save_checkpoint(1, model , None, None, 0)
-        sys.exit()
 
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:
@@ -1898,96 +1917,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 log_printed = True
 
     return iteration, num_floating_point_operations_so_far, tokens_so_far
-
-def extend_vocab_and_load_weights(
-    model: list,
-    state_dict: dict,
-    old_vocab_size: int,
-    mpu,
-):
-    model[0].embedding = LanguageModelEmbedding(
-                config=model[0].config,
-                vocab_size=model[0].vocab_size,
-                max_sequence_length=model[0].max_sequence_length,
-                position_embedding_type=model[0].position_embedding_type,
-                scatter_to_sequence_parallel=model[0].embedding.scatter_to_sequence_parallel,
-            )
-    # Extend the output layer to match the new vocab size
-    model[0].output_layer = tensor_parallel.ColumnParallelLinear(
-                model[0].config.hidden_size,
-                model[0].vocab_size,
-                config=model[0].config,
-                init_method=model[0].config.init_method,
-                bias=False,
-                skip_bias_add=False,
-                gather_output=not model[0].parallel_output,
-                skip_weight_param_allocation=model[0].pre_process
-                and model[0].share_embeddings_and_output_weights,
-                embedding_activation_buffer=model[0].embedding_activation_buffer,
-                grad_output_buffer=model[0].grad_output_buffer,
-            )
-    # Load the pretrained weights into the new embeddings
-    load_expanded_weights(
-        model_weight=model[0].embedding.word_embeddings.weight,
-        ckpt_state_dict=state_dict,
-        global_old_vocab_size=old_vocab_size,
-        global_new_vocab_size=model[0].vocab_size, # EXPAND
-        mpu=mpu,
-        weight_key='embedding.word_embeddings.weight',
-        weight_type='embedding',
-    )
-    # Load the pretrained weights into the new output layer
-    if 'output_layer.weight' in state_dict['model']:
-        load_expanded_weights(
-            model_weight=model[0].output_layer.weight,
-            ckpt_state_dict=state_dict,
-            global_old_vocab_size=old_vocab_size,
-            global_new_vocab_size=model[0].vocab_size,
-            mpu=mpu,
-            weight_key='output_layer.weight',
-            weight_type='output',
-        )
-
-def load_expanded_weights(
-    model_weight: torch.Tensor,
-    ckpt_state_dict: dict,
-    global_old_vocab_size: int,
-    global_new_vocab_size: int,
-    mpu,
-    weight_key: str,
-    weight_type: str = "embedding"  # for logging
-):
-    tp_rank = mpu.get_tensor_model_parallel_rank()
-    tp_size = mpu.get_tensor_model_parallel_world_size()
-    tp_group = mpu.get_tensor_model_parallel_group()
-
-    # Get local shard from checkpoint
-    local_old_weight = ckpt_state_dict['model'][weight_key].contiguous().to(model_weight.device)
-
-    # All-gather old shards
-    gathered_weights = [torch.empty_like(local_old_weight) for _ in range(tp_size)]
-    torch.distributed.all_gather(gathered_weights, local_old_weight, group=tp_group)
-    full_old_weight = torch.cat(gathered_weights, dim=0)  # [global_old_vocab, hidden_dim]
-
-    # Compute new shard slice for this rank
-    base_new_shard = global_new_vocab_size // tp_size
-    remainder = global_new_vocab_size % tp_size
-    new_local_start = tp_rank * base_new_shard
-    new_local_end = new_local_start + base_new_shard
-    if tp_rank == tp_size - 1:
-        new_local_end += remainder
-
-    new_local_vocab_size = new_local_end - new_local_start
-
-    # Determine how many rows we can copy from old weights
-    num_rows_to_copy = max(0, min(global_old_vocab_size - new_local_start, new_local_vocab_size))
-    print(f"Loading {num_rows_to_copy} rows into model {weight_type} from old weight on tp rank {tp_rank}")
-
-    if num_rows_to_copy > 0:
-        with torch.no_grad():
-            model_weight[:num_rows_to_copy].copy_(
-                full_old_weight[new_local_start:new_local_start + num_rows_to_copy]
-            )
 
 
 def _to_dtensor(wrapped_model, model_state_dict):

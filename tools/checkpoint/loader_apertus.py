@@ -138,10 +138,16 @@ def _load_checkpoint(queue, args):
 
     # Set dtype
     if args.bf16:
+        margs.bf16 = True
+        margs.fp16 = False
         margs.params_dtype = torch.bfloat16
     elif args.fp16:
+        margs.fp16 = True
+        margs.bf16 = False
         margs.params_dtype = torch.float16
     else:
+        margs.bf16 = False
+        margs.fp16 = False
         margs.params_dtype = torch.float32
 
     # Validate and set global variables
@@ -168,6 +174,9 @@ def _load_checkpoint(queue, args):
     # Get true vocab size from tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.tokenizer_model, trust_remote_code=True)
     true_vocab_size = len(tokenizer)
+
+    word_embed = hf_model.model.embed_tokens.weight.data
+    lm_head_weight = hf_model.lm_head.weight.data if margs.untie_embeddings_and_output_weights else None
 
     # Build metadata
     md = types.SimpleNamespace()
@@ -207,7 +216,7 @@ def _load_checkpoint(queue, args):
 
     # Send embeddings
     message = {
-        "word embeddings": hf_model.model.embed_tokens.weight.data,
+        "word embeddings": word_embed,
     }
     queue_put("embeddings", message)
 
@@ -283,7 +292,7 @@ def _load_checkpoint(queue, args):
     # Send output layer (lm_head)
     if md.output_layer:
         message = {
-            "weight": hf_model.lm_head.weight.data,
+            "weight": lm_head_weight,
         }
         queue_put("output layer", message)
 

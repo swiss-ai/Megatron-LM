@@ -6,7 +6,14 @@ from packaging.version import Version as PkgVersion
 import sys
 import torch
 
-from utils import _ConverterFakeProcessGroup, chunk_bias, chunk_weight
+from utils import (
+    chunk_bias,
+    chunk_weight,
+    init_converter_fake_groups,
+    pop_xielu_params,
+    set_converter_fake_group_ranks,
+)
+from vocab_extension import VocabExtensionConfig, resize_vocab_table
 
 class MegatronCheckpointSaverBase:
     """Orchestrates saving a Megatron checkpoint using parameters received on a multiprocessing queue.
@@ -27,6 +34,8 @@ class MegatronCheckpointSaverBase:
 
         self.models = None
         self.model_provider = None   # model_provider function either from pretrain_gpt or pretrain_bert
+
+        self._vocab_extension_config = None  # populated by _resolve_vocab_extension_config()
 
     def _maybe_parse_additional_megatron_args(self, margs):
         """
@@ -160,19 +169,11 @@ class MegatronCheckpointSaverBase:
 
         self.import_model_provider()
 
-        # fake initializing distributed
         mpu.set_tensor_model_parallel_world_size(self.args.target_tensor_parallel_size)
         mpu.set_pipeline_model_parallel_world_size(self.args.target_pipeline_parallel_size)
         mpu.set_expert_model_parallel_world_size(self.args.target_expert_parallel_size)
-        mpu.set_tensor_model_parallel_rank(0)
-        mpu.set_pipeline_model_parallel_rank(0)
-        mpu.set_expert_model_parallel_rank(0)
-        
-        # For backward compatibility during local parallel states refactoring
-        fake_tp_group = _ConverterFakeProcessGroup(size=self.args.target_tensor_parallel_size)
-        fake_ep_group = _ConverterFakeProcessGroup(size=self.args.target_expert_parallel_size)
-        mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
-        mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
+        self._initialize_converter_fake_groups(mpu)
+        self._set_converter_fake_group_ranks(mpu, tp_rank=0, pp_rank=0, ep_rank=0)
         fused_kernels.load(self.margs)
         
         try:
@@ -180,6 +181,28 @@ class MegatronCheckpointSaverBase:
             torch_llm_debug_tools.vscode_debugger_local_init()
         except ImportError:
             pass
+
+    def _initialize_converter_fake_groups(self, mpu):
+        """Initialize fake process groups used by checkpoint converter-only runs."""
+        self._converter_fake_groups = init_converter_fake_groups(
+            mpu,
+            tp_size=self.args.target_tensor_parallel_size,
+            pp_size=self.args.target_pipeline_parallel_size,
+            ep_size=self.args.target_expert_parallel_size,
+            cp_size=getattr(self.margs, 'context_parallel_size', 1),
+        )
+
+    def _set_converter_fake_group_ranks(self, mpu, tp_rank, pp_rank, ep_rank):
+        """Update fake process-group ranks for the TP/PP/EP shard being saved."""
+        set_converter_fake_group_ranks(
+            mpu,
+            self._converter_fake_groups,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            ep_rank=ep_rank,
+            tp_size=self.args.target_tensor_parallel_size,
+            ep_size=self.args.target_expert_parallel_size,
+        )
 
     def queue_get(self, name=None):
         """
@@ -268,6 +291,14 @@ class MegatronCheckpointSaverBase:
         """
         self.md = self.queue_get()
 
+        make_vocab_size_divisible_by = getattr(
+            self.args, "vocab_extension_make_vocab_size_divisible_by", None
+        )
+        if make_vocab_size_divisible_by is not None:
+            self.md.make_vocab_size_divisible_by = make_vocab_size_divisible_by
+            if hasattr(self.md, "checkpoint_args"):
+                self.md.checkpoint_args.make_vocab_size_divisible_by = make_vocab_size_divisible_by
+
         if self.args.target_tensor_parallel_size is None:
             if hasattr(self.md, 'previous_tensor_parallel_size'):
                 self.args.target_tensor_parallel_size = self.md.previous_tensor_parallel_size
@@ -301,6 +332,8 @@ class MegatronCheckpointSaverBase:
         Get the local model for a certain (pp,ep,tp).
         """
         if self.models[pp_rank][ep_rank][tp_rank] is None:
+            from megatron.core import mpu
+            self._set_converter_fake_group_ranks(mpu, tp_rank, pp_rank, ep_rank)
             pre_process = True if pp_rank == 0 else False
             post_process = True if pp_rank == self.args.target_pipeline_parallel_size - 1 else False
             self.models[pp_rank][ep_rank][tp_rank] = self.model_provider(pre_process, post_process).to(self.md.params_dtype)
@@ -350,16 +383,92 @@ class MegatronCheckpointSaverBase:
                     # release the uselese model parts
                     self.models[pp_rank][ep_rank][tp_rank] = None
 
+    def _resolve_vocab_extension_config(self):
+        """Build the saver's vocab-extension config from CLI args, or None if disabled.
+
+        Owns the only reads of ``self.args.vocab_extension_*`` so the rest of the
+        saver works against a typed config object instead of scattered getattr calls.
+        """
+        target = getattr(self.args, "vocab_extension_target_size", None)
+        if target is None:
+            return None
+        source = getattr(self.args, "vocab_extension_source_size", None)
+        if source is None:
+            source = self.md.true_vocab_size
+        if source is None:
+            raise ValueError(
+                "--vocab-extension-target-size requires --true-vocab-size on the loader "
+                "or --vocab-extension-source-size on the saver."
+            )
+        return VocabExtensionConfig(
+            source_vocab_size=source,
+            target_vocab_size=target,
+            seed=getattr(self.args, "vocab_extension_seed", 1234),
+            init_method=getattr(self.args, "vocab_extension_init_method", "mean-std"),
+        )
+
+    def _pad_vocab_table(self, weight, *, true_vocab_size, table_name, seed_offset=0):
+        """Resize/pad a full vocab table; returns (full_tensor, padded_vocab_size).
+
+        Pure: does not mutate self.margs. The caller assigns padded_vocab_size onto
+        margs once for the whole run.
+        """
+        from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
+
+        cfg = self._vocab_extension_config
+        if cfg is not None:
+            padded_vocab_size = _vocab_size_with_padding(cfg.target_vocab_size, self.margs)
+            if padded_vocab_size % self.args.target_tensor_parallel_size != 0:
+                raise ValueError(
+                    f"padded_vocab_size={padded_vocab_size} is not divisible by "
+                    f"target_tensor_parallel_size={self.args.target_tensor_parallel_size}"
+                )
+            full, plan = resize_vocab_table(
+                weight,
+                source_vocab_size=cfg.source_vocab_size,
+                target_vocab_size=cfg.target_vocab_size,
+                padded_vocab_size=padded_vocab_size,
+                seed=cfg.seed + seed_offset,
+                init_method=cfg.init_method,
+            )
+            print(
+                f"{table_name}: vocab extension "
+                f"original={plan.original_vocab_size}, source={plan.source_vocab_size}, "
+                f"target={plan.target_vocab_size}, padded={plan.padded_vocab_size}, "
+                f"trimmed={plan.trimmed_rows}, real_added={plan.real_added_rows}, "
+                f"padding_added={plan.padding_added_rows}, seed={cfg.seed + seed_offset}, "
+                f"init_method={cfg.init_method}"
+            )
+            return full, padded_vocab_size
+
+        if true_vocab_size is not None:
+            padded_vocab_size = _vocab_size_with_padding(true_vocab_size, self.margs)
+            orig_size = weight.shape[0]
+            if orig_size > padded_vocab_size:
+                full = weight[0:padded_vocab_size, :]
+            elif orig_size < padded_vocab_size:
+                # Megatron's historical pad-by-replicate-final-row behavior.
+                padding_size = padded_vocab_size - orig_size
+                full = torch.cat((weight, weight[-1].unsqueeze(0).expand(padding_size, -1)))
+            else:
+                full = weight
+            return full, padded_vocab_size
+
+        print("Original vocab size not specified, leaving embedding table as-is. "
+              "If you've changed the tensor parallel size this could cause problems.")
+        return weight, weight.shape[0]
+
     def receive_lm(self, schema, prefix=None):
         """
         Receive LM model parameters over queue and save them in self.models
         """
         try:
             from megatron.core import mpu
-            from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
+
+        self._vocab_extension_config = self._resolve_vocab_extension_config()
 
         # Embeddings
         #-----------
@@ -370,36 +479,14 @@ class MegatronCheckpointSaverBase:
         orig_word_embed = embeddings_msg.pop("word embeddings")
         self.check_message(embeddings_msg)
 
-        # Deal with padding
-        def pad_weight(orig_word_embed, true_vocab_size):
-            if true_vocab_size is not None:
-                # figure out what our padded vocab size is
-                orig_vocab_size = orig_word_embed.shape[0]
-                self.margs.padded_vocab_size = _vocab_size_with_padding(true_vocab_size, self.margs)
-
-                # Cut out extra padding we don't need
-                if orig_vocab_size > self.margs.padded_vocab_size:
-                    full_word_embed = orig_word_embed[0:self.margs.padded_vocab_size,:]
-
-                # Expanding embedding to larger size by replicating final entry
-                elif orig_vocab_size < self.margs.padded_vocab_size:
-                    padding_size = self.margs.padded_vocab_size - orig_vocab_size
-
-                    full_word_embed = torch.cat((
-                        orig_word_embed,
-                        orig_word_embed[-1].unsqueeze(0).expand(padding_size, -1)))
-
-                # Same size!
-                else:
-                    full_word_embed = orig_word_embed
-            else:
-                print("Original vocab size not specified, leaving embedding table as-is. "
-                    "If you've changed the tensor parallel size this could cause problems.")
-                self.margs.padded_vocab_size = orig_word_embed.shape[0]
-                full_word_embed = orig_word_embed
-            return full_word_embed
-
-        full_word_embed = pad_weight(orig_word_embed, self.md.true_vocab_size)
+        full_word_embed, padded_vocab_size = self._pad_vocab_table(
+            orig_word_embed,
+            true_vocab_size=self.md.true_vocab_size,
+            table_name="word embeddings",
+        )
+        self.margs.padded_vocab_size = padded_vocab_size
+        if self._vocab_extension_config is not None and hasattr(self.margs, "vocab_size"):
+            self.margs.vocab_size = self._vocab_extension_config.target_vocab_size
 
         # Split into new tensor model parallel sizes
         out_word_embed = torch.chunk(full_word_embed, self.args.target_tensor_parallel_size, dim=0)
@@ -466,10 +553,17 @@ class MegatronCheckpointSaverBase:
                     q_layernorm_weight = msg.pop("q norm weight")
                     k_layernorm_weight = msg.pop("k norm weight")
 
-                # XIELU activation parameters (Apertus-specific)
+                # XIELU activation parameters (Apertus-specific). Both loader_base
+                # and loader_apertus key forms accepted; see pop_xielu_params docstring.
+                # beta is intentionally drained but not propagated: megatron.core.activations.XIELU
+                # stores ``self.beta`` as a Python float (see activations.py), and
+                # schema.set_layer asserts the destination is a torch.Tensor. We rely on
+                # the destination's default XIELU configuration matching the source's.
+                xielu_eps = None
                 if getattr(self.md, 'xielu', False):
-                    xielu_alpha_p = msg.pop("mlp alpha_p")
-                    xielu_alpha_n = msg.pop("mlp alpha_n")
+                    xielu_alpha_p, xielu_alpha_n, _xielu_beta, xielu_eps = (
+                        pop_xielu_params(msg)
+                    )
 
                 # Save them to the model
                 for ep_rank in range(self.args.target_expert_parallel_size):
@@ -528,6 +622,8 @@ class MegatronCheckpointSaverBase:
                                 "mlp_xielu_alpha_p": xielu_alpha_p,
                                 "mlp_xielu_alpha_n": xielu_alpha_n,
                             })
+                            if xielu_eps is not None:
+                                params_dict["mlp_xielu_eps"] = xielu_eps
                         model = self.get_local_model(pp_rank, ep_rank, tp_rank)
                         schema.set_layer(model, layer_id, params_dict)
 
@@ -563,7 +659,16 @@ class MegatronCheckpointSaverBase:
                     if not hasattr(pp_local_models[0] if prefix is None else getattr(pp_local_models[0], prefix), 'output_layer'):
                         print("ERROR: got an output layer, but model does not have one")
                         exit(1)
-                    output_layer_weight = pad_weight(msg.pop("weight"), self.md.true_vocab_size)
+                    output_layer_weight, output_padded_size = self._pad_vocab_table(
+                        msg.pop("weight"),
+                        true_vocab_size=self.md.true_vocab_size,
+                        table_name="output layer",
+                        seed_offset=1,
+                    )
+                    assert output_padded_size == padded_vocab_size, (
+                        f"output layer padded size ({output_padded_size}) disagrees "
+                        f"with word embeddings ({padded_vocab_size})"
+                    )
                     output_layer_weight = torch.chunk(output_layer_weight, self.args.target_tensor_parallel_size, dim=0)
                     for eptp_rank, model in enumerate(pp_local_models):
                         tp_rank = eptp_rank % self.args.target_tensor_parallel_size
