@@ -5,8 +5,11 @@ Utilities for MoE experts offloading with FP8 support, including:
 2) OffloadingExpertsFP8GroupedSwiMLP: an autograd function for the forward and backward pass of the grouped SwiGLU MLP in offloading experts with FP8 support
 """
 from __future__ import annotations
-import torch
+
 import itertools
+from dataclasses import dataclass
+
+import torch
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -16,11 +19,14 @@ except ImportError:
     grouped_gemm = None
 
 from megatron.core.transformer.moe.experts_offloading_util import StreamManager
-from megatron.core.transformer.moe.experts_util import ExpertsWgradScheduler, MergedSwiGLU
+from megatron.core.transformer.moe.experts_util import (
+    ExpertsWgradScheduler,
+    get_dummy_wgrad,
+    release,
+)
 from megatron.core.transformer.moe.fp8_utils import (
     m_grouped_fp8_gemm_nt_contiguous, 
     k_grouped_fp8_gemm_nt_contiguous,
-    release,
 )
 from megatron.core.transformer.moe.fp8_jit import (
     per_block_cast_to_fp8_gpu,
@@ -35,27 +41,70 @@ from megatron.core.transformer.moe.swiglu_jit import (
     swiglu_backward,
 )
 
-_dummy_wgrads = {}
+@dataclass(frozen=True)
+class OffloadingFP8Config:
+    """Lightweight config for OffloadingExpertsFP8GroupedSwiMLP.
 
-def get_dummy_wgrad(
-    shape: list, 
-    dtype: torch.dtype, 
-    device, 
-    zero=False
-) -> torch.Tensor:
-    """Returns a dummy tensor of given shape."""
-    global _dummy_wgrads
-    wgard_key = (*shape, dtype)
-    if wgard_key not in _dummy_wgrads:
-        _dummy_wgrads[wgard_key] = torch.empty(
-            shape,
-            dtype=dtype,
-            device=device,
-            requires_grad=False,
+    Extracts only the fields needed from TransformerConfig / ModelParallelConfig
+    and pre-computes derived values (e.g. ``fc1_out_size``) so callers never
+    repeat the ``moe_ffn_hidden_size * (2 if gated_linear_unit else 1)``
+    pattern.
+    """
+
+    # sizes
+    hidden_size: int
+    moe_latent_size: int
+    input_hidden_size: int
+    moe_ffn_hidden_size: int
+    gated_linear_unit: bool
+    fc1_out_size: int = 0
+
+    # offloading
+    moe_offloading_chunk_size: int = -1
+    moe_offloading_num_chunks: int = 1
+    moe_offloading_num_stages: int = 1
+    moe_offloading_experts_debug_mode: bool = False
+    moe_use_extra_fp8_param_storage: bool = False
+
+    # recomputation
+    recompute_granularity: str = "selective"
+    recompute_modules: list | None = None
+
+    # wgrad scheduling
+    delay_wgrad_compute: bool = False
+    gradient_accumulation_fusion: bool = False
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "input_hidden_size",
+            self.moe_latent_size if self.moe_latent_size is not None else self.hidden_size,
         )
-    if zero:
-        _dummy_wgrads[wgard_key].fill_(0)
-    return _dummy_wgrads[wgard_key].detach()
+        object.__setattr__(
+            self,
+            "fc1_out_size",
+            self.moe_ffn_hidden_size * (2 if self.gated_linear_unit else 1),
+        )
+
+    @classmethod
+    def from_transformer_config(cls, config: TransformerConfig) -> OffloadingFP8Config:
+        """Construct from a full TransformerConfig."""
+        return cls(
+            hidden_size=config.hidden_size,
+            input_hidden_size=config.hidden_size,  # default to hidden_size if moe_latent_size is not set
+            moe_latent_size=config.moe_latent_size,
+            moe_ffn_hidden_size=config.moe_ffn_hidden_size,
+            gated_linear_unit=config.gated_linear_unit,
+            moe_offloading_chunk_size=config.moe_offloading_chunk_size,
+            moe_offloading_num_chunks=config.moe_offloading_num_chunks,
+            moe_offloading_num_stages=config.moe_offloading_num_stages,
+            moe_offloading_experts_debug_mode=config.moe_offloading_experts_debug_mode,
+            moe_use_extra_fp8_param_storage=config.moe_use_extra_fp8_param_storage,
+            recompute_granularity=config.recompute_granularity,
+            recompute_modules=config.recompute_modules,
+            delay_wgrad_compute=config.delay_wgrad_compute,
+            gradient_accumulation_fusion=config.gradient_accumulation_fusion,
+        )
 
 def _dequant_packed_kmajor(
     fp8_packed: torch.Tensor,
@@ -207,7 +256,7 @@ class FP8ExpertsParameterManager:
     @classmethod
     def create_instance(
         cls,
-        config: TransformerConfig,
+        config: OffloadingFP8Config,
     ):
         if cls._instance is None:
             cls._instance = cls(config=config)
@@ -244,7 +293,7 @@ class FP8ExpertsParameterManager:
     def __init__(
         self,
         fp8_recipe: int = 128,
-        config: TransformerConfig = None,
+        config: OffloadingFP8Config = None,
     ):
         # wid is the data pointer of each expert weight
         self._wid_to_bf16_weight_map: dict[int, torch.nn.Parameter] = {}
@@ -261,29 +310,29 @@ class FP8ExpertsParameterManager:
         # pre-allocate quantization buffer for expert weights
         self.expert_quantization_buffer: dict[int, torch.Tensor] = {}
         self.expert_quantization_buffer[
-            config.moe_ffn_hidden_size * (2 if config.gated_linear_unit else 1) * config.hidden_size
+            config.fc1_out_size * config.input_hidden_size
         ] = (
             torch.empty(
-                config.moe_ffn_hidden_size * (2 if config.gated_linear_unit else 1) * config.hidden_size, 
-                device=torch.cuda.current_device(), 
+                config.fc1_out_size * config.input_hidden_size,
+                device=torch.cuda.current_device(),
                 dtype=torch.bfloat16
-            ), 
+            ),
             torch.empty(
-                config.moe_ffn_hidden_size * (2 if config.gated_linear_unit else 1) * config.hidden_size,
+                config.fc1_out_size * config.input_hidden_size,
                 device=torch.cuda.current_device(),
                 dtype=torch.float8_e4m3fn
             )
         )
         self.expert_quantization_buffer[
-            config.moe_ffn_hidden_size * config.hidden_size
+            config.moe_ffn_hidden_size * config.input_hidden_size
         ] = (
             torch.empty(
-                config.moe_ffn_hidden_size * config.hidden_size,
+                config.moe_ffn_hidden_size * config.input_hidden_size,
                 device=torch.cuda.current_device(),
                 dtype=torch.bfloat16
             ),
             torch.empty(
-                config.moe_ffn_hidden_size * config.hidden_size,
+                config.moe_ffn_hidden_size * config.input_hidden_size,
                 device=torch.cuda.current_device(),
                 dtype=torch.float8_e4m3fn
             )
@@ -493,12 +542,12 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         tokens_per_expert_chunks_psum: list[torch.Tensor],
         stream_manager: StreamManager,
         fp8_parameter_manager: FP8ExpertsParameterManager,
-        config: TransformerConfig,
+        config: OffloadingFP8Config,
     ):
         # allocate output buffer for the first linear layer
         fc1_output = torch.empty(
             permuted_local_hidden_states[0].shape[0],
-            config.moe_ffn_hidden_size * (2 if config.gated_linear_unit else 1),
+            config.fc1_out_size,
             device=permuted_local_hidden_states[0].device,
             dtype=torch.bfloat16,
         )
@@ -551,7 +600,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         permuted_probs: torch.Tensor,
         stream_manager: StreamManager,
         fp8_parameter_manager: FP8ExpertsParameterManager,
-        config: TransformerConfig,
+        config: OffloadingFP8Config,
     ):
         # prefetch the first chunk of expert weights to GPU
         curr_buffer_metadata = cls.prefetch_expert_weights(0, cpu_w2, gpu_w2_buffers, stream_manager, fp8_parameter_manager, config)
@@ -619,7 +668,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         permuted_probs: torch.Tensor,
         stream_manager: StreamManager,
         fp8_parameter_manager: FP8ExpertsParameterManager,
-        config: TransformerConfig,
+        config: OffloadingFP8Config,
     ):
         """
         ds [m, H] = grad_y [m, h] @ w2.T [H, h]
@@ -649,7 +698,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             fp8_experts_chunk = gpu_w2_chunks[curr_buffer_metadata[0]].view(
                 config.moe_offloading_chunk_size,
                 config.moe_ffn_hidden_size,
-                config.hidden_size,
+                config.input_hidden_size,
             )
             fp8_experts_chunk_scales = curr_buffer_metadata[2]
             fp8_grad_y_chunk = fp8_grad_y_per_chunk[chunk_idx]
@@ -683,7 +732,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         tokens_per_expert_chunks_psum: list[torch.Tensor],
         stream_manager: StreamManager,
         fp8_parameter_manager: FP8ExpertsParameterManager,
-        config: TransformerConfig,
+        config: OffloadingFP8Config,
     ):
         """
         dx [m, h] = a [m, 2*H] @ w1.T [h, 2*H]
@@ -692,7 +741,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         fp8_grad_a_scales_per_chunk = grad_a[2]
         grad_x = torch.empty(
             grad_a[0].shape[0],
-            config.hidden_size,
+            config.input_hidden_size,
             device=grad_a[0].device, 
             dtype=torch.bfloat16
         )
@@ -709,8 +758,8 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             # computation on the current GPU buffer
             fp8_experts_chunk = gpu_w1_chunks[curr_buffer_metadata[0]].view(
                 config.moe_offloading_chunk_size,
-                config.hidden_size,
-                config.moe_ffn_hidden_size * (2 if config.gated_linear_unit else 1),
+                config.input_hidden_size,
+                config.fc1_out_size,
             )
             fp8_experts_chunk_scales = curr_buffer_metadata[2]
             fp8_grad_a_chunk = fp8_grad_a_per_chunk[chunk_idx]
@@ -759,7 +808,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         permuted_probs: torch.Tensor,
         stream_manager: StreamManager,
         num_local_experts: int,
-        config: TransformerConfig,
+        config: OffloadingFP8Config,
         wgrad_scheduler: ExpertsWgradScheduler = None,
         delay_wgrad_compute: bool = False,
         fuse_gradient_accumulation: bool = False,
@@ -854,7 +903,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         gpu_buffers: list[list[torch.Tensor]],
         stream_manager: StreamManager,
         fp8_parameter_manager: FP8ExpertsParameterManager,
-        config: TransformerConfig,
+        config: OffloadingFP8Config,
         transposed: bool = False,
     ) -> tuple:
         h2d_stream_idx = chunk_idx % config.moe_offloading_num_stages
@@ -916,7 +965,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         permuted_probs: torch.Tensor = args[-5]
         expert_wgrad_scheduler: ExpertsWgradScheduler = args[-4]
         stream_manager: StreamManager = args[-3]
-        config: TransformerConfig = args[-2]
+        config: OffloadingFP8Config = args[-2]
         wgrad_accumulation_and_reduce_hooks: list = args[-1]
         fp8_parameter_manager: FP8ExpertsParameterManager = FP8ExpertsParameterManager.get_instance()
         fp8_parameter_manager.config = config
@@ -1030,7 +1079,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         ctx, 
         *grad_outputs
     ):
-        config: TransformerConfig = ctx.config
+        config: OffloadingFP8Config = ctx.config
         cpu_w1: torch.nn.Parameter = ctx.cpu_w1
         cpu_w2: torch.nn.Parameter = ctx.cpu_w2
         cpu_w1_list: list[torch.Tensor] = ctx.cpu_w1_list
@@ -1200,7 +1249,7 @@ def offloading_fp8_grouped_swiglu_mlp(
     permuted_probs: torch.Tensor,
     expert_wgrad_scheduler: ExpertsWgradScheduler,
     stream_manager: StreamManager,
-    config: TransformerConfig,
+    config: OffloadingFP8Config,
     wgrad_accumulation_and_reduce_hooks: list,
 ) -> torch.Tensor:
     """Autograd function for Offloading Experts Grouped SwiGLU MLP.
@@ -1216,7 +1265,7 @@ def offloading_fp8_grouped_swiglu_mlp(
         permuted_probs (torch.Tensor): probability derived from router
         expert_wgrad_scheduler (ExpertsWgradScheduler): scheduler for expert weight gradients
         stream_manager (StreamManager): manager for CUDA streams
-        config (TransformerConfig): transformer configuration
+        config (OffloadingFP8Config): offloading FP8 configuration
 
     Returns:
         torch.Tensor: output of the MLP

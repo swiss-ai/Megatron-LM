@@ -57,6 +57,15 @@ try:
         CheckpointMetadataCache,
     )
 
+    # Probe the full async API that `get_async_strategy("nvrx")` requires (not just the
+    # two symbols above). An nvrx version that is present but missing newer symbols would
+    # otherwise leave HAVE_NVRX=True and crash *every* save -- including synchronous ones,
+    # which are implemented as `async_save(...).execute_sync()` and select the backend via
+    # HAVE_NVRX. Probing here makes an incompatible nvrx fall back to the mcore backend.
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (  # noqa: F401
+        get_write_results_queue as _nvrx_get_write_results_queue,
+    )
+
     HAVE_NVRX = True
 except (ImportError, ModuleNotFoundError):
     CheckpointMetadataCache = ABC

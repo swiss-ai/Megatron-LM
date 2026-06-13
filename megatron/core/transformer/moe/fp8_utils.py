@@ -47,11 +47,6 @@ def plot_tensor_hist(tensor: torch.Tensor, name, bins=100, title="Tensor Value D
     plt.tight_layout()
     plt.savefig(f"./{name}_histogram.png")
 
-def release(t: torch.Tensor):
-    """Helper function to release tensors that are no longer needed to save memory.
-    """
-    t.untyped_storage().resize_(0)
-
 def build_offloading_expert_sharded_tensor(
     weight_slice: torch.Tensor,
     prefix: str,

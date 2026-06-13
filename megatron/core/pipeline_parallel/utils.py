@@ -180,15 +180,29 @@ class ScheduleNode:
 
     def default_backward_func(self, outputs, output_grad):
         """Default backward function"""
-        Variable._execution_engine.run_backward(
-            tensors=outputs,
-            grad_tensors=output_grad,
-            keep_graph=False,
-            create_graph=False,
-            inputs=tuple(),
-            allow_unreachable=True,
-            accumulate_grad=True,
-        )
+        # Some forward outputs are non-differentiable metadata rather than
+        # autograd-tracked activations, e.g. the FP8 scale factors produced by
+        # FP8 dispatch (a real tensor that does not require grad) or `None`
+        # placeholders. These must not be passed to the autograd engine as
+        # backward roots, otherwise run_backward raises "element N of tensors
+        # tuple is neither a Tensor nor a GradientEdge". Filter them and their
+        # corresponding grads out here.
+        roots_and_grads = [
+            (t, g)
+            for t, g in zip(outputs, output_grad)
+            if isinstance(t, torch.Tensor) and t.requires_grad
+        ]
+        if roots_and_grads:
+            tensors, grad_tensors = zip(*roots_and_grads)
+            Variable._execution_engine.run_backward(
+                tensors=tensors,
+                grad_tensors=grad_tensors,
+                keep_graph=False,
+                create_graph=False,
+                inputs=tuple(),
+                allow_unreachable=True,
+                accumulate_grad=True,
+            )
         return output_grad
 
     def forward(self, inputs=()):

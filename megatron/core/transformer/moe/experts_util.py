@@ -214,6 +214,30 @@ def release(t: torch.Tensor):
     """
     t.untyped_storage().resize_(0)
 
+
+_dummy_wgrads = {}
+
+def get_dummy_wgrad(
+    shape: list,
+    dtype: torch.dtype,
+    device,
+    zero=False
+) -> torch.Tensor:
+    """Returns a dummy tensor of given shape."""
+    global _dummy_wgrads
+    wgard_key = (*shape, dtype)
+    if wgard_key not in _dummy_wgrads:
+        _dummy_wgrads[wgard_key] = torch.empty(
+            shape,
+            dtype=dtype,
+            device=device,
+            requires_grad=False,
+        )
+    if zero:
+        _dummy_wgrads[wgard_key].fill_(0)
+    return _dummy_wgrads[wgard_key].detach()
+
+# deprecated legacy MLP implementation
 class GroupedSwiMLP(torch.autograd.Function):
     @classmethod
     def call_forward_a(

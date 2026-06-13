@@ -195,6 +195,7 @@ from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
 from megatron.core.transformer.moe.experts_offloading_fp8_util import (
     FP8ExpertsParameterManager,
+    OffloadingFP8Config,
 )
 from megatron.core.transformer.moe.experts_fp8_util import (
     FP8GPUExpertsParameterManager,

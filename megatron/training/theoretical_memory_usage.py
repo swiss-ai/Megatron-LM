@@ -103,30 +103,35 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         )
         + self_attn_term
     )
+    # Routed experts run on moe_latent_size when it is set; the shared expert and the
+    # pre-MLP layernorm always run on hidden_size (is_expert=False, see mlp.py).
+    expert_hidden_size = (
+        args.hidden_size if args.moe_latent_size is None else args.moe_latent_size
+    )
+    # Shared fc1/fc2 latent projections (hidden->latent and latent->hidden) per MoE layer.
+    latent_proj_term = (
+        0 if args.moe_latent_size is None else 2 * args.hidden_size * args.moe_latent_size
+    )
     num_parameters_in_transformer_layer_moe = (
-        2
+        # Routed experts (on moe_latent_size when set).
+        2 * expert_hidden_size * (moe_ffn_hidden_size * num_experts * gated_linear_multiplier)
+        # Shared MoE MLP + transformer layernorms (on hidden_size).
+        + 2
         * args.hidden_size
-        * (
-            # MoE MLP.
-            + (moe_ffn_hidden_size * num_experts * gated_linear_multiplier)
-            # Shared MoE MLP.
-            + (shared_expert_ffn_hidden_size * gated_linear_multiplier)
-            # Transformer layernorms.
-            + norm_size
-        )
+        * ((shared_expert_ffn_hidden_size * gated_linear_multiplier) + norm_size)
+        # Latent projections.
+        + latent_proj_term
         + self_attn_term
     )
     num_active_parameters_in_transformer_layer_moe = (
+        # Routed experts (on moe_latent_size when set).
         2
-        * args.hidden_size
-        * (
-            # MoE MLP.
-            + (moe_ffn_hidden_size * args.moe_router_topk * gated_linear_multiplier)
-            # Shared MoE MLP.
-            + (shared_expert_ffn_hidden_size * gated_linear_multiplier)
-            # Transformer layernorms.
-            + (2)
-        )
+        * expert_hidden_size
+        * (moe_ffn_hidden_size * args.moe_router_topk * gated_linear_multiplier)
+        # Shared MoE MLP + transformer layernorms (on hidden_size).
+        + 2 * args.hidden_size * ((shared_expert_ffn_hidden_size * gated_linear_multiplier) + 2)
+        # Latent projections (shared, always active).
+        + latent_proj_term
         + self_attn_term
     )
     embedding_size = args.hidden_size * args.padded_vocab_size

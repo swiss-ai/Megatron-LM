@@ -48,6 +48,7 @@ from megatron.core.transformer.moe.experts_offloading_util import (
     offloading_grouped_swiglu_mlp,
 )
 from megatron.core.transformer.moe.experts_offloading_fp8_util import (
+    OffloadingFP8Config,
     offloading_fp8_grouped_swiglu_mlp,
 )
 
@@ -1172,6 +1173,9 @@ class OffloadingExpertsMLP(MegatronModule):
         self.chunk_size = num_local_experts // self.num_chunks # one chunk contains num_local_experts // self.num_chunks experts
         self.config.moe_offloading_chunk_size = self.chunk_size
 
+        # lightweight config for the FP8 offloading autograd function
+        self.fp8_config = OffloadingFP8Config.from_transformer_config(self.config)
+
         # allocate tensors for gpu buffers
         buffer_dtype = config.params_dtype if not self.config.moe_use_inplace_fp8_param else torch.float8_e4m3fn
         experts1_gpu_buffers_storage = torch.empty(
@@ -1391,7 +1395,7 @@ class OffloadingExpertsMLP(MegatronModule):
                     permuted_probs,
                     self.expert_wgrad_scheduler,
                     self.stream_manager,
-                    self.config,
+                    self.fp8_config,
                     self.wgrad_accumulation_and_reduce_hooks,
                 )
 
@@ -1445,13 +1449,13 @@ class OffloadingExpertsMLP(MegatronModule):
                     permuted_probs,
                     self.expert_wgrad_scheduler,
                     self.stream_manager,
-                    self.config,
+                    self.fp8_config,
                     self.wgrad_accumulation_and_reduce_hooks,
                 )
 
                 return output, None
-        
-            # NOTE: it should be safe to pass empty tensor to the custom function, 
+
+            # NOTE: it should be safe to pass empty tensor to the custom function,
             # but it will introduce meanless h2d transfer.
             # TODO: add cost free path for empty input
             output = offloading_grouped_swiglu_mlp(
