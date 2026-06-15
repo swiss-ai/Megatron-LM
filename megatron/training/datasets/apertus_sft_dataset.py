@@ -897,16 +897,17 @@ class ApertusSFTDataset(GPTDataset):
                 loss_mask[~assistant_mask] = self.sft_plw_value # value is 0 by default for full masking
 
             # Also unmask tokens between BOS and <|system_start|> (pre-system content). Relevant for Long Context Tasks
-            bos_seq = torch.tensor([self._bos_token_id], dtype=data.dtype, device=data.device)
-            sys_start_seq = self._sft_system_start_sequence.to(dtype=data.dtype, device=data.device)
-            loss_mask[get_matching_mask_by_start_end(data, bos_seq, sys_start_seq)] = 1
+            if self.config.sft_long_ctx_loss:
+                bos_seq = torch.tensor([self._bos_token_id], dtype=data.dtype, device=data.device)
+                sys_start_seq = self._sft_system_start_sequence.to(dtype=data.dtype, device=data.device)
+                loss_mask[get_matching_mask_by_start_end(data, bos_seq, sys_start_seq)] = 1
 
-            # First-doc fallback: if <|system_start|> appears with no preceding <s>, unmask [0..system_start].
-            sys_pos = torch.where(get_matching_mask(data, sys_start_seq, only_begin=True))[0]
-            if sys_pos.numel() > 0 and not (data[: sys_pos[0]] == self._bos_token_id).any():
-                loss_mask[: sys_pos[0].item() + sys_start_seq.numel()] = 1
+                # First-doc fallback: if <|system_start|> appears with no preceding <s>, unmask [0..system_start].
+                sys_pos = torch.where(get_matching_mask(data, sys_start_seq, only_begin=True))[0]
+                if sys_pos.numel() > 0 and not (data[: sys_pos[0]] == self._bos_token_id).any():
+                    loss_mask[: sys_pos[0].item() + sys_start_seq.numel()] = 1
 
-            loss_mask[get_matching_mask(data, sys_start_seq, only_begin=False)] = 0
+                loss_mask[get_matching_mask(data, sys_start_seq, only_begin=False)] = 0
 
             # 1b) Mask tool output tokens from both loss_mask and assistant_mask.
             # Tool output spans (<|tool_output_start|> ... <|tool_output_end|>)

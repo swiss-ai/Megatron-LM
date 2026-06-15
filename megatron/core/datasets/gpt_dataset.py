@@ -314,6 +314,10 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     sft_equalize_sample_loss: bool = False
     """Normalize loss per sample segment. Used by ApertusSFTDataset."""
 
+    sft_long_ctx_loss: bool = False
+    """In cases where tokens appear between the system prompt and the BOS token, we also include 
+    those tokens in training. This helps avoid discarding a large number of tokens during pre-training."""
+
     sft_truncate_right: bool = False
     """If sample is too long for context, throw away tokens in the end"""
 
