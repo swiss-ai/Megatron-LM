@@ -726,6 +726,7 @@ def core_gpt_dataset_config_from_args(args):
         "sft_pack_samples": args.ap_sft_pack_samples,
         "sft_packing_strategy": args.ap_sft_packing_strategy,
         "sft_equalize_sample_loss": args.ap_sft_equalize_sample_loss,
+        "sft_long_ctx_loss": args.ap_sft_long_ctx_loss,
         "sft_truncate_right": args.ap_sft_truncate_right,
         "pretraining_packing_strategy": args.pretraining_packing_strategy,
         "max_docs_per_bin": args.max_docs_per_bin,

@@ -3770,6 +3770,10 @@ def _add_sft_args(parser):
                        help='Maximum number of documents allowed per sample in bfd, 0 means no limit.')
     group.add_argument('--ap-sft-plw', type=float, default=0.0,
                        help='Prompt loss weight for user tokens (0 = fully masked)')
+    group.add_argument("--ap-sft-long-ctx-loss", action="store_true",
+                        help='In cases where tokens appear between the system prompt and the BOS token, '
+                        'we also include those tokens in training. This helps avoid discarding a large '
+                        'number of tokens during pre-training. ')
     group.add_argument('--ap-sft-load-loss-mask', action="store_true",
                        help='Load pre-computed loss masks from tokenized data')
     group.add_argument('--ap-sft-mask-special-tokens', action="store_true",
