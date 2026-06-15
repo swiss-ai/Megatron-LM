@@ -107,14 +107,14 @@ To enable best-fit decreasing packing, add the following arguments to your launc
 
 ```bash
 --pretraining-packing-strategy bfd
---max_docs_per_bin 64
+--max-docs-per-bin 64
 ```
 
 - `--pretraining-packing-strategy` controls the packing algorithm:
   - `greedy` (default) standard greedy sampling.
   - `bfd` best-fit decreasing packing for improved packing efficiency.
 
-- `--max_docs_per_bin` sets the maximum number of documents per packed bin.
+- `--max-docs-per-bin` sets the maximum number of documents per packed bin.
   - Default: `0` (no limit).
   - Useful when working with many small documents, where packing too many documents into a bin can reduce throughput.
 
@@ -152,7 +152,7 @@ Sample packing (`--ap-sft-pack-samples`) concatenates multiple whole documents i
 Two packing strategies are available via `--ap-sft-packing-strategy`:
 
 - **`greedy`** (default): Packs documents in shuffled order, filling each sequence until the next document doesn't fit. Fast O(n) index building.
-- **`bfd`** (Best-Fit Decreasing): Sorts documents by length and assigns each to the sequence with the least remaining space that still fits. Produces fewer sequences and less wasted padding, especially when document lengths vary widely.
+- **`bfd`** (Best-Fit Decreasing): Sorts documents by length and assigns each to the sequence with the least remaining space that still fits. Produces fewer sequences and less wasted padding, especially when document lengths vary widely. Similar to pre-training, the best-fit approach also supports --max-docs-per-bin-sft 64, which limits the number of samples packed into each bucket.
 
 ### Workflow
 

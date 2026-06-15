@@ -3765,7 +3765,9 @@ def _add_sft_args(parser):
                             '"bfd" (Best-Fit Decreasing) sorts by length for higher packing '
                             'efficiency and don\'t cut the samples if < sequence_length.')
     group.add_argument('--max-docs-per-bin', type=int, default=0,
-                       help='Maximum number of documents allowed per sample in bfd, 0 means no limit. ')
+                       help='Maximum number of documents allowed per sample in bfd, 0 means no limit.')
+    group.add_argument('--max-docs-per-bin-sft', type=int, default=0,
+                       help='Maximum number of documents allowed per sample in bfd, 0 means no limit.')
     group.add_argument('--ap-sft-plw', type=float, default=0.0,
                        help='Prompt loss weight for user tokens (0 = fully masked)')
     group.add_argument('--ap-sft-load-loss-mask', action="store_true",
