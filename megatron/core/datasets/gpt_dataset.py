@@ -326,6 +326,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     max_docs_per_bin: int = 0
     """Maximum number of documents allowed per sample in bfd, 0 means no limit"""
 
+    max_docs_per_bin_sft: int = 0
+    """Maximum number of documents allowed per sample in bfd for SFT, 0 means no limit"""
+
     ap_sft_auto_tag: bool = False
     """When True, blend entries without an explicit 'sft:' / 'pretrain:' marker
     are dispatched as ApertusSFTDataset. Set by --ap-sft for backward compatibility

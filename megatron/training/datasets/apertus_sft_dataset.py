@@ -41,7 +41,7 @@ def _load_bfd_c_library():
     import ctypes
     import subprocess
 
-    _dir = os.path.dirname(os.path.abspath(__file__))
+    _dir = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'core', 'datasets'))
     so_path  = os.path.join(_dir, "libbfd_pack.so")
     cpp_path = os.path.join(_dir, "bfd_pack.cpp")
 
@@ -53,6 +53,7 @@ def _load_bfd_c_library():
                 ctypes.POINTER(ctypes.c_long), # doc_lengths
                 ctypes.c_int, # num_docs
                 ctypes.c_int, # capacity
+                ctypes.c_int, # max_docs_per_bin
                 ctypes.POINTER(ctypes.c_int), # document_index
                 ctypes.POINTER(ctypes.c_int), # doc_idx_out
                 ctypes.POINTER(ctypes.c_int), # boundaries_out
@@ -84,6 +85,7 @@ def _build_sample_idx_bfd(
     document_index: np.ndarray,
     seq_length: int,
     add_extra_token: int,
+    max_docs_per_bin: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Best-Fit Decreasing bin packing for whole documents.
 
@@ -107,12 +109,11 @@ def _build_sample_idx_bfd(
             offsets into reordered_document_index; column 1 is always 0.
     """
     if _bfd_c_lib is not None:
-        return _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_extra_token)
-    return _build_sample_idx_bfd_python(sequence_lengths, document_index, seq_length, add_extra_token)
+        return _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin)
+    return _build_sample_idx_bfd_python(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin)
 
 
-
-def _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_extra_token):
+def _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin=0):
     """C-accelerated BFD bin packing via ctypes. See _build_sample_idx_bfd."""
     import ctypes
 
@@ -130,7 +131,7 @@ def _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_ex
     _bfd_c_lib.bfd_pack(
         sorted_positions.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
         doc_lengths.ctypes.data_as(ctypes.POINTER(ctypes.c_long)),
-        num_docs, capacity,
+        num_docs, capacity, int(max_docs_per_bin),
         doc_index_i32.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
         doc_idx_out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
         boundaries_out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
@@ -151,6 +152,7 @@ def _build_sample_idx_bfd_python(
     document_index: np.ndarray,
     seq_length: int,
     add_extra_token: int,
+    max_docs_per_bin: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Pure-Python BFD fallback using bisect. See _build_sample_idx_bfd."""
     capacity = seq_length + add_extra_token
@@ -182,6 +184,8 @@ def _build_sample_idx_bfd_python(
             if bins_sorted:
                 remaining, bin_id = bins_sorted[0]
                 bin_contents[bin_id].append(int(pos))
+                if max_docs_per_bin > 0 and len(bin_contents[bin_id]) >= max_docs_per_bin:
+                    bins_sorted.pop(0)
             else:
                 bin_id = len(bin_contents)
                 bin_contents.append([int(pos)])
@@ -196,7 +200,7 @@ def _build_sample_idx_bfd_python(
             remaining, bin_id = bins_sorted.pop(idx)
             new_remaining = remaining - length
             bin_contents[bin_id].append(int(pos))
-            if new_remaining > 0:
+            if new_remaining > 0 and not (max_docs_per_bin > 0 and len(bin_contents[bin_id]) >= max_docs_per_bin):
                 # Re-insert with updated capacity
                 bisect.insort(bins_sorted, (new_remaining, bin_id))
         else:
@@ -204,7 +208,7 @@ def _build_sample_idx_bfd_python(
             bin_id = len(bin_contents)
             bin_contents.append([int(pos)])
             new_remaining = capacity - length
-            if new_remaining > 0:
+            if new_remaining > 0 and not (max_docs_per_bin > 0 and len(bin_contents[bin_id]) >= max_docs_per_bin):
                 bisect.insort(bins_sorted, (new_remaining, bin_id))
 
     # Rebuild document_index so each bin's documents are contiguous
@@ -471,6 +475,7 @@ class ApertusSFTDataset(GPTDataset):
                     document_index,
                     sequence_length,
                     add_extra_token=self.config.add_extra_token_to_sequence,
+                    max_docs_per_bin=self.config.max_docs_per_bin_sft,
                 )
             else:
                 sample_index = helpers.build_sample_idx_packed_whole_docs(
