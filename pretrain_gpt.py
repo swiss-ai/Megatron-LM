@@ -117,12 +117,21 @@ def get_batch(data_iterator, vp_stage=None):
             ])
 
         # Step 1b: merge sequences that are too short for CP 
-        _divisibility = 2 * cp_size
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        sp_enabled = getattr(args, 'sequence_parallel', False)
+        _divisibility = 2 * cp_size * (tp_size if sp_enabled else 1)
+
         _seq_lens = cu_seq[1:] - cu_seq[:-1]
+
+        _keep = _seq_lens >= _divisibility
+
+        # Expand to match cu_seq size and force first/last to stay
         _keep = torch.cat([
-            torch.tensor([True], device=device),
-            _seq_lens >= _divisibility,
+            torch.tensor([True], device=device),  # always keep first
+            _keep
         ])
+        _keep[-1] = True  # always keep last
+
         cu_seq = cu_seq[_keep]
 
         if cp_size > 1:
@@ -134,7 +143,7 @@ def get_batch(data_iterator, vp_stage=None):
                 get_batch_on_this_cp_rank as te_get_batch_on_this_cp_rank,
             )
 
-            divisibility = 2 * cp_size
+            divisibility = 2 * cp_size * (tp_size if sp_enabled else 1)
             cp_group = parallel_state.get_context_parallel_group()
             cp_rank = parallel_state.get_context_parallel_rank()
 
@@ -147,6 +156,7 @@ def get_batch(data_iterator, vp_stage=None):
                 padding_token_id=tokenizer.eod,
                 padding_label_id=-100,
             )
+
             input_ids_padded = input_ids_padded.to(device)
             labels_padded = labels_padded.to(device)
             cu_seqlens_padded = cu_seqlens_padded.to(device=device, dtype=torch.int32)
@@ -499,6 +509,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     current_modality_weights=current_modality_weights,
                 )
             else:
+                
                 output_tensor = model(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask,
                     packed_seq_params=packed_seq_params
@@ -592,7 +603,12 @@ def core_gpt_dataset_config_from_args(args):
         "sft_pack_samples": args.ap_sft_pack_samples,
         "sft_packing_strategy": args.ap_sft_packing_strategy,
         "sft_equalize_sample_loss": args.ap_sft_equalize_sample_loss,
-        "sft_truncate_right": args.ap_sft_truncate_right
+        "sft_long_ctx_loss": args.ap_sft_long_ctx_loss,
+        "sft_truncate_right": args.ap_sft_truncate_right,
+        "pretraining_packing_strategy": args.pretraining_packing_strategy,
+        "max_docs_per_bin": args.max_docs_per_bin,
+        "max_docs_per_bin_sft": args.max_docs_per_bin_sft,
+        "ap_sft_auto_tag": args.ap_sft,
     }
 
     # add FIM args to the config
@@ -629,22 +645,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     config = core_gpt_dataset_config_from_args(args)
 
-    if args.ap_sft:
-        dataset_type = ApertusSFTDataset
-    elif args.sft:
-        dataset_type = SFTDataset
-    else:
-        if args.mock_data:
-            dataset_type = MockGPTDataset
-        elif args.fim_data:
-            dataset_type = GPTFIMDataset
-        else:
-            dataset_type = GPTDataset
-
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type, train_val_test_num_samples, partial(is_dataset_built_on_rank, vp_stage=vp_stage), config
+        train_val_test_num_samples, partial(is_dataset_built_on_rank, vp_stage=vp_stage), config
     ).build()
 
     print_rank_0("> finished creating GPT datasets ...")

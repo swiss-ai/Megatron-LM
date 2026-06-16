@@ -30,17 +30,71 @@ def _pad_sequence_if_needed(document, target_length: int, padding_value):
     return np.concatenate([document, np.full(padding_length, padding_value, dtype=document.dtype)])
 
 
+
+def _load_bfd_c_library():
+    """Load (or compile then load) the C/C++ BFD packing library.
+
+    Uses a segment-tree + min-heap structure for O(n log C) best-fit lookup,
+    ~10-15x faster than pure-Python bisect at million-doc scale. Thread-safe.
+    Returns the loaded ctypes library, or None if unavailable.
+    """
+    import ctypes
+    import subprocess
+
+    _dir = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'core', 'datasets'))
+    so_path  = os.path.join(_dir, "libbfd_pack.so")
+    cpp_path = os.path.join(_dir, "bfd_pack.cpp")
+
+    if os.path.isfile(so_path):
+        try:
+            lib = ctypes.CDLL(so_path)
+            lib.bfd_pack.argtypes = [
+                ctypes.POINTER(ctypes.c_int), # sorted_positions
+                ctypes.POINTER(ctypes.c_long), # doc_lengths
+                ctypes.c_int, # num_docs
+                ctypes.c_int, # capacity
+                ctypes.c_int, # max_docs_per_bin
+                ctypes.POINTER(ctypes.c_int), # document_index
+                ctypes.POINTER(ctypes.c_int), # doc_idx_out
+                ctypes.POINTER(ctypes.c_int), # boundaries_out
+                ctypes.POINTER(ctypes.c_int), # num_bins_out
+            ]
+            lib.bfd_pack.restype = None
+            return lib
+        except OSError:
+            pass
+
+    # Compile from source (prefer C++, fall back to C)
+    for src_path, compiler in [(cpp_path, "g++")]:
+        if os.path.isfile(src_path):
+            try:
+                subprocess.check_call(
+                    [compiler, "-O3", "-shared", "-fPIC", "-o", so_path, src_path],
+                    stderr=subprocess.DEVNULL,
+                )
+                return _load_bfd_c_library()
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
+
+    return None
+
+_bfd_c_lib = _load_bfd_c_library()
+
 def _build_sample_idx_bfd(
     sequence_lengths: np.ndarray,
     document_index: np.ndarray,
     seq_length: int,
     add_extra_token: int,
+    max_docs_per_bin: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Best-Fit Decreasing bin packing for whole documents.
 
     Sorts documents by decreasing length and assigns each to the bin with the
     least remaining capacity that still fits. Produces fewer bins (less padding)
     than greedy sequential packing when document lengths vary.
+
+    Uses the C-accelerated implementation when available, otherwise a pure-Python
+    bisect-based fallback.
 
     Args:
         sequence_lengths: Array of document lengths indexed by document ID.
@@ -54,6 +108,53 @@ def _build_sample_idx_bfd(
         sample_index: Shape (num_bins + 1, 2) boundary array. Column 0 holds
             offsets into reordered_document_index; column 1 is always 0.
     """
+    if _bfd_c_lib is not None:
+        return _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin)
+    return _build_sample_idx_bfd_python(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin)
+
+
+def _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin=0):
+    """C-accelerated BFD bin packing via ctypes. See _build_sample_idx_bfd."""
+    import ctypes
+
+    capacity = seq_length + add_extra_token
+    num_docs = len(document_index)
+
+    doc_lengths = sequence_lengths[document_index].astype(np.int64)
+    sorted_positions = np.argsort(-doc_lengths, kind='stable').astype(np.int32)
+    doc_index_i32 = document_index.astype(np.int32)
+
+    doc_idx_out = np.empty(num_docs, dtype=np.int32)
+    boundaries_out = np.empty(num_docs + 1, dtype=np.int32)
+    num_bins_out = ctypes.c_int(0)
+
+    _bfd_c_lib.bfd_pack(
+        sorted_positions.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+        doc_lengths.ctypes.data_as(ctypes.POINTER(ctypes.c_long)),
+        num_docs, capacity, int(max_docs_per_bin),
+        doc_index_i32.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+        doc_idx_out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+        boundaries_out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+        ctypes.byref(num_bins_out),
+    )
+
+    nb = num_bins_out.value
+    reordered = doc_idx_out[:num_docs].astype(document_index.dtype)
+    sample_index = np.zeros((nb + 1, 2), dtype=document_index.dtype)
+    sample_index[:, 0] = boundaries_out[:nb + 1].astype(document_index.dtype)
+
+    assert boundaries_out[nb] == num_docs, f"BFD placed {boundaries_out[nb]} docs but expected {num_docs}"
+    return reordered, sample_index
+
+
+def _build_sample_idx_bfd_python(
+    sequence_lengths: np.ndarray,
+    document_index: np.ndarray,
+    seq_length: int,
+    add_extra_token: int,
+    max_docs_per_bin: int = 0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Pure-Python BFD fallback using bisect. See _build_sample_idx_bfd."""
     capacity = seq_length + add_extra_token
     num_docs = len(document_index)
 
@@ -83,6 +184,8 @@ def _build_sample_idx_bfd(
             if bins_sorted:
                 remaining, bin_id = bins_sorted[0]
                 bin_contents[bin_id].append(int(pos))
+                if max_docs_per_bin > 0 and len(bin_contents[bin_id]) >= max_docs_per_bin:
+                    bins_sorted.pop(0)
             else:
                 bin_id = len(bin_contents)
                 bin_contents.append([int(pos)])
@@ -97,7 +200,7 @@ def _build_sample_idx_bfd(
             remaining, bin_id = bins_sorted.pop(idx)
             new_remaining = remaining - length
             bin_contents[bin_id].append(int(pos))
-            if new_remaining > 0:
+            if new_remaining > 0 and not (max_docs_per_bin > 0 and len(bin_contents[bin_id]) >= max_docs_per_bin):
                 # Re-insert with updated capacity
                 bisect.insort(bins_sorted, (new_remaining, bin_id))
         else:
@@ -105,7 +208,7 @@ def _build_sample_idx_bfd(
             bin_id = len(bin_contents)
             bin_contents.append([int(pos)])
             new_remaining = capacity - length
-            if new_remaining > 0:
+            if new_remaining > 0 and not (max_docs_per_bin > 0 and len(bin_contents[bin_id]) >= max_docs_per_bin):
                 bisect.insort(bins_sorted, (new_remaining, bin_id))
 
     # Rebuild document_index so each bin's documents are contiguous
@@ -125,6 +228,7 @@ def _build_sample_idx_bfd(
 
     assert offset == num_docs, f"BFD placed {offset} docs but expected {num_docs}"
     return reordered, sample_index
+
 
 
 class ApertusSFTDataset(GPTDataset):
@@ -186,17 +290,19 @@ class ApertusSFTDataset(GPTDataset):
         # These must be set as pre-tokenized token ID lists, e.g. by
         # add_emu3_tokens_llama3_vision_instruct.py. Some models use separate assistant/user
         # end sequences, others share a common eot token.
-        missing = [attr for attr in ('sft_assistant_begin_sequence', 'sft_assistant_end_sequence')
-                   if not hasattr(self.tokenizer, attr)]
-        if missing:
-            raise ValueError(
-                f"Tokenizer is missing required SFT attributes: {missing}. "
-                f"ApertusSFTDataset requires 'sft_assistant_begin_sequence' and "
-                f"'sft_assistant_end_sequence' (list of token IDs) to be defined in "
-                f"tokenizer_config.json."
-            )
-        self._sft_assistant_begin_sequence = torch.tensor(self.tokenizer.sft_assistant_begin_sequence, dtype=torch.long)
-        self._sft_assistant_end_sequence = torch.tensor(self.tokenizer.sft_assistant_end_sequence, dtype=torch.long)
+
+        special_tokens = {
+            "assistant_begin": "<|assistant_start|>",
+            "assistant_end": "<|assistant_end|>",
+            "system_start": "<|system_start|>",
+            "tool_output_start": "<|tool_output_start|>",
+            "tool_output_end": "<|tool_output_end|>", 
+        }
+
+        for attr, string in special_tokens.items():
+            token_id = self.tokenizer._tokenizer.tokenizer.encode(string, add_special_tokens=False)
+            token_list = token_id if isinstance(token_id, list) else [token_id]
+            setattr(self, f"_sft_{attr}_sequence", torch.tensor(token_list, dtype=torch.long))
 
         # Configure token (sequences) to remove from loss calculation
         self.tokens_to_mask = []
@@ -261,7 +367,7 @@ class ApertusSFTDataset(GPTDataset):
 
     def _log_packing_statistics(self, document_index, sample_index, from_cache=False):
         """
-        Log statistics about packed samples.
+        Log statistics about packed samples (one epoch).
 
         Args:
             document_index: Array of document IDs
@@ -270,23 +376,44 @@ class ApertusSFTDataset(GPTDataset):
         """
         num_samples_available = sample_index.shape[0] - 1
         sequence_length = self.config.sequence_length
-        num_tokens_per_epoch = int(np.sum(self.dataset.sequence_lengths[self.indices]))
-        total_tokens_in_samples = num_samples_available * sequence_length
-        avg_tokens_per_sample = num_tokens_per_epoch / num_samples_available if num_samples_available > 0 else 0
-        avg_documents_per_sample = len(document_index) / num_samples_available if num_samples_available > 0 else 0
+        capacity = sequence_length + self.config.add_extra_token_to_sequence
+
+        raw_lengths = self.dataset.sequence_lengths[self.indices]
+        raw_tokens_per_epoch = int(raw_lengths.sum())
+        # Oversized docs get their own bin and are truncated at `capacity` in
+        # _get_packed_sample, so only `capacity` of each contributes to a sample.
+        effective_tokens_per_epoch = int(np.minimum(raw_lengths, capacity).sum())
+        truncated_tokens = raw_tokens_per_epoch - effective_tokens_per_epoch
+
+        total_capacity = num_samples_available * capacity
+        avg_tokens_per_sample = (
+            effective_tokens_per_epoch / num_samples_available if num_samples_available > 0 else 0
+        )
+        avg_documents_per_sample = (
+            len(document_index) / num_samples_available if num_samples_available > 0 else 0
+        )
+        packing_efficiency = (
+            100 * effective_tokens_per_epoch / total_capacity if total_capacity > 0 else 0
+        )
+
+        # When loss masks are loaded from disk, each stored "doc" is [tokens, loss_mask]
+        # concatenated, so config.sequence_length and raw lengths are both 2x. Halve
+        # displayed absolute counts so the reader sees real model-token quantities.
+        display_divisor = 2 if self.config.sft_load_loss_mask else 1
+        display_seq_len = sequence_length // display_divisor
 
         cache_suffix = " (loaded from cache)" if from_cache else ""
-        packing_efficiency = 100 * num_tokens_per_epoch / total_tokens_in_samples if total_tokens_in_samples > 0 else 0
 
         log_single_rank(logger, logging.INFO, f"> ===== SFT Packing Statistics (ONE EPOCH){cache_suffix} =====")
-        log_single_rank(logger, logging.INFO, f" > #docs in epoch:                    {len(document_index):>12}")
-        log_single_rank(logger, logging.INFO, f" > #tokens in epoch:                  {num_tokens_per_epoch:>12,}")
-        log_single_rank(logger, logging.INFO, f" > Sequence length:                   {sequence_length:>12}")
-        log_single_rank(logger, logging.INFO, f" > #packed samples (per epoch):       {num_samples_available:>12,}")
-        log_single_rank(logger, logging.INFO, f" > #tokens(incl. padding) in samples: {total_tokens_in_samples:>12,}")
-        log_single_rank(logger, logging.INFO, f" > Average #tokens/sample:            {avg_tokens_per_sample:>12.1f}")
-        log_single_rank(logger, logging.INFO, f" > Average #documents/sample:         {avg_documents_per_sample:>12.2f}")
-        log_single_rank(logger, logging.INFO, f" > Packing efficiency:                {packing_efficiency:>11.2f}%\n\n")
+        log_single_rank(logger, logging.INFO, f" > #docs in epoch:                       {len(document_index):>12}")
+        log_single_rank(logger, logging.INFO, f" > #tokens in epoch (raw):               {raw_tokens_per_epoch // display_divisor:>12,}")
+        log_single_rank(logger, logging.INFO, f" > #tokens lost to truncation:           {truncated_tokens // display_divisor:>12,}")
+        log_single_rank(logger, logging.INFO, f" > Model sequence length:                {display_seq_len:>12}")
+        log_single_rank(logger, logging.INFO, f" > #packed samples (per epoch):          {num_samples_available:>12,}")
+        log_single_rank(logger, logging.INFO, f" > Total bin capacity:                   {total_capacity // display_divisor:>12,}")
+        log_single_rank(logger, logging.INFO, f" > Avg #tokens/sample (effective):       {avg_tokens_per_sample / display_divisor:>12.1f}")
+        log_single_rank(logger, logging.INFO, f" > Avg #documents/sample:                {avg_documents_per_sample:>12.2f}")
+        log_single_rank(logger, logging.INFO, f" > Packing efficiency:                   {packing_efficiency:>11.2f}%\n\n")
 
     def _build_packing_document_to_sample_indices(self):
         """
@@ -348,6 +475,7 @@ class ApertusSFTDataset(GPTDataset):
                     document_index,
                     sequence_length,
                     add_extra_token=self.config.add_extra_token_to_sequence,
+                    max_docs_per_bin=self.config.max_docs_per_bin_sft,
                 )
             else:
                 sample_index = helpers.build_sample_idx_packed_whole_docs(
@@ -768,6 +896,28 @@ class ApertusSFTDataset(GPTDataset):
             if self.sft_plw_value > 0:
                 loss_mask[~assistant_mask] = self.sft_plw_value # value is 0 by default for full masking
 
+            # Also unmask tokens between BOS and <|system_start|> (pre-system content). Relevant for Long Context Tasks
+            if self.config.sft_long_ctx_loss:
+                bos_seq = torch.tensor([self._bos_token_id], dtype=data.dtype, device=data.device)
+                sys_start_seq = self._sft_system_start_sequence.to(dtype=data.dtype, device=data.device)
+                loss_mask[get_matching_mask_by_start_end(data, bos_seq, sys_start_seq)] = 1
+
+                # First-doc fallback: if <|system_start|> appears with no preceding <s>, unmask [0..system_start].
+                sys_pos = torch.where(get_matching_mask(data, sys_start_seq, only_begin=True))[0]
+                if sys_pos.numel() > 0 and not (data[: sys_pos[0]] == self._bos_token_id).any():
+                    loss_mask[: sys_pos[0].item() + sys_start_seq.numel()] = 1
+
+                loss_mask[get_matching_mask(data, sys_start_seq, only_begin=False)] = 0
+
+            # 1b) Mask tool output tokens from both loss_mask and assistant_mask.
+            # Tool output spans (<|tool_output_start|> ... <|tool_output_end|>)
+            tool_output_start_seq = self._sft_tool_output_start_sequence.to(dtype=data.dtype, device=data.device)
+            tool_output_end_seq   = self._sft_tool_output_end_sequence.to(dtype=data.dtype, device=data.device)
+            tool_output_mask = get_matching_mask_by_start_end(data, tool_output_start_seq, tool_output_end_seq)
+
+            loss_mask[tool_output_mask] = 0.0
+            if assistant_mask is not None:
+                assistant_mask[tool_output_mask] = False
 
         # 2) Mask loss for special tokens (if activated) - only if not load loss from disk
         if preloaded_loss_mask is None:

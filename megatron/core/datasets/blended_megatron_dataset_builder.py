@@ -2,18 +2,20 @@
 
 import logging
 import math
+import warnings
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Iterable, List, Optional, Type, Union
+from typing import Any, Callable, Iterable, List, Optional, Tuple, Type, Union
 
 import numpy
 import torch
 
 from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, GPTDataset, MockGPTDataset
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
-from megatron.core.datasets.utils import Split, normalize
+from megatron.core.datasets.utils import Split, normalize, split_dataset_type_marker
 from megatron.core.utils import log_single_rank
+from megatron.training.datasets.apertus_sft_dataset import ApertusSFTDataset
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,11 @@ TopLevelDataset = Union[BlendedDataset, MidLevelDataset]
 DistributedDataset = Union[
     TopLevelDataset, MidLevelDataset, LowLevelDataset, torch.utils.data.Dataset
 ]
+
+# Legacy: paths whose name contains one of these substrings (matched
+# case-insensitively) are inferred to be SFT datasets. Deprecated in favor of
+# explicit "sft:" markers.
+LEGACY_SFT_PATH_SUBSTRINGS = ("apertus_sft", "apertus1p5_sft")
 
 
 class BlendedMegatronDatasetBuilder(object):
@@ -44,12 +51,10 @@ class BlendedMegatronDatasetBuilder(object):
 
     def __init__(
         self,
-        cls: Type[MidLevelDataset],
         sizes: List[int],
         is_built_on_rank: Callable,
         config: BlendedMegatronDatasetConfig,
     ):
-        self.cls = cls
         self.sizes = sizes
         self.is_built_on_rank = is_built_on_rank
         self.config = config
@@ -57,7 +62,7 @@ class BlendedMegatronDatasetBuilder(object):
         log_single_rank(
             logger,
             logging.INFO,
-            f"Building {cls.__name__} splits with sizes={self.sizes} and config={self.config}",
+            f"Building splits with sizes={self.sizes} and config={self.config}",
         )
 
         if not self.config.mock:
@@ -151,7 +156,7 @@ class BlendedMegatronDatasetBuilder(object):
                 return self._build_megatron_dataset_splits(None, split, self.sizes)
             except Exception as error:
                 raise Exception(
-                    f"{self.cls.__name__} failed to build as a mock data generator"
+                    f"Failed to build as a mock data generator"
                 ) from error
 
         ##
@@ -180,6 +185,7 @@ class BlendedMegatronDatasetBuilder(object):
                     weights, self.sizes, surplus=self.config.mid_level_dataset_surplus
                 )
 
+            
             # Build each dataset in parallel
             megatron_datasets = self._build_megatron_datasets_parallel(
                 prefixes, split, sizes_per_dataset_buffer
@@ -211,6 +217,7 @@ class BlendedMegatronDatasetBuilder(object):
                         raise ValueError(
                             "Using client-specified weights requires client-specified size"
                         )
+
                     blended_datasets[i] = self.build_generic_dataset(
                         BlendedDataset,
                         self.is_built_on_rank,
@@ -413,6 +420,47 @@ class BlendedMegatronDatasetBuilder(object):
 
         return megatron_datasets
 
+    def _resolve_dataset_class(
+        self, dataset_path: Optional[str]
+    ) -> Tuple[Type[MegatronDataset], Optional[str]]:
+        """Decide which dataset class builds ``dataset_path``.
+
+        Precedence:
+          1. Explicit ``sft:`` / ``pretrain:`` marker on the path.
+          2. ``GPTDatasetConfig.ap_sft_auto_tag`` (set by ``--ap-sft``) → SFT for
+             any unmarked path.
+          3. Legacy substring (one of ``LEGACY_SFT_PATH_SUBSTRINGS``, e.g.
+             ``"apertus_sft"`` / ``"apertus1p5_sft"``, matched case-insensitively)
+             → SFT with a DeprecationWarning.
+          4. Default → ``GPTDataset``.
+
+        Returns the chosen class and the marker-stripped path. Mock configs and
+        ``None`` paths short-circuit to ``MockGPTDataset``.
+        """
+        if self.config.mock or dataset_path is None:
+            return MockGPTDataset, None
+        dtype, clean = split_dataset_type_marker(dataset_path)
+        if dtype == "sft":
+            return ApertusSFTDataset, clean
+        if dtype == "pretrain":
+            return GPTDataset, clean
+        if getattr(self.config, "ap_sft_auto_tag", False):
+            return ApertusSFTDataset, clean
+        if clean:
+            clean_lower = clean.lower()
+            matched = next(
+                (s for s in LEGACY_SFT_PATH_SUBSTRINGS if s in clean_lower), None
+            )
+            if matched is not None:
+                warnings.warn(
+                    f"Inferring SFT dataset from '{matched}' substring in "
+                    f"'{clean}' is deprecated; prefix the path with 'sft:' instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                return ApertusSFTDataset, clean
+        return GPTDataset, clean
+
     def _build_megatron_dataset_splits(
         self,
         dataset_path: Optional[str],
@@ -436,11 +484,14 @@ class BlendedMegatronDatasetBuilder(object):
         Returns:
             List[Optional[MidLevelDataset]]: The MidLevelDataset (or None) per split
         """
+
+        dataset_cls, dataset_path = self._resolve_dataset_class(dataset_path)
+
         synchronize_ranks = (
             False
             if (
                 synchronize_ranks
-                and (isinstance(self.cls, GPTDatasetConfig) and self.config.fast_cache_load)
+                and (isinstance(dataset_cls, GPTDatasetConfig) and dataset_cls.config.fast_cache_load)
             )
             else synchronize_ranks
         )  # NOTE(asolergi-nv): Set synchronize_ranks to False if we are using --dataloader-fast-cache-load # pylint: disable=C0301
@@ -451,11 +502,13 @@ class BlendedMegatronDatasetBuilder(object):
                     torch.distributed.barrier()
             return [None] * len(Split)
 
+
+
         # Build the low level dataset
-        low_level_dataset = self.cls.build_low_level_dataset(dataset_path, self.config)
+        low_level_dataset = dataset_cls.build_low_level_dataset(dataset_path, self.config)
 
         # Build the split indices for the low level dataset
-        num_elements = self.cls.numel_low_level_dataset(low_level_dataset)
+        num_elements = dataset_cls.numel_low_level_dataset(low_level_dataset)
 
         # Build the mid level dataset
         mid_level_datasets = []
@@ -473,7 +526,7 @@ class BlendedMegatronDatasetBuilder(object):
 
                 mid_level_datasets.append(
                     self.build_generic_dataset(
-                        self.cls,
+                        dataset_cls,
                         self.is_built_on_rank,
                         synchronize_ranks,
                         low_level_dataset,

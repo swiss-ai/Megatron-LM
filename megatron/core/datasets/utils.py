@@ -90,3 +90,31 @@ def get_blend_from_list(
     prefix_per_dataset = [rppd.strip() for rppd in raw_prefix_per_dataset]
 
     return prefix_per_dataset, weight_per_dataset
+
+
+DATASET_TYPE_MARKERS = ("sft:", "pretrain:")
+
+
+def split_dataset_type_marker(prefix: Optional[str]) -> Tuple[str, Optional[str]]:
+    """Split a blend prefix into (dataset_type, clean_path).
+
+    Recognises the reserved markers ``sft:`` and ``pretrain:`` (matched
+    case-insensitively, so ``SFT:/x`` and ``sft:/x`` behave identically).
+    Returns ``("default", original_path)`` when no marker is present.
+    A ``None`` prefix (mock datasets) round-trips as ``("default", None)``.
+    Only the leading marker is stripped, so ``"sft:sft:/x"`` resolves to
+    ``("sft", "sft:/x")``. An empty path after a marker raises an
+    AssertionError so typos like ``"sft:"`` fail fast.
+    """
+    if prefix is None:
+        return ("default", None)
+    lowered = prefix.lower()
+    for marker in DATASET_TYPE_MARKERS:
+        if lowered.startswith(marker):
+            clean = prefix[len(marker):]
+            assert clean, (
+                f"Dataset path is empty after dataset-type marker "
+                f"'{prefix[:len(marker)]}'"
+            )
+            return (marker[:-1], clean)
+    return ("default", prefix)

@@ -53,7 +53,6 @@ from megatron.training import get_tokenizer
 from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
-from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.training.initialize import initialize_megatron
 from megatron.training.tokenizer.tokenizer_omni_metadata import populate_omni_metadata_from_tokenizer
@@ -145,6 +144,7 @@ def core_gpt_dataset_config_from_args(args):
         sft_equalize_sample_loss=args.ap_sft_equalize_sample_loss,
         sft_load_loss_mask=args.ap_sft_load_loss_mask,
         sft_truncate_right=args.ap_sft_truncate_right,
+        ap_sft_auto_tag=args.ap_sft,
     )
 
 
@@ -158,21 +158,9 @@ def build_train_valid_test_datasets(train_val_test_num_samples):
 
     config = core_gpt_dataset_config_from_args(args)
 
-    if args.ap_sft:
-        from megatron.training.datasets.apertus_sft_dataset import ApertusSFTDataset
-        dataset_type = ApertusSFTDataset
-    elif args.sft:
-        from megatron.training.datasets.sft_dataset import SFTDataset
-        dataset_type = SFTDataset
-    elif args.mock_data:
-        dataset_type = MockGPTDataset
-    else:
-        dataset_type = GPTDataset
-
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type,
         train_val_test_num_samples,
         is_dataset_built_on_rank,
         config
