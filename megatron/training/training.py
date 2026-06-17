@@ -196,6 +196,9 @@ from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux
 from megatron.core.transformer.moe.experts_offloading_fp8_util import (
     FP8ExpertsParameterManager,
 )
+from megatron.core.transformer.moe.experts_fp8_util import (
+    FP8GPUExpertsParameterManager,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
@@ -1840,10 +1843,21 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     if isinstance(optim_instance, DistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
 
-        if args.moe_use_offloading_experts and args.moe_use_inplace_fp8_param:
+        if (
+            args.moe_use_offloading_experts
+            and args.moe_use_inplace_fp8_param
+            and not config.moe_offloading_experts_debug_mode
+        ):
             FP8ExpertsParameterManager.create_instance(config)
             FP8ExpertsParameterManager.mark_first_microbatch()
 
+        if (
+            args.moe_use_offloading_experts
+            and args.moe_use_inplace_fp8_param
+            and config.moe_offloading_experts_debug_mode
+        ):
+            FP8GPUExpertsParameterManager.create_instance(config)
+            FP8GPUExpertsParameterManager.mark_first_microbatch()
 
         # Forward pass.
         if save_dgrads_in_this_iteration:

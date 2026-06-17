@@ -537,17 +537,21 @@ class ExpertsFP8GroupedSwiMLP(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, *args):
-        if len(args) < 8:
-            raise ValueError(f"Insufficient arguments for forward pass of ExpertsFP8GroupedSwiMLP. Expected at least 8, got {len(args)}")
+        if len(args) not in (8, 9):
+            raise ValueError(
+                "Invalid arguments for ExpertsFP8GroupedSwiMLP forward pass. "
+                f"Expected 8 or 9, got {len(args)}"
+            )
 
-        w1: torch.nn.Parameter = args[-8]
-        w2: torch.nn.Parameter = args[-7]
-        permuted_local_hidden_states: torch.Tensor = args[-6]
-        tokens_per_expert: torch.Tensor = args[-5]
-        num_local_experts: int = args[-4]
-        permuted_probs: torch.Tensor = args[-3]
-        expert_wgrad_scheduler: ExpertsWgradScheduler = args[-2]
-        config: TransformerConfig = args[-1]
+        w1: torch.nn.Parameter = args[0]
+        w2: torch.nn.Parameter = args[1]
+        permuted_local_hidden_states: torch.Tensor = args[2]
+        tokens_per_expert: torch.Tensor = args[3]
+        num_local_experts: int = args[4]
+        permuted_probs: torch.Tensor = args[5]
+        expert_wgrad_scheduler: ExpertsWgradScheduler = args[6]
+        config: TransformerConfig = args[7]
+        wgrad_accumulation_and_reduce_hooks: list = args[8] if len(args) == 9 else []
         fp8_parameter_manager = FP8GPUExpertsParameterManager.get_instance(config)
 
         assert w1.shape[0] == num_local_experts, f"Expected w1 to have {num_local_experts} experts, but got {w1.shape[0]}"
@@ -579,6 +583,8 @@ class ExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         ctx.tokens_per_expert = tokens_per_expert
         ctx.tokens_per_expert_psum = tokens_per_expert_psum
         ctx.expert_wgrad_scheduler = expert_wgrad_scheduler
+        ctx.wgrad_accumulation_and_reduce_hooks = wgrad_accumulation_and_reduce_hooks
+        ctx.has_wgrad_hooks_input = len(args) == 9
         ctx.w1 = w1
         ctx.w2 = w2
         ctx.config = config
@@ -619,11 +625,10 @@ class ExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             fp8_grad_y, fc1_output, w2, permuted_probs,
             tokens_per_expert_psum, fp8_parameter_manager, config,
         )
-        grad_a_ref, _ = ExpertsFP8GroupedSwiMLP.call_backward_grad_a_ref(
+        grad_a_ref, grad_probs = ExpertsFP8GroupedSwiMLP.call_backward_grad_a_ref(
             grad_y, fc1_output, w2, permuted_probs,
             tokens_per_expert, config,
         )
-
         d = diff_tensor_norm(grad_a, grad_a_ref)
         assert d < 0.05, f"grad_a diff norm {d:.2e} exceeds threshold"
 
@@ -648,19 +653,30 @@ class ExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum,
             ctx.num_local_experts, config.gradient_accumulation_fusion,
         )
+        # ExpertsFP8GroupedSwiMLP.call_backward_grad_w2_ref(
+        #     grad_y, fc1_output, w2, permuted_probs, tokens_per_expert, config.gradient_accumulation_fusion,
+        # )
 
         # grad_w1: x is already FP8 rowwise; we need a colwise cast for the k-grouped kernel.
         bf16_x = per_token_dequant_from_fp8(fp8_x, fp8_x_scales)
-
         fp8_x_t = per_channel_cast_to_fp8(bf16_x, use_ue8m0=False, gran_k=128, transpose=False)
         ExpertsFP8GroupedSwiMLP.call_backward_grad_w1(
             fp8_grad_a_t, fp8_x_t, w1,
             tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum,
             ctx.num_local_experts, config.gradient_accumulation_fusion,
         )
+        # ExpertsFP8GroupedSwiMLP.call_backward_grad_w1_ref(
+        #     grad_a, bf16_x, w1, tokens_per_expert, config.gradient_accumulation_fusion,
+        # )
+
+        for hook_fn in ctx.wgrad_accumulation_and_reduce_hooks:
+            hook_fn()
 
         # gradients for w1, w2 are written into .main_grad inside _wgrad_post_process.
-        return None, None, grad_x, None, None, grad_probs, None, None
+        gradients = (None, None, grad_x, None, None, grad_probs, None, None)
+        if ctx.has_wgrad_hooks_input:
+            gradients = (*gradients, None)
+        return gradients
 
 
 def fp8_grouped_swiglu_mlp(
@@ -672,23 +688,26 @@ def fp8_grouped_swiglu_mlp(
     permuted_probs: torch.Tensor,
     expert_wgrad_scheduler: ExpertsWgradScheduler,
     config: TransformerConfig,
+    wgrad_accumulation_and_reduce_hooks: list | None = None,
 ) -> torch.Tensor:
     """Autograd entry point for the GPU-resident FP8 grouped SwiGLU MLP.
 
     Args:
-        w1: stacked first-linear weight of shape (E, hidden, 2*ffn) on GPU.
-        w2: stacked second-linear weight of shape (E, ffn, hidden) on GPU.
+        w1: stacked first-linear weight of shape (E, 2*ffn, hidden) on GPU.
+        w2: stacked second-linear weight of shape (E, hidden, ffn) on GPU.
         permuted_local_hidden_states: token-permuted activations.
         tokens_per_expert: 1-D tensor of length E.
         num_local_experts: E.
         permuted_probs: per-token routing probs aligned to permutation.
         expert_wgrad_scheduler: kept for API parity; not consumed in the FP8 path.
         config: transformer configuration.
+        wgrad_accumulation_and_reduce_hooks: optional hooks to invoke after fused
+            weight-gradient accumulation.
 
     Returns:
         torch.Tensor: MLP output, same shape as permuted_local_hidden_states.
     """
-    output, _ = ExpertsFP8GroupedSwiMLP.apply(
+    args = [
         w1,
         w2,
         permuted_local_hidden_states,
@@ -697,5 +716,8 @@ def fp8_grouped_swiglu_mlp(
         permuted_probs,
         expert_wgrad_scheduler,
         config,
-    )
+    ]
+    if wgrad_accumulation_and_reduce_hooks is not None:
+        args.append(wgrad_accumulation_and_reduce_hooks)
+    output, _ = ExpertsFP8GroupedSwiMLP.apply(*args)
     return output

@@ -40,11 +40,13 @@ from megatron.core.transformer.moe.experts_util import (
     grouped_swiglu_mlp_torch_ref,
     ExpertsWgradScheduler,
 )
+from megatron.core.transformer.moe.experts_fp8_util import (
+    fp8_grouped_swiglu_mlp,
+)
 from megatron.core.transformer.moe.experts_offloading_util import (
     StreamManager, 
     offloading_grouped_swiglu_mlp,
 )
-
 from megatron.core.transformer.moe.experts_offloading_fp8_util import (
     offloading_fp8_grouped_swiglu_mlp,
 )
@@ -1295,6 +1297,54 @@ class OffloadingExpertsMLP(MegatronModule):
         for name, p in saved.items():
             self._parameters[name] = p
         return out
+
+    def _forward_debug(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run a GPU-resident reference path without expert weight offloading."""
+        if not self.config.moe_use_inplace_fp8_param:
+            return grouped_swiglu_mlp_torch_ref(
+                self.weight1,
+                self.weight2,
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                self.num_local_experts,
+                permuted_probs,
+                self.expert_wgrad_scheduler,
+                self.config,
+            )
+
+        tokens_per_expert_list = tokens_per_expert.tolist()
+        has_tokens = permuted_local_hidden_states.nelement() != 0
+        if has_tokens:
+            permuted_local_hidden_states, tokens_per_expert_padded = self.quantization_padding(
+                permuted_local_hidden_states, tokens_per_expert_list
+            )
+            permuted_probs, _ = self.quantization_padding(
+                permuted_probs.unsqueeze(-1), tokens_per_expert_list
+            )
+            tokens_per_expert = torch.tensor(
+                tokens_per_expert_padded, dtype=torch.int32, device='cpu'
+            )
+
+        output = fp8_grouped_swiglu_mlp(
+            self.weight1,
+            self.weight2,
+            permuted_local_hidden_states,
+            tokens_per_expert,
+            self.num_local_experts,
+            permuted_probs,
+            self.expert_wgrad_scheduler,
+            self.config,
+            self.wgrad_accumulation_and_reduce_hooks,
+        )
+
+        if has_tokens:
+            output = self.quantization_unpadding(output, tokens_per_expert_list)
+        return output
     
     def forward(
         self,
@@ -1304,17 +1354,9 @@ class OffloadingExpertsMLP(MegatronModule):
     ):
         if permuted_local_hidden_states.nelement() != 0:
             if self.config.moe_offloading_experts_debug_mode:
-                output = grouped_swiglu_mlp_torch_ref(
-                    self.weight1,
-                    self.weight2,
-                    permuted_local_hidden_states,
-                    tokens_per_expert,
-                    self.num_local_experts,
-                    permuted_probs,
-                    self.expert_wgrad_scheduler,
-                    self.config,
-                )
-                return output, None
+                return self._forward_debug(
+                    permuted_local_hidden_states, tokens_per_expert, permuted_probs
+                ), None
             
             if self.config.moe_use_inplace_fp8_param:
                 # create weight list
@@ -1375,17 +1417,9 @@ class OffloadingExpertsMLP(MegatronModule):
             return output, None
         else:
             if self.config.moe_offloading_experts_debug_mode:
-                output = grouped_swiglu_mlp_torch_ref(
-                    self.weight1,
-                    self.weight2,
-                    permuted_local_hidden_states,
-                    tokens_per_expert,
-                    self.num_local_experts,
-                    permuted_probs,
-                    self.expert_wgrad_scheduler,
-                    self.config,
-                )
-                return output, None
+                return self._forward_debug(
+                    permuted_local_hidden_states, tokens_per_expert, permuted_probs
+                ), None
 
             if self.config.moe_use_inplace_fp8_param:
                 # create weight list
@@ -1437,7 +1471,8 @@ class OffloadingExpertsMLP(MegatronModule):
             return output, None
         
     def backward_dw(self):
-        if self.config.delay_wgrad_compute:
+        # Debug paths compute weight gradients during the regular backward pass.
+        if self.config.delay_wgrad_compute and not self.config.moe_offloading_experts_debug_mode:
             self.expert_wgrad_scheduler.pop_callback()
             self.expert_wgrad_scheduler.pop_callback()
 
@@ -1525,9 +1560,3 @@ class OffloadingExpertsMLP(MegatronModule):
                 )
             )
         return sharded_state_dict
-
-
-
-
-
-

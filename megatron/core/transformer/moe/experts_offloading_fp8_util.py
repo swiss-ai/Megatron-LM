@@ -57,6 +57,150 @@ def get_dummy_wgrad(
         _dummy_wgrads[wgard_key].fill_(0)
     return _dummy_wgrads[wgard_key].detach()
 
+def _dequant_packed_kmajor(
+    fp8_packed: torch.Tensor,
+    sf_t: torch.Tensor,
+    ks: list[int],
+    n: int,
+    gran_k: int = 128,
+    out_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Inverse of ``per_channel_cast_to_fp8_pack_kmajor`` (debug/guard only).
+
+    Reconstructs the ``(sum(ks), n)`` operand from the per-expert k-major packed
+    fp8 buffer and its transposed scale view ``sf_t`` of shape
+    ``(n, sum(ks)//gran_k)``. Used to measure how much energy the quantization
+    actually preserved.
+    """
+    device = fp8_packed.device
+    m_total = sum(ks)
+    out = torch.empty(m_total, n, dtype=out_dtype, device=device)
+    sf = sf_t.float()
+    off_row = off_elem = off_grp = 0
+    for k_g in ks:
+        if k_g == 0:
+            continue
+        # expert slab is (n, k_g): slab[channel, token_local]
+        slab = fp8_packed[off_elem:off_elem + k_g * n].view(n, k_g).float()
+        g = k_g // gran_k
+        sc = sf[:, off_grp:off_grp + g]                 # (n, g) per-channel/group scale
+        sc_full = sc.repeat_interleave(gran_k, dim=1)   # (n, k_g)
+        out[off_row:off_row + k_g] = (slab * sc_full).t().to(out_dtype)
+        off_row += k_g
+        off_elem += k_g * n
+        off_grp += g
+    return out
+
+def guarded_per_channel_cast_to_fp8_pack_kmajor(
+    x: torch.Tensor,
+    ks: list[int],
+    ks_tensor: torch.Tensor,
+    prefixes: torch.Tensor,
+    *,
+    name: str,
+    config: TransformerConfig,
+    gran_k: int = 128,
+    free_input: bool = False,
+):
+    """``per_channel_cast_to_fp8_pack_kmajor`` + optional wgrad guard.
+
+    Drop-in replacement for the raw cast at the w2-wgrad operand sites. When the
+    guard is disabled this is behaviorally identical to calling the cast with the
+    same ``free_input``. When enabled, the input is validated *before* being
+    freed, so the guard can compare against the original bf16 operand.
+    """
+    def _fp8_wgrad_guard_mode(config) -> str:
+        """Return 'off' | 'warn' | 'raise'.
+
+        Enabled via env ``MOE_FP8_WGRAD_GUARD`` (``1``/``warn`` -> warn,
+        ``raise``/``strict``/``2`` -> raise) or ``config.moe_fp8_wgrad_guard``
+        (with ``config.moe_fp8_wgrad_guard_strict`` selecting raise).
+        """
+        # env = os.environ.get("MOE_FP8_WGRAD_GUARD", "")
+        # if env:
+        #     return "raise" if env.lower() in ("raise", "strict", "2") else "warn"
+        # if getattr(config, "moe_fp8_wgrad_guard", False):
+        #     return "raise" if getattr(config, "moe_fp8_wgrad_guard_strict", False) else "warn"
+        return "off"
+    
+    def guard_fp8_wgrad_operand(
+        name: str,
+        x: torch.Tensor,
+        fp8_packed: torch.Tensor,
+        sf_t: torch.Tensor,
+        ks: list[int],
+        mode: str,
+        gran_k: int = 128,
+        rel_tol: float = 0.03,
+    ) -> None:
+        """Validate one FP8-quantized w2-wgrad operand.
+
+        Checks, in increasing cost:
+        1. ``sf`` and the packed fp8 buffer are finite (catches the denormal-scale
+            reciprocal overflow / ``0*inf`` NaN path);
+        2. the dequantized operand is within ``rel_tol`` of the bf16 input
+            (catches zeroing / saturation / a too-coarse amax floor).
+
+        ``x`` must still be alive (call before any ``free_input``). On failure the
+        message includes the operand name and the stats needed to localize it.
+        """
+        if mode == "off":
+            # print(
+            #     f"{name}: x_mean={x.float().mean().item():.3e} x_std={x.float().std().item():.3e} x_amax={x.float().abs().amax().item():.3e} x_norm={x.float().norm().item():.3e}"
+            # )
+            return
+
+        problems = []
+        sf_f = sf_t.float()
+        fp8_f = fp8_packed.float()
+        sf_finite = torch.isfinite(sf_f).all().item()
+        fp8_finite = torch.isfinite(fp8_f).all().item()
+        if not sf_finite:
+            problems.append("scale factors contain NaN/Inf")
+        if not fp8_finite:
+            problems.append("packed fp8 contains NaN/Inf")
+
+        x_norm = x.float().norm()
+        rel = float("nan")
+        if sf_finite and fp8_finite and x_norm > 0:
+            x_deq = _dequant_packed_kmajor(fp8_packed, sf_t, ks, x.shape[1], gran_k)
+            rel = ((x_deq - x.float()).norm() / x_norm).item()
+            if not (rel == rel):  # NaN
+                problems.append("dequant produced NaN")
+            elif rel > rel_tol:
+                problems.append(
+                    f"dequant rel-error {rel:.3f} > {rel_tol} "
+                    f"(energy lost -- zeroing / saturation / coarse amax floor)"
+                )
+
+        if not problems:
+            return
+
+        detail = (
+            f"[wgrad2 fp8 guard] operand '{name}': {'; '.join(problems)} | "
+            f"x_amax={x.float().abs().amax().item():.3e} x_norm={x_norm.item():.3e} "
+            f"sf_min={sf_f.min().item():.3e} sf_max={sf_f.max().item():.3e} "
+            f"rel_err={rel:.3f} shape={tuple(x.shape)} ks_sum={sum(ks)}"
+        )
+        if mode == "raise":
+            print(detail)
+            raise FloatingPointError(detail)
+    
+    
+    mode = _fp8_wgrad_guard_mode(config)
+    # Defer freeing until after the guard has inspected the bf16 input.
+    fp8 = per_channel_cast_to_fp8_pack_kmajor(
+        x, ks, ks_tensor, prefixes,
+        use_ue8m0=False, gran_k=gran_k,
+        free_input=(free_input and mode == "off"),
+    )
+
+    guard_fp8_wgrad_operand(name, x, fp8[0], fp8[1], ks, mode, gran_k=gran_k)
+    if free_input:
+        x.data.untyped_storage().resize_(0)
+    return fp8
+
+
 class FP8ExpertsParameterManager:
     _instance = None
 
@@ -625,9 +769,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         with k_grouped_fp8_gemm: grad_y [m, h] @ s [m, H]
         """
         s = swiglu_forward(a, permuted_probs.unsqueeze(-1))
-        fp8_s = per_channel_cast_to_fp8_pack_kmajor(
-            s, tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum, 
-            use_ue8m0=False, gran_k=128, free_input=True,
+        fp8_s = guarded_per_channel_cast_to_fp8_pack_kmajor(
+            s, tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum,
+            name="w2_s", config=config, gran_k=128, free_input=True,
         )
 
         assert cpu_w2.main_grad is not None
@@ -739,6 +883,8 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                     h2d_stream.cuda_stream
                 )
             else: # NOTE: fallback to non-batched copy if not pinned
+                if transposed:
+                    buf = [b.view(b.shape[1], b.shape[0]) for b in buf]
                 for idx in range(experts_idx_start, experts_idx_end):
                     buf[idx - experts_idx_start].copy_(fp8_cpu_weights[idx].data, non_blocking=True)
 
@@ -977,9 +1123,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         )
 
         # backward grad_w2 computation
-        fp8_grad_y_t = per_channel_cast_to_fp8_pack_kmajor(
+        fp8_grad_y_t = guarded_per_channel_cast_to_fp8_pack_kmajor(
             grad_y, tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum,
-            use_ue8m0=False, gran_k=128, free_input=True,
+            name="w2_grad_y", config=config, gran_k=128, free_input=True,
         )
         OffloadingExpertsFP8GroupedSwiMLP.call_backward_grad_w2(
             fp8_grad_y_t,

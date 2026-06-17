@@ -779,7 +779,11 @@ class TransformerConfig(ModelParallelConfig):
     """Whether the offloading experts MLP should skip the post backward hook."""
 
     moe_offloading_experts_debug_mode: bool = False
-    """Whether to enable debug mode for offloading experts, which will take the flow of GroupedMLP"""
+    """Whether to run offloading experts through a GPU-resident debug path.
+
+    The inplace-FP8 variant uses ExpertsFP8GroupedSwiMLP; the BF16 variant uses
+    the pure-PyTorch grouped SwiGLU reference.
+    """
 
     moe_offloading_experts_te_style_init: bool = True
     """Whether OffloadingExpertsMLP should initialize expert weights to match the TEGroupedMLP

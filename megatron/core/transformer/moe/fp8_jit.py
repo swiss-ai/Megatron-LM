@@ -110,7 +110,8 @@ def _ceil_to_ue8m0(sf):
     exp = (bits >> 23) & 0xFF
     mantissa = bits & 0x7FFFFF
     exp = exp + tl.where(mantissa > 0, 1, 0)
-    exp = tl.clamp(exp, 1, 254)
+    # tl.clamp only accepts floating-point tensors in current Triton.
+    exp = tl.where(exp < 1, 1, tl.where(exp > 254, 254, exp))
     return (exp << 23).to(tl.float32, bitcast=True)
 
 
@@ -153,6 +154,10 @@ def _per_token_cast_to_fp8_kernel(
 
     # Scale and store FP8 output
     sf = tl.where(sf == 0.0, 1.0, sf)
+    # Floor sf so inv_sf cannot overflow when a token's group amax is tiny but
+    # nonzero (denormal sf -> inv_sf = +inf -> 0*inf = NaN). See
+    # _pack_kmajor_per_channel_fp8_kernel for the full rationale.
+    sf = tl.maximum(sf, 1e-30)
     inv_sf = 1.0 / sf[:, None]
     x_scaled = x * inv_sf
     # x_scaled = tl.clamp(x_scaled, -448.0, 448.0).to(tl.float8e4nv)
@@ -312,6 +317,10 @@ def _per_token_cast_to_fp8_chunked_fused_kernel(
     if use_ue8m0:
         sf = _ceil_to_ue8m0(sf)
     sf = tl.where(sf == 0.0, 1.0, sf)
+    # Floor sf so inv_sf cannot overflow when a token's group amax is tiny but
+    # nonzero (denormal sf -> inv_sf = +inf -> 0*inf = NaN). See
+    # _pack_kmajor_per_channel_fp8_kernel for the full rationale.
+    sf = tl.maximum(sf, 1e-30)
     inv_sf = 1.0 / sf[:, None]
     x_scaled = x * inv_sf
 
@@ -531,8 +540,13 @@ def _per_channel_cast_to_fp8_kernel(
     cols = col_start + tl.arange(0, BLOCK_N)
     col_mask = cols < n
 
-    # Phase 1: compute per-column abs-max across the group of gran_k rows
-    row_amax = tl.full((BLOCK_N,), 1e-4, dtype=tl.float32)
+    # Phase 1: compute per-column abs-max across the group of gran_k rows.
+    # Init to 0 (not a 1e-4 floor): wgrad operands are routinely ~1e-9 and a
+    # coarse amax floor would collapse the per-channel scale. The scale is
+    # floored just above the fp32 reciprocal cliff after the division below,
+    # matching _pack_kmajor_per_channel_fp8_kernel so the fused and unfused
+    # paths stay numerically identical.
+    row_amax = tl.zeros((BLOCK_N,), dtype=tl.float32)
     for r in range(0, gran_k, BLOCK_ROWS):
         rows = row_group * gran_k + r + tl.arange(0, BLOCK_ROWS)
         offsets = rows[:, None] * stride_m + cols[None, :]
@@ -540,9 +554,12 @@ def _per_channel_cast_to_fp8_kernel(
         x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         row_amax = tl.maximum(row_amax, tl.max(tl.abs(x), axis=0))
 
-    # Compute scale factor
+    # Compute scale factor. Floor sf so inv_sf = 1/sf cannot overflow to +inf
+    # (a denormal sf otherwise saturates the column to 448 and turns exact zeros
+    # into 0*inf = NaN). See _pack_kmajor_per_channel_fp8_kernel for details.
     sf = row_amax / 448.0
     sf = tl.where(sf == 0.0, 1.0, sf)
+    sf = tl.maximum(sf, 1e-30)
     if use_ue8m0:
         sf = _ceil_to_ue8m0(sf)
 
@@ -727,7 +744,12 @@ def _pack_kmajor_per_channel_fp8_kernel(
     base_row = prefix + rg * gran_k
 
     # Phase 1: per-column abs-max across the gran_k rows of this group.
-    row_amax = tl.full((BLOCK_N,), 1e-4, dtype=tl.float32)
+    # Do NOT floor amax at a coarse value like 1e-4: the offloading wgrad
+    # operands (grads / swiglu activations) are routinely ~1e-9, with near-dead
+    # channels far below that, and a coarse floor collapses the per-channel scale
+    # and discards most of the FP8 dynamic range. The scale is instead floored
+    # just above the fp32 reciprocal cliff after the division below.
+    row_amax = tl.zeros((BLOCK_N,), dtype=tl.float32)
     for r in range(0, gran_k, BLOCK_ROWS):
         rows = base_row + r + tl.arange(0, BLOCK_ROWS)
         offs = rows[:, None] * stride_xm + cols[None, :]
@@ -736,6 +758,15 @@ def _pack_kmajor_per_channel_fp8_kernel(
 
     sf = row_amax / 448.0
     sf = tl.where(sf == 0.0, 1.0, sf)
+    # Guard the fp32 reciprocal. If a channel's amax is tiny but nonzero, sf
+    # underflows to a denormal and inv_sf = 1/sf overflows to +inf. After that
+    # the amax element saturates to 448 (the whole per-channel spread collapses
+    # to the max) and any exact zero in the column -- e.g. a padded token --
+    # becomes 0*inf = NaN. Both silently corrupt the k-grouped wgrad GEMM and
+    # surface as an exploding grad norm. The 1e-30 floor keeps inv_sf finite and
+    # normal while only touching channels whose amax < ~4.5e-28, i.e. ~18 orders
+    # of magnitude below the training activation scale (negligible).
+    sf = tl.maximum(sf, 1e-7)
     if use_ue8m0:
         sf = _ceil_to_ue8m0(sf)
     inv_sf = 1.0 / sf
