@@ -7,6 +7,7 @@ import argparse
 from data_pipeline_pretrain.pipeline.tokens import MegatronDocumentTokenizer
 from datatrove.executor.local import LocalPipelineExecutor
 from datatrove.pipeline.readers import ParquetReader
+from datatrove.pipeline.readers import JsonlReader
 
 
 def get_args():
@@ -71,6 +72,13 @@ def get_args():
         default="text",
         help="Column to preprocess from the Dataset. Default: text",
     )
+    group.add_argument(
+        "--file-format",
+        type=str,
+        choices=["parquet", "jsonl"],
+        default="parquet",
+        help="File format of the input dataset. Default: parquet",
+    )
 
     args = parser.parse_args()
 
@@ -85,13 +93,23 @@ def main(args):
     if n_tasks > number_of_files:
         n_tasks = number_of_files
 
+    if args.file_format == "jsonl":
+        reader = JsonlReader(
+            data_folder=args.dataset,
+            paths_file=args.paths_file,
+            text_key=args.column,
+            compression="infer",
+        )
+    else:
+        reader = ParquetReader(
+            data_folder=args.dataset,
+            paths_file=args.paths_file,
+            text_key=args.column,
+        )
+
     preprocess_executor = LocalPipelineExecutor(
         pipeline=[
-            ParquetReader(
-                data_folder=args.dataset,
-                paths_file=args.paths_file,
-                text_key=args.column,
-            ),
+            reader,
             MegatronDocumentTokenizer(
                 output_folder=args.output_folder,
                 tokenizer_name_or_path=args.tokenizer_name_or_path,

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #SBATCH --account=infra01
-#SBATCH --time=03:59:59
+#SBATCH --time=02:30:00
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=288
@@ -19,7 +19,7 @@ number_of_tasks=$7
 MEGATRON_LM_DIR=$8
 COLUMN_KEY=$9
 REHYDRATE_FLAG=${10}
-EXTENSION=${11:-.parquet}
+FILE_FORMAT=${11:-parquet}
 
 set -eo pipefail
 
@@ -45,6 +45,7 @@ srun --environment=$ENV_FILE \
     --dataset $input_folder \
     --paths-file $paths_file \
     --column $COLUMN_KEY \
+    --file-format $FILE_FORMAT \
     $REHYDRATE_FLAG
 
 end=$(date +%s)

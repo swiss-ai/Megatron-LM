@@ -8,7 +8,7 @@
 NUMBER_OF_DATATROVE_TASKS=20
 TOKENIZER=swiss-ai/Apertus-70B-2509
 TOKENIZER_NAME=Apertus-70B-2509
-DATASET_NAME=nemotron-cc-v2
+DATASET_NAME=finephrase
 COLUMN_KEY=text
 
 REHYDRATE=False  # Set to True or False
@@ -18,11 +18,13 @@ else
   REHYDRATE_FLAG=""
 fi
 
-MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/data_ablations/Megatron-LM
+MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/tokenization_megatron/Megatron-LM
 PATH_TO_PREPROCESSING_METADATA=$MEGATRON_LM_DIR/datasets/$DATASET_NAME # Where dumps are stored
 PATH_TO_DATATROVE_LOGGING_DIR=$MEGATRON_LM_DIR/logs/datatrove # Where datatrove logs are stored
 PATH_TO_SLURM_LOGGING_DIR=$MEGATRON_LM_DIR/logs/slurm/tokenization-$TOKENIZER_NAME-$DATASET_NAME
-PATH_TO_OUTPUT_FOLDER=/iopsstor/scratch/cscs/$USER/datasets # Where tokenized datasets are stored
+#PATH_TO_OUTPUT_FOLDER=/iopsstor/scratch/cscs/$USER/datasets # Where tokenized datasets are stored
+PATH_TO_OUTPUT_FOLDER=/capstor/store/cscs/swissai/infra01/datasets_tokenized/txt360
+
 
 DATASET_OUTPUT_FOLDER_NAME=$PATH_TO_OUTPUT_FOLDER/$TOKENIZER_NAME/$DATASET_NAME
 CSV_RESULTS_FILE=$PATH_TO_PREPROCESSING_METADATA/tokenize-$TOKENIZER_NAME-$DATASET_NAME.csv
