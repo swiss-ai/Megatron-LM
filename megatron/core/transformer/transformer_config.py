@@ -1267,10 +1267,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.use_fused_weighted_squared_relu:
                 raise ValueError("pnglu=True is incompatible with use_fused_weighted_squared_relu.")
             if self.moe_use_offloading_experts:
-                raise ValueError(
-                    "pnglu=True is not supported with moe_use_offloading_experts (the offloading "
-                    "experts use custom fused SwiGLU CUDA kernels)."
-                )
+                assert self.moe_use_inplace_fp8_param, "pnglu=True with offloading experts currently only supports fp8 path"
             if self.transformer_impl == "inference_optimized":
                 raise ValueError(
                     "pnglu=True is not supported with transformer_impl='inference_optimized' "

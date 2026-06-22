@@ -200,6 +200,40 @@ class FusedPolyNormGLUFunction(torch.autograd.Function):
     coefficients of shape ``(M,)``; ``score`` is an optional per-token multiplier of shape ``(M,)``.
     """
 
+    @classmethod
+    def call_forward(
+        cls, x_glu, x_linear, a1, a2, eps, score
+    ):
+        M, D = x_glu.shape
+        out = torch.empty((M, D), dtype=x_glu.dtype, device=x_glu.device)
+        inv = torch.empty((M, 2), dtype=torch.float32, device=x_glu.device)
+        has_score = score is not None
+        score_arg = score if has_score else x_glu  # dummy pointer when unused
+
+        block = triton.next_power_of_2(D)
+        _polynorm_glu_fwd_kernel[(M,)](
+            out,
+            inv,
+            x_glu,
+            x_linear,
+            a1,
+            a2,
+            score_arg,
+            x_glu.stride(0),
+            x_glu.stride(1),
+            x_linear.stride(0),
+            x_linear.stride(1),
+            out.stride(0),
+            out.stride(1),
+            D,
+            1.0 / D,
+            eps,
+            HAS_SCORE=has_score,
+            BLOCK_SIZE=block,
+            num_warps=_num_warps_for(block),
+        )
+        return out, inv
+
     @staticmethod
     def forward(ctx, x_glu, x_linear, a1, a2, eps, score):
         M, D = x_glu.shape
@@ -238,6 +272,62 @@ class FusedPolyNormGLUFunction(torch.autograd.Function):
         ctx.has_score = has_score
         ctx.eps = eps
         return out
+    
+    @classmethod
+    def call_backward(
+        cls, 
+        grad_output, 
+        saved
+    ):
+        x_glu, x_linear, a1, a2, inv = saved[:5]
+        score = saved[5] if len(saved) > 5 else None
+        M, D = x_glu.shape
+
+        grad_output = grad_output.contiguous()
+        dx = torch.empty((M, D), dtype=x_glu.dtype, device=x_glu.device)
+        dm = torch.empty((M, D), dtype=x_linear.dtype, device=x_linear.device)
+        da1 = torch.empty((M,), dtype=a1.dtype, device=x_glu.device)
+        da2 = torch.empty((M,), dtype=a2.dtype, device=x_glu.device)
+        has_score = score is not None
+        if has_score:
+            dscore = torch.empty((M,), dtype=score.dtype, device=score.device)
+            score_arg = score
+        else:
+            dscore = None
+            score_arg = x_glu  # dummy pointer
+
+        block = triton.next_power_of_2(D)
+        _polynorm_glu_bwd_kernel[(M,)](
+            dx,
+            dm,
+            da1,
+            da2,
+            dscore if has_score else x_glu,
+            grad_output,
+            x_glu,
+            x_linear,
+            inv,
+            a1,
+            a2,
+            score_arg,
+            grad_output.stride(0),
+            grad_output.stride(1),
+            x_glu.stride(0),
+            x_glu.stride(1),
+            x_linear.stride(0),
+            x_linear.stride(1),
+            dx.stride(0),
+            dx.stride(1),
+            dm.stride(0),
+            dm.stride(1),
+            D,
+            1.0 / D,
+            HAS_SCORE=has_score,
+            BLOCK_SIZE=block,
+            num_warps=_num_warps_for(block),
+        )
+
+        return dx, dm, da1, da2, None, (dscore if has_score else None)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -337,3 +427,89 @@ def fused_polynorm_glu_impl(
 
     out = FusedPolyNormGLUFunction.apply(x2, m2, a1, a2, eps, score2)
     return out.reshape(ori_shape)
+
+
+def _split_glu_halves(fc1_output: torch.Tensor):
+    """Split a fused ``(..., 2D)`` fc1 output into its gate / linear ``(M, D)`` halves.
+    """
+    ori_shape = fc1_output.shape
+    two_d = ori_shape[-1]
+    assert two_d % 2 == 0, "fc1 output last dim must be 2*D for a gated linear unit"
+    d = two_d // 2
+    flat = fc1_output.reshape(-1, two_d)
+    x_glu, x_linear = torch.split(flat, d, dim=-1)
+    return x_glu, x_linear, ori_shape[:-1], d
+
+
+def _per_token_coeffs(a1: torch.Tensor, a2: torch.Tensor, num_tokens: int):
+    """Normalize ``a1``/``a2`` to per-token ``(M,)`` coefficients for the row-indexed kernels.
+
+    Mirrors :func:`fused_polynorm_glu_impl`: a single shared coefficient is expanded to one per
+    token (the ``expand`` keeps the autograd link), and already-per-token coefficients pass
+    through unchanged.
+    """
+    a1 = a1.reshape(-1)
+    a2 = a2.reshape(-1)
+    if a1.numel() == 1:
+        a1 = a1.expand(num_tokens).contiguous()
+        a2 = a2.expand(num_tokens).contiguous()
+    return a1, a2
+
+
+def fused_polynorm_glu_forward(
+    fc1_output: torch.Tensor,
+    a1: torch.Tensor,
+    a2: torch.Tensor,
+    eps: float,
+    score: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """2nd-order PolyNorm GLU forward.
+    """
+    x_glu, x_linear, lead_shape, d = _split_glu_halves(fc1_output)
+    a1, a2 = _per_token_coeffs(a1, a2, x_glu.shape[0])
+    score2 = score.reshape(-1) if score is not None else None
+    out, inv = FusedPolyNormGLUFunction.call_forward(x_glu, x_linear, a1, a2, eps, score2)
+    return out.reshape(lead_shape + (d,)), inv
+
+
+def fused_polynorm_glu_backward(
+    grad_output: torch.Tensor,
+    fc1_output: torch.Tensor,
+    a1: torch.Tensor,
+    a2: torch.Tensor,
+    inv: torch.Tensor,
+    eps: float,
+    score: Optional[torch.Tensor] = None,
+):
+    """2nd-order PolyNorm GLU backward.
+
+    Recomputes the inverse-RMS state from fc1_output then runs the fused backward kernel.
+    """
+    x_glu, x_linear, lead_shape, d = _split_glu_halves(fc1_output)
+    # A single shared coefficient receives the summed per-token gradient (mirrors the
+    # expand-backward in ``fused_polynorm_glu_impl``); a per-token coefficient keeps its shape.
+    shared_coeff = a1.numel() == 1
+    a1_c, a2_c = _per_token_coeffs(a1, a2, x_glu.shape[0])
+    score2 = score.reshape(-1) if score is not None else None
+
+    # Recompute inverse-RMS.
+    # _, to_save = FusedPolyNormGLUFunction.call_forward(x_glu, x_linear, a1_c, a2_c, eps, None)
+    # inv = to_save[4]
+    
+    # reconstruct the tensors
+    assert inv is not None
+    saved = [x_glu, x_linear, a1_c, a2_c, inv]
+    if score2 is not None:
+        saved.append(score2)
+
+    grad_flat = grad_output.reshape(-1, d)
+    dx, dm, da1, da2, _, dscore = FusedPolyNormGLUFunction.call_backward(grad_flat, saved)
+    grad_fc1 = torch.cat([dx, dm], dim=-1).reshape(lead_shape + (2 * d,))
+    if shared_coeff:
+        da1 = da1.sum(0, keepdim=True).reshape(a1.shape)
+        da2 = da2.sum(0, keepdim=True).reshape(a2.shape)
+    else:
+        da1 = da1.reshape(a1.shape)
+        da2 = da2.reshape(a2.shape)
+    grad_score = dscore.reshape(score.shape[:-1]) if score is not None else None
+    return grad_fc1, da1, da2, grad_score

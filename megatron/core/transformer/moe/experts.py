@@ -1031,6 +1031,13 @@ class OffloadingExpertsMLP(MegatronModule):
             self.input_size,
             fc2_input_size,
         )
+
+        if self.config.pnglu:
+            self.polynorm_glu = PolyNorm(
+                num_local_experts=self.num_local_experts,
+                config=self.config,
+                tp_group=self.tp_group,
+            )
         
         # For now all expert weights are offloaded in CPU.
         # NOTE: when FP8 is enabled, we allocate experts as a single tensor
@@ -1362,6 +1369,30 @@ class OffloadingExpertsMLP(MegatronModule):
             output = self.quantization_unpadding(output, tokens_per_expert_list)
         return output
     
+    def _polynorm_glu_coeffs(self, tokens_per_expert):
+        """Per-token positive PolyNorm-GLU coefficients.
+
+        abs and repeat_interleave run outside the offloading autograd Function so the 
+        gradients of alpha parameters flow back via standard autograd. 
+        """
+        if not self.config.pnglu:
+            return None, None
+        assert (
+            self.config.activation_func_clamp_value is None
+            and self.config.glu_linear_offset == 0.0
+        ), (
+            "PolyNorm GLU on the FP8 offloading path does not yet support "
+            "activation_func_clamp_value / glu_linear_offset."
+        )
+        device = self.polynorm_glu.alpha_1.device
+        if isinstance(tokens_per_expert, torch.Tensor):
+            tpe_tensor = tokens_per_expert.to(device=device)
+        else:
+            tpe_tensor = torch.tensor(tokens_per_expert, device=device)
+        a1 = torch.repeat_interleave(torch.abs(self.polynorm_glu.alpha_1), tpe_tensor)
+        a2 = torch.repeat_interleave(torch.abs(self.polynorm_glu.alpha_2), tpe_tensor)
+        return a1, a2
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -1391,7 +1422,10 @@ class OffloadingExpertsMLP(MegatronModule):
                     permuted_probs.unsqueeze(-1), tokens_per_expert_list
                 )
                 tokens_per_expert_padded = torch.tensor(tokens_per_expert_padded, dtype=torch.int32, device='cpu')
-                
+
+                # Per-token PolyNorm coefficients computation
+                a1, a2 = self._polynorm_glu_coeffs(tokens_per_expert_padded)
+
                 output = offloading_fp8_grouped_swiglu_mlp(
                     self.weight1,
                     self.weight2,
@@ -1409,6 +1443,8 @@ class OffloadingExpertsMLP(MegatronModule):
                     self.stream_manager,
                     self.fp8_config,
                     self.wgrad_accumulation_and_reduce_hooks,
+                    a1,
+                    a2,
                 )
 
                 output = self.quantization_unpadding(output, tokens_per_expert_list)
@@ -1445,7 +1481,10 @@ class OffloadingExpertsMLP(MegatronModule):
                     self.weight1_list = list(torch.unbind(self.weight1, dim=0))
                 if self.weight2_list is None:
                     self.weight2_list = list(torch.unbind(self.weight2, dim=0))
-                
+
+                # Empty input: counts sum to 0, so a1/a2 are length-0 (None on the SwiGLU path).
+                a1, a2 = self._polynorm_glu_coeffs(tokens_per_expert)
+
                 output = offloading_fp8_grouped_swiglu_mlp(
                     self.weight1,
                     self.weight2,
@@ -1463,6 +1502,8 @@ class OffloadingExpertsMLP(MegatronModule):
                     self.stream_manager,
                     self.fp8_config,
                     self.wgrad_accumulation_and_reduce_hooks,
+                    a1,
+                    a2,
                 )
 
                 return output, None
