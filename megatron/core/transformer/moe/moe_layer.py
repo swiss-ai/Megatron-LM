@@ -192,6 +192,11 @@ class BaseMoELayer(MegatronModule, ABC):
         """Set the layer number for the MoE layer."""
         self.layer_number = layer_number
         self.router.set_layer_number(layer_number)
+        if self.experts is not None and hasattr(self.experts, "set_layer_number"):
+            expert_layer_number = layer_number
+            if self.is_mtp_layer and self.config.mtp_num_layers is not None:
+                expert_layer_number = layer_number + self.config.num_layers
+            self.experts.set_layer_number(expert_layer_number)
 
 
 class MoELayer(BaseMoELayer):
@@ -303,6 +308,8 @@ class MoELayer(BaseMoELayer):
         self.experts = self.submodules.experts(
             self.num_local_experts, self.config, pg_collection=pg_collection
         )
+        if self.layer_number is not None and hasattr(self.experts, "set_layer_number"):
+            self.set_layer_number(self.layer_number)
 
         # Initialize shared experts
         if self.use_shared_expert:

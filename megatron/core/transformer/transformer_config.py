@@ -779,6 +779,15 @@ class TransformerConfig(ModelParallelConfig):
     moe_use_offloading_experts: bool = False
     """Whether to use offloading experts for MoE."""
 
+    monitor_moe_activation_max: bool = False
+    """Track max values around the FP8 offloading-expert FC2/wgrad path.
+
+    The monitored tensor is the router-weighted activation consumed by the expert FC2 layer.
+    The training logger reports the forward FC2 input max and the same activation captured
+    immediately before the FP8 ``grad_w2`` computation, plus the ``grad_y`` max captured
+    before ``grad_y`` is packed for ``grad_w2``.
+    """
+
     moe_offloading_num_chunks: int = 8
     """Number of chunks to split the expert weights into for offloading. """
 

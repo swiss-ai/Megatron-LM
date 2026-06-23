@@ -3,7 +3,6 @@
 import pytest
 import torch
 
-from megatron.core.transformer.moe.experts_util import MergedSwiGLU
 from megatron.core.transformer.moe.experts_offloading_util import (
     StreamManager,
     offloading_grouped_swiglu_mlp,

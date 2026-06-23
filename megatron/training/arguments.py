@@ -1467,6 +1467,14 @@ def validate_args(args, defaults={}):
         assert args.gradient_accumulation_fusion, "MoE expert offloading currently requires gradient accumulation fusion to be enabled."
         assert args.bf16, "MoE expert offloading currently requires using bfloat16 precision."
         assert not args.async_save, "Asynchronous checkpoint saving is not supported with MoE expert offloading for now."
+    if args.monitor_moe_activation_max:
+        assert args.moe_use_offloading_experts, (
+            "--monitor-moe-activation-max requires --moe-use-offloading-experts."
+        )
+        assert args.moe_use_inplace_fp8_param, (
+            "--monitor-moe-activation-max currently monitors only the FP8 offloading path; "
+            "set --moe-use-inplace-fp8-param."
+        )
 
         if args.overlap_grad_reduce:
             args.moe_offloading_experts_skip_post_backward_hook = True

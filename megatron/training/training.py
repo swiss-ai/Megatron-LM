@@ -193,6 +193,7 @@ from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
+from megatron.core.transformer.moe.experts import OffloadingExpertsMLP
 from megatron.core.transformer.moe.experts_offloading_fp8_util import (
     FP8ExpertsParameterManager,
     OffloadingFP8Config,
@@ -1800,6 +1801,254 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
+def _get_moe_activation_monitor_num_layers(args) -> int:
+    """Return the number of 1-indexed layer slots used by the activation monitor."""
+    num_layers = getattr(args, "num_layers", None)
+    if num_layers is None:
+        num_layers = getattr(args, "decoder_num_layers", None)
+    if num_layers is None:
+        num_layers = getattr(args, "encoder_num_layers", None)
+    if num_layers is None:
+        raise ValueError("--monitor-moe-activation-max requires a known number of layers.")
+    return int(num_layers) + int(getattr(args, "mtp_num_layers", None) or 0)
+
+
+def _record_max_moe_activation_value(
+    value: Optional[torch.Tensor],
+    layer_number: Optional[int],
+    local_max: torch.Tensor,
+    local_per_layer_max: torch.Tensor,
+) -> torch.Tensor:
+    """Record one module-local max into global and per-layer tensors."""
+    if value is None:
+        return local_max
+
+    value = value.detach().to(device=local_max.device, dtype=torch.float32)
+    local_max = torch.maximum(local_max, value)
+    if layer_number is not None:
+        layer_idx = layer_number - 1
+        if 0 <= layer_idx < local_per_layer_max.numel():
+            local_per_layer_max[layer_idx] = torch.maximum(
+                local_per_layer_max[layer_idx], value
+            )
+    return local_max
+
+
+def _record_moe_activation_stats(
+    stats: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    layer_number: Optional[int],
+    local_sum: torch.Tensor,
+    local_sum_sq: torch.Tensor,
+    local_count: torch.Tensor,
+    local_per_layer_sum: torch.Tensor,
+    local_per_layer_sum_sq: torch.Tensor,
+    local_per_layer_count: torch.Tensor,
+) -> None:
+    """Record one module-local stat triplet into global and per-layer accumulators."""
+    if stats is None:
+        return
+
+    value_sum, value_sum_sq, value_count = stats
+    value_sum = value_sum.detach().to(device=local_sum.device, dtype=torch.float32)
+    value_sum_sq = value_sum_sq.detach().to(device=local_sum_sq.device, dtype=torch.float32)
+    value_count = value_count.detach().to(device=local_count.device, dtype=torch.float32)
+    local_sum.add_(value_sum)
+    local_sum_sq.add_(value_sum_sq)
+    local_count.add_(value_count)
+    if layer_number is not None:
+        layer_idx = layer_number - 1
+        if 0 <= layer_idx < local_per_layer_sum.numel():
+            local_per_layer_sum[layer_idx].add_(value_sum)
+            local_per_layer_sum_sq[layer_idx].add_(value_sum_sq)
+            local_per_layer_count[layer_idx].add_(value_count)
+
+
+def _mean_std_from_moe_activation_stats(
+    total: torch.Tensor,
+    total_sq: torch.Tensor,
+    count: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert reduced sum/sum_sq/count tensors to mean/std tensors."""
+    safe_count = torch.clamp(count, min=1.0)
+    mean = total / safe_count
+    variance = torch.clamp(total_sq / safe_count - mean.square(), min=0.0)
+    std = torch.sqrt(variance)
+    invalid = count <= 0
+    mean = torch.where(invalid, torch.full_like(mean, torch.nan), mean)
+    std = torch.where(invalid, torch.full_like(std, torch.nan), std)
+    return mean, std
+
+
+def _collect_max_moe_activation(
+    model,
+) -> tuple[torch.Tensor, ...]:
+    """Collect and reset monitored offloading-expert activations across all ranks."""
+    args = get_args()
+    num_layers = _get_moe_activation_monitor_num_layers(args)
+    device = torch.cuda.current_device()
+    local_max = torch.full((), -torch.inf, dtype=torch.float32, device=torch.cuda.current_device())
+    local_per_layer_max = torch.full(
+        (num_layers,), -torch.inf, dtype=torch.float32, device=device
+    )
+    local_before_grad_w2_max = torch.full(
+        (), -torch.inf, dtype=torch.float32, device=device
+    )
+    local_before_grad_w2_per_layer_max = torch.full(
+        (num_layers,), -torch.inf, dtype=torch.float32, device=device
+    )
+    local_grad_y_before_grad_w2_max = torch.full(
+        (), -torch.inf, dtype=torch.float32, device=device
+    )
+    local_grad_y_before_grad_w2_per_layer_max = torch.full(
+        (num_layers,), -torch.inf, dtype=torch.float32, device=device
+    )
+    local_w2_grad_ref_fp8_rel_l2_max = torch.full(
+        (), -torch.inf, dtype=torch.float32, device=device
+    )
+    local_activation_sum = torch.zeros((), dtype=torch.float32, device=device)
+    local_activation_sum_sq = torch.zeros((), dtype=torch.float32, device=device)
+    local_activation_count = torch.zeros((), dtype=torch.float32, device=device)
+    local_activation_per_layer_sum = torch.zeros((num_layers,), dtype=torch.float32, device=device)
+    local_activation_per_layer_sum_sq = torch.zeros(
+        (num_layers,), dtype=torch.float32, device=device
+    )
+    local_activation_per_layer_count = torch.zeros(
+        (num_layers,), dtype=torch.float32, device=device
+    )
+    local_grad_y_sum = torch.zeros((), dtype=torch.float32, device=device)
+    local_grad_y_sum_sq = torch.zeros((), dtype=torch.float32, device=device)
+    local_grad_y_count = torch.zeros((), dtype=torch.float32, device=device)
+    local_grad_y_per_layer_sum = torch.zeros((num_layers,), dtype=torch.float32, device=device)
+    local_grad_y_per_layer_sum_sq = torch.zeros(
+        (num_layers,), dtype=torch.float32, device=device
+    )
+    local_grad_y_per_layer_count = torch.zeros(
+        (num_layers,), dtype=torch.float32, device=device
+    )
+
+    for model_chunk in model:
+        for module in model_chunk.modules():
+            if isinstance(module, OffloadingExpertsMLP):
+                value = module.get_max_activation(reset=True)
+                layer_number = module.layer_number
+                local_max = _record_max_moe_activation_value(
+                    value, layer_number, local_max, local_per_layer_max
+                )
+
+                before_grad_w2_value = module.get_max_activation_before_grad_w2(reset=True)
+                local_before_grad_w2_max = _record_max_moe_activation_value(
+                    before_grad_w2_value,
+                    layer_number,
+                    local_before_grad_w2_max,
+                    local_before_grad_w2_per_layer_max,
+                )
+
+                grad_y_before_grad_w2_value = module.get_max_grad_y_before_grad_w2(
+                    reset=True
+                )
+                local_grad_y_before_grad_w2_max = _record_max_moe_activation_value(
+                    grad_y_before_grad_w2_value,
+                    layer_number,
+                    local_grad_y_before_grad_w2_max,
+                    local_grad_y_before_grad_w2_per_layer_max,
+                )
+                _record_moe_activation_stats(
+                    module.get_activation_stats_before_grad_w2(reset=True),
+                    layer_number,
+                    local_activation_sum,
+                    local_activation_sum_sq,
+                    local_activation_count,
+                    local_activation_per_layer_sum,
+                    local_activation_per_layer_sum_sq,
+                    local_activation_per_layer_count,
+                )
+                _record_moe_activation_stats(
+                    module.get_grad_y_stats_before_grad_w2(reset=True),
+                    layer_number,
+                    local_grad_y_sum,
+                    local_grad_y_sum_sq,
+                    local_grad_y_count,
+                    local_grad_y_per_layer_sum,
+                    local_grad_y_per_layer_sum_sq,
+                    local_grad_y_per_layer_count,
+                )
+                w2_grad_ref_fp8_rel_l2 = module.get_max_w2_grad_ref_fp8_rel_l2(reset=True)
+                if w2_grad_ref_fp8_rel_l2 is not None:
+                    local_w2_grad_ref_fp8_rel_l2_max = torch.maximum(
+                        local_w2_grad_ref_fp8_rel_l2_max,
+                        w2_grad_ref_fp8_rel_l2.detach().to(
+                            device=local_w2_grad_ref_fp8_rel_l2_max.device,
+                            dtype=torch.float32,
+                        ),
+                    )
+
+    # This runs after the pipeline schedule, where every rank reaches the same collective.
+    torch.distributed.all_reduce(local_max, op=torch.distributed.ReduceOp.MAX)
+    torch.distributed.all_reduce(local_per_layer_max, op=torch.distributed.ReduceOp.MAX)
+    torch.distributed.all_reduce(local_before_grad_w2_max, op=torch.distributed.ReduceOp.MAX)
+    torch.distributed.all_reduce(
+        local_before_grad_w2_per_layer_max, op=torch.distributed.ReduceOp.MAX
+    )
+    torch.distributed.all_reduce(
+        local_grad_y_before_grad_w2_max, op=torch.distributed.ReduceOp.MAX
+    )
+    torch.distributed.all_reduce(
+        local_grad_y_before_grad_w2_per_layer_max, op=torch.distributed.ReduceOp.MAX
+    )
+    torch.distributed.all_reduce(
+        local_w2_grad_ref_fp8_rel_l2_max, op=torch.distributed.ReduceOp.MAX
+    )
+    for value in (
+        local_activation_sum,
+        local_activation_sum_sq,
+        local_activation_count,
+        local_activation_per_layer_sum,
+        local_activation_per_layer_sum_sq,
+        local_activation_per_layer_count,
+        local_grad_y_sum,
+        local_grad_y_sum_sq,
+        local_grad_y_count,
+        local_grad_y_per_layer_sum,
+        local_grad_y_per_layer_sum_sq,
+        local_grad_y_per_layer_count,
+    ):
+        torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
+
+    activation_mean, activation_std = _mean_std_from_moe_activation_stats(
+        local_activation_sum, local_activation_sum_sq, local_activation_count
+    )
+    activation_per_layer_mean, activation_per_layer_std = _mean_std_from_moe_activation_stats(
+        local_activation_per_layer_sum,
+        local_activation_per_layer_sum_sq,
+        local_activation_per_layer_count,
+    )
+    grad_y_mean, grad_y_std = _mean_std_from_moe_activation_stats(
+        local_grad_y_sum, local_grad_y_sum_sq, local_grad_y_count
+    )
+    grad_y_per_layer_mean, grad_y_per_layer_std = _mean_std_from_moe_activation_stats(
+        local_grad_y_per_layer_sum,
+        local_grad_y_per_layer_sum_sq,
+        local_grad_y_per_layer_count,
+    )
+    return (
+        local_max,
+        local_per_layer_max,
+        local_before_grad_w2_max,
+        local_before_grad_w2_per_layer_max,
+        local_grad_y_before_grad_w2_max,
+        local_grad_y_before_grad_w2_per_layer_max,
+        activation_mean,
+        activation_std,
+        activation_per_layer_mean,
+        activation_per_layer_std,
+        grad_y_mean,
+        grad_y_std,
+        grad_y_per_layer_mean,
+        grad_y_per_layer_std,
+        local_w2_grad_ref_fp8_rel_l2_max,
+    )
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
     """Single training step."""
     args = get_args()
@@ -1902,7 +2151,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
+        return (
+            {},
+            True,
+            should_checkpoint,
+            should_exit,
+            exit_code,
+            None,
+            None,
+            0,
+            *((None,) * 15),
+        )
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -1925,6 +2184,40 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
 
     timers('optimizer').stop()
+
+    max_moe_activation = None
+    max_moe_activation_per_layer = None
+    max_moe_activation_before_grad_w2 = None
+    max_moe_activation_before_grad_w2_per_layer = None
+    max_moe_grad_y_before_grad_w2 = None
+    max_moe_grad_y_before_grad_w2_per_layer = None
+    mean_moe_activation_before_grad_w2 = None
+    std_moe_activation_before_grad_w2 = None
+    mean_moe_activation_before_grad_w2_per_layer = None
+    std_moe_activation_before_grad_w2_per_layer = None
+    mean_moe_grad_y_before_grad_w2 = None
+    std_moe_grad_y_before_grad_w2 = None
+    mean_moe_grad_y_before_grad_w2_per_layer = None
+    std_moe_grad_y_before_grad_w2_per_layer = None
+    max_w2_grad_ref_fp8_rel_l2 = None
+    if args.monitor_moe_activation_max:
+        (
+            max_moe_activation,
+            max_moe_activation_per_layer,
+            max_moe_activation_before_grad_w2,
+            max_moe_activation_before_grad_w2_per_layer,
+            max_moe_grad_y_before_grad_w2,
+            max_moe_grad_y_before_grad_w2_per_layer,
+            mean_moe_activation_before_grad_w2,
+            std_moe_activation_before_grad_w2,
+            mean_moe_activation_before_grad_w2_per_layer,
+            std_moe_activation_before_grad_w2_per_layer,
+            mean_moe_grad_y_before_grad_w2,
+            std_moe_grad_y_before_grad_w2,
+            mean_moe_grad_y_before_grad_w2_per_layer,
+            std_moe_grad_y_before_grad_w2_per_layer,
+            max_w2_grad_ref_fp8_rel_l2,
+        ) = _collect_max_moe_activation(model)
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
@@ -1982,8 +2275,47 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             grad_norm,
             num_zeros_in_grad,
             log_max_attention_logit,
+            max_moe_activation,
+            max_moe_activation_per_layer,
+            max_moe_activation_before_grad_w2,
+            max_moe_activation_before_grad_w2_per_layer,
+            max_moe_grad_y_before_grad_w2,
+            max_moe_grad_y_before_grad_w2_per_layer,
+            mean_moe_activation_before_grad_w2,
+            std_moe_activation_before_grad_w2,
+            mean_moe_activation_before_grad_w2_per_layer,
+            std_moe_activation_before_grad_w2_per_layer,
+            mean_moe_grad_y_before_grad_w2,
+            std_moe_grad_y_before_grad_w2,
+            mean_moe_grad_y_before_grad_w2_per_layer,
+            std_moe_grad_y_before_grad_w2_per_layer,
+            max_w2_grad_ref_fp8_rel_l2,
         )
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
+    return (
+        {},
+        skipped_iter,
+        should_checkpoint,
+        should_exit,
+        exit_code,
+        grad_norm,
+        num_zeros_in_grad,
+        log_max_attention_logit,
+        max_moe_activation,
+        max_moe_activation_per_layer,
+        max_moe_activation_before_grad_w2,
+        max_moe_activation_before_grad_w2_per_layer,
+        max_moe_grad_y_before_grad_w2,
+        max_moe_grad_y_before_grad_w2_per_layer,
+        mean_moe_activation_before_grad_w2,
+        std_moe_activation_before_grad_w2,
+        mean_moe_activation_before_grad_w2_per_layer,
+        std_moe_activation_before_grad_w2_per_layer,
+        mean_moe_grad_y_before_grad_w2,
+        std_moe_grad_y_before_grad_w2,
+        mean_moe_grad_y_before_grad_w2_per_layer,
+        std_moe_grad_y_before_grad_w2_per_layer,
+        max_w2_grad_ref_fp8_rel_l2,
+    )
 
 
 def training_log(
@@ -1998,6 +2330,21 @@ def training_log(
     params_norm,
     num_zeros_in_grad,
     max_attention_logit,
+    max_moe_activation,
+    max_moe_activation_per_layer,
+    max_moe_activation_before_grad_w2,
+    max_moe_activation_before_grad_w2_per_layer,
+    max_moe_grad_y_before_grad_w2,
+    max_moe_grad_y_before_grad_w2_per_layer,
+    mean_moe_activation_before_grad_w2,
+    std_moe_activation_before_grad_w2,
+    mean_moe_activation_before_grad_w2_per_layer,
+    std_moe_activation_before_grad_w2_per_layer,
+    mean_moe_grad_y_before_grad_w2,
+    std_moe_grad_y_before_grad_w2,
+    mean_moe_grad_y_before_grad_w2_per_layer,
+    std_moe_grad_y_before_grad_w2_per_layer,
+    max_w2_grad_ref_fp8_rel_l2,
     pg_collection=None,
     is_first_iteration=False,
 ):
@@ -2166,6 +2513,92 @@ def training_log(
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
+        if args.monitor_moe_activation_max and max_moe_activation is not None:
+            wandb_metrics = {}
+
+            def _log_monitor_scalar(tag, value):
+                if value is None or not torch.isfinite(value).all().item():
+                    return
+                writer.add_scalar(tag, value, iteration)
+                wandb_metrics[tag] = value
+
+            def _log_monitor_per_layer(prefix, values):
+                if values is None:
+                    return
+                layer_indices = torch.nonzero(torch.isfinite(values), as_tuple=False).flatten().tolist()
+                for layer_idx in layer_indices:
+                    tag = f'{prefix}/layer_{layer_idx + 1:03d}'
+                    value = values[layer_idx]
+                    writer.add_scalar(tag, value, iteration)
+                    wandb_metrics[tag] = value
+
+            writer.add_scalar('max_moe_activation', max_moe_activation, iteration)
+            wandb_metrics['max_moe_activation'] = max_moe_activation
+
+            if max_moe_activation_per_layer is not None:
+                layer_indices = torch.nonzero(
+                    torch.isfinite(max_moe_activation_per_layer), as_tuple=False
+                ).flatten().tolist()
+                for layer_idx in layer_indices:
+                    tag = f'max_moe_activation/layer_{layer_idx + 1:03d}'
+                    value = max_moe_activation_per_layer[layer_idx]
+                    writer.add_scalar(tag, value, iteration)
+                    wandb_metrics[tag] = value
+
+            _log_monitor_scalar(
+                'max_moe_activation_before_grad_w2',
+                max_moe_activation_before_grad_w2,
+            )
+
+            _log_monitor_per_layer(
+                'max_moe_activation_before_grad_w2',
+                max_moe_activation_before_grad_w2_per_layer,
+            )
+
+            _log_monitor_scalar(
+                'max_moe_grad_y_before_grad_w2',
+                max_moe_grad_y_before_grad_w2,
+            )
+
+            _log_monitor_per_layer(
+                'max_moe_grad_y_before_grad_w2',
+                max_moe_grad_y_before_grad_w2_per_layer,
+            )
+
+            for tag, value in (
+                (
+                    'mean_moe_activation_before_grad_w2',
+                    mean_moe_activation_before_grad_w2,
+                ),
+                ('std_moe_activation_before_grad_w2', std_moe_activation_before_grad_w2),
+                ('mean_moe_grad_y_before_grad_w2', mean_moe_grad_y_before_grad_w2),
+                ('std_moe_grad_y_before_grad_w2', std_moe_grad_y_before_grad_w2),
+                ('max_w2_grad_ref_fp8_rel_l2', max_w2_grad_ref_fp8_rel_l2),
+            ):
+                _log_monitor_scalar(tag, value)
+
+            for prefix, values in (
+                (
+                    'mean_moe_activation_before_grad_w2',
+                    mean_moe_activation_before_grad_w2_per_layer,
+                ),
+                (
+                    'std_moe_activation_before_grad_w2',
+                    std_moe_activation_before_grad_w2_per_layer,
+                ),
+                (
+                    'mean_moe_grad_y_before_grad_w2',
+                    mean_moe_grad_y_before_grad_w2_per_layer,
+                ),
+                (
+                    'std_moe_grad_y_before_grad_w2',
+                    std_moe_grad_y_before_grad_w2_per_layer,
+                ),
+            ):
+                _log_monitor_per_layer(prefix, values)
+
+            if wandb_writer and wandb_metrics:
+                wandb_writer.log(wandb_metrics, iteration)
 
     # Log MoE metrics.
     if args.num_experts is not None:
@@ -3076,6 +3509,21 @@ def train(
             grad_norm = 0.0
             num_zeros_in_grad = 0
             max_attention_logit = None
+            max_moe_activation = None
+            max_moe_activation_per_layer = None
+            max_moe_activation_before_grad_w2 = None
+            max_moe_activation_before_grad_w2_per_layer = None
+            max_moe_grad_y_before_grad_w2 = None
+            max_moe_grad_y_before_grad_w2_per_layer = None
+            mean_moe_activation_before_grad_w2 = None
+            std_moe_activation_before_grad_w2 = None
+            mean_moe_activation_before_grad_w2_per_layer = None
+            std_moe_activation_before_grad_w2_per_layer = None
+            mean_moe_grad_y_before_grad_w2 = None
+            std_moe_grad_y_before_grad_w2 = None
+            mean_moe_grad_y_before_grad_w2_per_layer = None
+            std_moe_grad_y_before_grad_w2_per_layer = None
+            max_w2_grad_ref_fp8_rel_l2 = None
         else:
             ft_integration.on_training_step_start()
             (
@@ -3087,6 +3535,21 @@ def train(
                 grad_norm,
                 num_zeros_in_grad,
                 max_attention_logit,
+                max_moe_activation,
+                max_moe_activation_per_layer,
+                max_moe_activation_before_grad_w2,
+                max_moe_activation_before_grad_w2_per_layer,
+                max_moe_grad_y_before_grad_w2,
+                max_moe_grad_y_before_grad_w2_per_layer,
+                mean_moe_activation_before_grad_w2,
+                std_moe_activation_before_grad_w2,
+                mean_moe_activation_before_grad_w2_per_layer,
+                std_moe_activation_before_grad_w2_per_layer,
+                mean_moe_grad_y_before_grad_w2,
+                std_moe_grad_y_before_grad_w2,
+                mean_moe_grad_y_before_grad_w2_per_layer,
+                std_moe_grad_y_before_grad_w2_per_layer,
+                max_w2_grad_ref_fp8_rel_l2,
             ) = train_step(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
             )
@@ -3203,6 +3666,21 @@ def train(
             params_norm,
             num_zeros_in_grad,
             max_attention_logit,
+            max_moe_activation,
+            max_moe_activation_per_layer,
+            max_moe_activation_before_grad_w2,
+            max_moe_activation_before_grad_w2_per_layer,
+            max_moe_grad_y_before_grad_w2,
+            max_moe_grad_y_before_grad_w2_per_layer,
+            mean_moe_activation_before_grad_w2,
+            std_moe_activation_before_grad_w2,
+            mean_moe_activation_before_grad_w2_per_layer,
+            std_moe_activation_before_grad_w2_per_layer,
+            mean_moe_grad_y_before_grad_w2,
+            std_moe_grad_y_before_grad_w2,
+            mean_moe_grad_y_before_grad_w2_per_layer,
+            std_moe_grad_y_before_grad_w2_per_layer,
+            max_w2_grad_ref_fp8_rel_l2,
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
         )

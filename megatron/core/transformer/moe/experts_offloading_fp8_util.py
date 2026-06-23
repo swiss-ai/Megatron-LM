@@ -7,7 +7,10 @@ Utilities for MoE experts offloading with FP8 support, including:
 from __future__ import annotations
 
 import itertools
+import os
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -44,6 +47,155 @@ from megatron.core.fusions.fused_polynorm_glu import (
     fused_polynorm_glu_forward,
     fused_polynorm_glu_backward,
 )
+from megatron.core.transformer.moe.experts_fp8_util import (
+    ExpertsFP8GroupedSwiMLP
+)
+
+_W2_GRAD_REL_L2_ABORT_THRESHOLD = 100.0
+_W2_GRAD_REL_L2_ABORT_THRESHOLD_ENV = "MEGATRON_MOE_W2_GRAD_REL_L2_ABORT_THRESHOLD"
+_W2_GRAD_REL_L2_DUMP_DIR_ENV = "MEGATRON_MOE_W2_GRAD_REL_L2_DUMP_DIR"
+
+
+def _record_activation_monitor_max(
+    activation_monitor: dict | None,
+    name: str,
+    value: torch.Tensor | None,
+) -> None:
+    """Record a detached device-side maximum into a mutable monitor dictionary."""
+    if activation_monitor is None or value is None or value.numel() == 0:
+        return
+    max_value = value.detach().amax().float()
+    previous = activation_monitor.get(name)
+    if previous is None:
+        activation_monitor[name] = max_value
+    else:
+        activation_monitor[name] = torch.maximum(previous, max_value)
+
+
+def _record_activation_monitor_stats(
+    activation_monitor: dict | None,
+    name: str,
+    value: torch.Tensor | None,
+) -> None:
+    """Record detached device-side max/sum/sum_sq/count for one monitored tensor."""
+    if activation_monitor is None or value is None or value.numel() == 0:
+        return
+
+    detached = value.detach().float()
+    _record_activation_monitor_max(activation_monitor, f"max_{name}", detached)
+
+    stat_updates = {
+        f"sum_{name}": detached.sum(),
+        f"sum_sq_{name}": detached.square().sum(),
+        f"count_{name}": torch.full(
+            (), detached.numel(), dtype=torch.float32, device=detached.device
+        ),
+    }
+    for stat_name, stat_value in stat_updates.items():
+        previous = activation_monitor.get(stat_name)
+        if previous is None:
+            activation_monitor[stat_name] = stat_value
+        else:
+            activation_monitor[stat_name] = previous + stat_value
+
+
+def _relative_l2_norm(actual: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    ref_l2 = torch.linalg.vector_norm(reference.float())
+    return torch.linalg.vector_norm((actual - reference).float()) / torch.clamp(
+        ref_l2, min=torch.finfo(torch.float32).tiny
+    )
+
+
+def _w2_grad_rel_l2_abort_threshold() -> float:
+    threshold = os.environ.get(_W2_GRAD_REL_L2_ABORT_THRESHOLD_ENV)
+    if threshold is None:
+        return _W2_GRAD_REL_L2_ABORT_THRESHOLD
+    try:
+        return float(threshold)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_W2_GRAD_REL_L2_ABORT_THRESHOLD_ENV} must be a float, got {threshold!r}"
+        ) from exc
+
+
+def _debug_dump_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    try:
+        return int(os.environ.get("RANK", "0"))
+    except ValueError:
+        return 0
+
+
+def _make_w2_grad_rel_l2_dump_dir() -> Path:
+    dump_dir = Path(os.environ.get(_W2_GRAD_REL_L2_DUMP_DIR_ENV, "moe_w2_grad_rel_l2_dumps"))
+    try:
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        return dump_dir
+    except OSError:
+        fallback = Path("/tmp/moe_w2_grad_rel_l2_dumps")
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+def _detach_to_cpu(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.detach().cpu()
+
+
+def _detach_to_cpu_optional(tensor: torch.Tensor | None) -> torch.Tensor | None:
+    return None if tensor is None else tensor.detach().cpu()
+
+
+def _save_w2_grad_rel_l2_debug_tensors(
+    *,
+    rel_l2: torch.Tensor,
+    threshold: float,
+    grad_y: torch.Tensor,
+    fc1_output: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    permuted_probs: torch.Tensor,
+    config: OffloadingFP8Config,
+    fp8_w2_grad: torch.Tensor,
+    ref_w2_grad: torch.Tensor,
+    a1: torch.Tensor | None = None,
+    a2: torch.Tensor | None = None,
+) -> Path:
+    dump_dir = _make_w2_grad_rel_l2_dump_dir()
+    rank = _debug_dump_rank()
+    path = dump_dir / (
+        f"w2_grad_rel_l2_rank{rank}_pid{os.getpid()}_{time.time_ns()}.pt"
+    )
+    torch.save(
+        {
+            "rel_l2": _detach_to_cpu(rel_l2.float()),
+            "threshold": threshold,
+            "grad_y": _detach_to_cpu(grad_y),
+            "fc1_output": _detach_to_cpu(fc1_output),
+            "tokens_per_expert": _detach_to_cpu(tokens_per_expert),
+            # Per-token router probability used to scale the activation ``s``.
+            # Needed to replay the dumped grad_w2 exactly.
+            "permuted_probs": _detach_to_cpu(permuted_probs),
+            # The training-time grads whose relative-L2 tripped the guard. A clean
+            # offline replay should reproduce these from the saved operands; a
+            # mismatch points to runtime corruption (stream race / buffer reuse).
+            "fp8_w2_grad": _detach_to_cpu(fp8_w2_grad),
+            "ref_w2_grad": _detach_to_cpu(ref_w2_grad),
+            # PolyNorm-GLU per-token coefficients (None for SwiGLU). Needed to
+            # recompute the activation ``s`` when replaying the dumped grad_w2.
+            "a1": _detach_to_cpu_optional(a1),
+            "a2": _detach_to_cpu_optional(a2),
+            "metadata": {
+                "rank": rank,
+                "hidden_size": config.hidden_size,
+                "moe_ffn_hidden_size": config.moe_ffn_hidden_size,
+                "fc1_out_size": config.fc1_out_size,
+                "gated_polynorm_linear_unit": config.gated_polynorm_linear_unit,
+            },
+        },
+        path,
+    )
+    return path
+
 
 @dataclass(frozen=True)
 class OffloadingFP8Config:
@@ -71,6 +223,7 @@ class OffloadingFP8Config:
     moe_offloading_num_stages: int = 1
     moe_offloading_experts_debug_mode: bool = False
     moe_use_extra_fp8_param_storage: bool = False
+    monitor_moe_activation_max: bool = False
 
     # recomputation
     recompute_granularity: str = "selective"
@@ -108,6 +261,7 @@ class OffloadingFP8Config:
             moe_offloading_num_stages=config.moe_offloading_num_stages,
             moe_offloading_experts_debug_mode=config.moe_offloading_experts_debug_mode,
             moe_use_extra_fp8_param_storage=config.moe_use_extra_fp8_param_storage,
+            monitor_moe_activation_max=config.monitor_moe_activation_max,
             recompute_granularity=config.recompute_granularity,
             recompute_modules=config.recompute_modules,
             delay_wgrad_compute=config.delay_wgrad_compute,
@@ -673,7 +827,11 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             # update current buffer metadata
             curr_buffer_metadata = next_buffer_metadata if chunk_idx + 1 < config.moe_offloading_num_chunks else None
         
-        return fc2_output, fp8_s, inv if config.gated_polynorm_linear_unit else None
+        max_activation = None
+        if config.monitor_moe_activation_max and s.numel() > 0:
+            # Measure BF16 `s` before quantization rather than the FP8 tensor consumed by FC2.
+            max_activation = s.detach().amax().float()
+        return fc2_output, max_activation, inv if config.gated_polynorm_linear_unit else None
 
 
     @classmethod
@@ -845,6 +1003,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         fuse_gradient_accumulation: bool = False,
         a1: torch.Tensor = None,
         a2: torch.Tensor = None,
+        activation_monitor: dict | None = None,
     ):
         """
         dw2 [h, H] = grad_y.T [h, m] @ s.T [H, m]
@@ -856,6 +1015,10 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             )
         else:
             s = swiglu_forward(a, permuted_probs.unsqueeze(-1))
+        if config.monitor_moe_activation_max:
+            _record_activation_monitor_stats(
+                activation_monitor, "activation_before_grad_w2", s
+            )
         fp8_s = guarded_per_channel_cast_to_fp8_pack_kmajor(
             s, tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum,
             name="w2_s", config=config, gran_k=128, free_input=True,
@@ -993,22 +1156,23 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         a1: torch.Tensor = args[0]
         a2: torch.Tensor = args[1]
         
-        cpu_w1: torch.nn.Parameter =  args[-16]
-        cpu_w2: torch.nn.Parameter =  args[-15]
-        cpu_w1_list: list[torch.Tensor] = args[-14]
-        cpu_w2_list: list[torch.Tensor] = args[-13]
-        gpu_w1_buffers: list[torch.Tensor] = args[-12]
-        gpu_w2_buffers: list[torch.Tensor] = args[-11]
-        gpu_w1_chunks: list[torch.Tensor] = args[-10]
-        gpu_w2_chunks: list[torch.Tensor] = args[-9]
-        permuted_local_hidden_states: torch.Tensor = args[-8]
-        tokens_per_expert: torch.Tensor = args[-7]
-        num_local_experts: int = args[-6]
-        permuted_probs: torch.Tensor = args[-5]
-        expert_wgrad_scheduler: ExpertsWgradScheduler = args[-4]
-        stream_manager: StreamManager = args[-3]
-        config: OffloadingFP8Config = args[-2]
-        wgrad_accumulation_and_reduce_hooks: list = args[-1]
+        cpu_w1: torch.nn.Parameter =  args[-17]
+        cpu_w2: torch.nn.Parameter =  args[-16]
+        cpu_w1_list: list[torch.Tensor] = args[-15]
+        cpu_w2_list: list[torch.Tensor] = args[-14]
+        gpu_w1_buffers: list[torch.Tensor] = args[-13]
+        gpu_w2_buffers: list[torch.Tensor] = args[-12]
+        gpu_w1_chunks: list[torch.Tensor] = args[-11]
+        gpu_w2_chunks: list[torch.Tensor] = args[-10]
+        permuted_local_hidden_states: torch.Tensor = args[-9]
+        tokens_per_expert: torch.Tensor = args[-8]
+        num_local_experts: int = args[-7]
+        permuted_probs: torch.Tensor = args[-6]
+        expert_wgrad_scheduler: ExpertsWgradScheduler = args[-5]
+        stream_manager: StreamManager = args[-4]
+        config: OffloadingFP8Config = args[-3]
+        wgrad_accumulation_and_reduce_hooks: list = args[-2]
+        activation_monitor: dict | None = args[-1]
         fp8_parameter_manager: FP8ExpertsParameterManager = FP8ExpertsParameterManager.get_instance()
         fp8_parameter_manager.config = config
 
@@ -1052,7 +1216,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         )
 
         # activation and forward for the second linear layer
-        y, _, inv = OffloadingExpertsFP8GroupedSwiMLP.call_forward_y(
+        y, max_activation, inv = OffloadingExpertsFP8GroupedSwiMLP.call_forward_y(
             cpu_w2_list,
             gpu_w2_buffers,
             gpu_w2_chunks,
@@ -1067,6 +1231,10 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             a1,
             a2,
         )
+
+        if max_activation is not None:
+            # Keep the result on device to avoid a host synchronization.
+            ctx.mark_non_differentiable(max_activation)
 
         # context saving for polynorm GLU
         ctx.a1 = a1
@@ -1092,6 +1260,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         ctx.gpu_w2_chunks = gpu_w2_chunks
         ctx.stream_manager = stream_manager
         ctx.config = config
+        ctx.activation_monitor = activation_monitor
 
         activation_recompute = (
             config.recompute_granularity == 'selective'
@@ -1119,7 +1288,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 permuted_probs
             )
 
-        return y, None
+        return y, max_activation
 
 
 
@@ -1224,27 +1393,94 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         )
 
         # backward grad_w2 computation
-        fp8_grad_y_t = guarded_per_channel_cast_to_fp8_pack_kmajor(
-            grad_y, tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum,
-            name="w2_grad_y", config=config, gran_k=128, free_input=True,
-        )
-        OffloadingExpertsFP8GroupedSwiMLP.call_backward_grad_w2(
-            fp8_grad_y_t,
-            fc1_output,
-            cpu_w2,
-            tokens_per_expert_list,
-            tokens_per_expert_cuda,
-            tokens_per_expert_cumsum,
-            permuted_probs,
-            stream_manager,
-            ctx.num_local_experts,
-            config,
-            expert_wgrad_scheduler,
-            config.delay_wgrad_compute,
-            config.gradient_accumulation_fusion,
-            ctx.a1,
-            ctx.a2,
-        )
+        if config.monitor_moe_activation_max:
+            _record_activation_monitor_stats(
+                ctx.activation_monitor, "grad_y_before_grad_w2", grad_y
+            )
+        if config.monitor_moe_activation_max:
+            original_main_grad = cpu_w2.main_grad
+            original_base = original_main_grad.detach().clone()
+
+            fp8_w2_grad = torch.zeros_like(original_main_grad)
+            cpu_w2.main_grad = fp8_w2_grad
+            fp8_grad_y_t = guarded_per_channel_cast_to_fp8_pack_kmajor(
+                grad_y, tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum,
+                name="w2_grad_y", config=config, gran_k=128, free_input=False,
+            )
+            OffloadingExpertsFP8GroupedSwiMLP.call_backward_grad_w2(
+                fp8_grad_y_t,
+                fc1_output,
+                cpu_w2,
+                tokens_per_expert_list,
+                tokens_per_expert_cuda,
+                tokens_per_expert_cumsum,
+                permuted_probs,
+                stream_manager,
+                ctx.num_local_experts,
+                config,
+                None,
+                False,
+                config.gradient_accumulation_fusion,
+                ctx.a1,
+                ctx.a2,
+                ctx.activation_monitor,
+            )
+
+            ref_w2_grad = torch.zeros_like(original_main_grad)
+            cpu_w2.main_grad = ref_w2_grad
+            ExpertsFP8GroupedSwiMLP.call_backward_grad_w2_ref(
+                grad_y,
+                fc1_output,
+                cpu_w2,
+                permuted_probs,
+                tokens_per_expert,
+                config.gradient_accumulation_fusion,
+                config,
+                ctx.a1,
+                ctx.a2,
+            )
+            rel_l2 = _relative_l2_norm(fp8_w2_grad, ref_w2_grad)
+            _record_activation_monitor_max(
+                ctx.activation_monitor, "max_w2_grad_ref_fp8_rel_l2", rel_l2
+            )
+
+            cpu_w2.main_grad = original_main_grad
+            original_main_grad.copy_(original_base)
+            original_main_grad.add_(ref_w2_grad)
+
+            rel_l2_threshold = _w2_grad_rel_l2_abort_threshold()
+            rel_l2_value = rel_l2.detach().float().item()
+            if rel_l2_value > rel_l2_threshold:
+                dump_path = _save_w2_grad_rel_l2_debug_tensors(
+                    rel_l2=rel_l2,
+                    threshold=rel_l2_threshold,
+                    grad_y=grad_y,
+                    fc1_output=fc1_output,
+                    tokens_per_expert=tokens_per_expert,
+                    permuted_probs=permuted_probs,
+                    config=config,
+                    fp8_w2_grad=fp8_w2_grad,
+                    ref_w2_grad=ref_w2_grad,
+                    a1=ctx.a1,
+                    a2=ctx.a2,
+                )
+                raise RuntimeError(
+                    "w2 grad FP8/reference relative L2 "
+                    f"{rel_l2_value:.6e} exceeded threshold "
+                    f"{rel_l2_threshold:.6e}; dumped grad_y/fc1_output to {dump_path}"
+                )
+        else:
+            ExpertsFP8GroupedSwiMLP.call_backward_grad_w2_ref(
+                grad_y,
+                fc1_output,
+                cpu_w2,
+                permuted_probs,
+                tokens_per_expert,
+                config.gradient_accumulation_fusion,
+                config,
+                ctx.a1,
+                ctx.a2,
+            )
 
         # backward grad_w1 computation
         fp8_grad_a_t = per_channel_cast_to_fp8_pack_kmajor(
@@ -1283,7 +1519,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 hook_fn()
 
         # Leading grads correspond to the a1/a2 PolyNorm coefficient inputs (None for SwiGLU)
-        return grad_a1, grad_a2, grad_w1_ret, grad_w2_ret, None, None, None, None, None, None, grad_x, None, None, grad_probs, None, None, None, None
+        return grad_a1, grad_a2, grad_w1_ret, grad_w2_ret, None, None, None, None, None, None, grad_x, None, None, grad_probs, None, None, None, None, None
 
 
 
@@ -1308,7 +1544,9 @@ def offloading_fp8_grouped_swiglu_mlp(
     wgrad_accumulation_and_reduce_hooks: list,
     a1: torch.Tensor = None,
     a2: torch.Tensor = None,
-) -> torch.Tensor:
+    activation_monitor: dict | None = None,
+    return_max_activation: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """Autograd function for Offloading Experts Grouped SwiGLU MLP.
 
     Args:
@@ -1327,7 +1565,7 @@ def offloading_fp8_grouped_swiglu_mlp(
     Returns:
         torch.Tensor: output of the MLP
     """
-    output, _ = OffloadingExpertsFP8GroupedSwiMLP.apply(
+    output, max_activation = OffloadingExpertsFP8GroupedSwiMLP.apply(
         a1,
         a2,
         cpu_w1,
@@ -1345,7 +1583,10 @@ def offloading_fp8_grouped_swiglu_mlp(
         expert_wgrad_scheduler,
         stream_manager,
         config,
-        wgrad_accumulation_and_reduce_hooks
+        wgrad_accumulation_and_reduce_hooks,
+        activation_monitor,
     )
 
+    if return_max_activation:
+        return output, max_activation
     return output

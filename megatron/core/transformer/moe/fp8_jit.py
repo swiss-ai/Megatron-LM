@@ -558,7 +558,9 @@ def _per_channel_cast_to_fp8_kernel(
     # (a denormal sf otherwise saturates the column to 448 and turns exact zeros
     # into 0*inf = NaN). See _pack_kmajor_per_channel_fp8_kernel for details.
     sf = row_amax / 448.0
-    sf = tl.where(sf == 0.0, 1.0, sf)
+
+    # NOTE
+    sf = tl.where(sf == 0.0, 1e-30, sf)
     sf = tl.maximum(sf, 1e-30)
     if use_ue8m0:
         sf = _ceil_to_ue8m0(sf)
@@ -757,7 +759,9 @@ def _pack_kmajor_per_channel_fp8_kernel(
         row_amax = tl.maximum(row_amax, tl.max(tl.abs(x), axis=0))
 
     sf = row_amax / 448.0
-    sf = tl.where(sf == 0.0, 1.0, sf)
+
+    # NOTE
+    sf = tl.where(sf == 0.0, 1e-30, sf)
     # Guard the fp32 reciprocal. If a channel's amax is tiny but nonzero, sf
     # underflows to a denormal and inv_sf = 1/sf overflows to +inf. After that
     # the amax element saturates to 448 (the whole per-channel spread collapses
@@ -766,7 +770,7 @@ def _pack_kmajor_per_channel_fp8_kernel(
     # surface as an exploding grad norm. The 1e-30 floor keeps inv_sf finite and
     # normal while only touching channels whose amax < ~4.5e-28, i.e. ~18 orders
     # of magnitude below the training activation scale (negligible).
-    sf = tl.maximum(sf, 1e-7)
+    sf = tl.maximum(sf, 1e-30)
     if use_ue8m0:
         sf = _ceil_to_ue8m0(sf)
     inv_sf = 1.0 / sf

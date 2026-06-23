@@ -1239,6 +1239,25 @@ class OffloadingExpertsMLP(MegatronModule):
         # store hooks after wgrad reduce
         self.wgrad_accumulation_and_reduce_hooks = []
 
+        # Transient device-side monitoring state. This is deliberately not a registered buffer,
+        # so it is not moved with parameters or included in checkpoints.
+        self.current_max_activation: Optional[torch.Tensor] = None
+        self.current_max_activation_before_grad_w2: Optional[torch.Tensor] = None
+        self.current_max_grad_y_before_grad_w2: Optional[torch.Tensor] = None
+        self.current_max_w2_grad_ref_fp8_rel_l2: Optional[torch.Tensor] = None
+        self.activation_monitor_state = {
+            "max_activation_before_grad_w2": None,
+            "max_grad_y_before_grad_w2": None,
+            "max_w2_grad_ref_fp8_rel_l2": None,
+            "sum_activation_before_grad_w2": None,
+            "sum_sq_activation_before_grad_w2": None,
+            "count_activation_before_grad_w2": None,
+            "sum_grad_y_before_grad_w2": None,
+            "sum_sq_grad_y_before_grad_w2": None,
+            "count_grad_y_before_grad_w2": None,
+        }
+        self.layer_number: Optional[int] = None
+
         # padding function
         if self.config.moe_use_inplace_fp8_param:
             self.quantization_padding = Fp8Padding(self.num_local_experts, 128)
@@ -1393,6 +1412,136 @@ class OffloadingExpertsMLP(MegatronModule):
         a2 = torch.repeat_interleave(torch.abs(self.polynorm_glu.alpha_2), tpe_tensor)
         return a1, a2
 
+    def set_layer_number(self, layer_number: int) -> None:
+        """Set the 1-indexed transformer layer number for per-layer monitoring."""
+        self.layer_number = layer_number
+
+    def _record_max_activation(self, max_activation: Optional[torch.Tensor]) -> None:
+        """Accumulate a detached activation maximum without synchronizing with the host."""
+        if max_activation is None:
+            return
+        max_activation = max_activation.detach()
+        if self.current_max_activation is None:
+            self.current_max_activation = max_activation
+        else:
+            self.current_max_activation = torch.maximum(
+                self.current_max_activation, max_activation
+            )
+
+    def _record_activation_before_grad_w2(self) -> None:
+        """Accumulate the max activation captured immediately before w2 wgrad compute."""
+        max_activation = self.activation_monitor_state.get("max_activation_before_grad_w2")
+        if max_activation is None:
+            return
+        max_activation = max_activation.detach()
+        self.activation_monitor_state["max_activation_before_grad_w2"] = None
+        if self.current_max_activation_before_grad_w2 is None:
+            self.current_max_activation_before_grad_w2 = max_activation
+        else:
+            self.current_max_activation_before_grad_w2 = torch.maximum(
+                self.current_max_activation_before_grad_w2, max_activation
+            )
+
+    def _record_grad_y_before_grad_w2(self) -> None:
+        """Accumulate the max grad_y captured immediately before w2 wgrad compute."""
+        max_grad_y = self.activation_monitor_state.get("max_grad_y_before_grad_w2")
+        if max_grad_y is None:
+            return
+        max_grad_y = max_grad_y.detach()
+        self.activation_monitor_state["max_grad_y_before_grad_w2"] = None
+        if self.current_max_grad_y_before_grad_w2 is None:
+            self.current_max_grad_y_before_grad_w2 = max_grad_y
+        else:
+            self.current_max_grad_y_before_grad_w2 = torch.maximum(
+                self.current_max_grad_y_before_grad_w2, max_grad_y
+            )
+
+    def _record_monitor_max(self, state_name: str, attr_name: str) -> None:
+        value = self.activation_monitor_state.get(state_name)
+        if value is None:
+            return
+        value = value.detach()
+        self.activation_monitor_state[state_name] = None
+        current = getattr(self, attr_name)
+        if current is None:
+            setattr(self, attr_name, value)
+        else:
+            setattr(self, attr_name, torch.maximum(current, value))
+
+    def _consume_monitor_stats(
+        self, name: str, reset: bool = False
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        sum_key = f"sum_{name}"
+        sum_sq_key = f"sum_sq_{name}"
+        count_key = f"count_{name}"
+        total = self.activation_monitor_state.get(sum_key)
+        total_sq = self.activation_monitor_state.get(sum_sq_key)
+        count = self.activation_monitor_state.get(count_key)
+        if total is None or total_sq is None or count is None:
+            return None
+        if reset:
+            self.activation_monitor_state[sum_key] = None
+            self.activation_monitor_state[sum_sq_key] = None
+            self.activation_monitor_state[count_key] = None
+        return total.detach(), total_sq.detach(), count.detach()
+
+    def _consume_monitored_result(self, result):
+        """Record an optional monitor result and return the expert output tensor."""
+        if not self.config.monitor_moe_activation_max:
+            return result
+        output, max_activation = result
+        self._record_max_activation(max_activation)
+        return output
+
+    def get_max_activation(self, reset: bool = False) -> Optional[torch.Tensor]:
+        """Return the accumulated post-SwiGLU maximum, optionally clearing the monitor."""
+        max_activation = self.current_max_activation
+        if reset:
+            self.current_max_activation = None
+        return max_activation
+
+    def get_max_activation_before_grad_w2(
+        self, reset: bool = False
+    ) -> Optional[torch.Tensor]:
+        """Return the accumulated activation maximum captured before w2 wgrad compute."""
+        self._record_activation_before_grad_w2()
+        max_activation = self.current_max_activation_before_grad_w2
+        if reset:
+            self.current_max_activation_before_grad_w2 = None
+        return max_activation
+
+    def get_max_grad_y_before_grad_w2(
+        self, reset: bool = False
+    ) -> Optional[torch.Tensor]:
+        """Return the accumulated grad_y maximum captured before w2 wgrad compute."""
+        self._record_grad_y_before_grad_w2()
+        max_grad_y = self.current_max_grad_y_before_grad_w2
+        if reset:
+            self.current_max_grad_y_before_grad_w2 = None
+        return max_grad_y
+
+    def get_activation_stats_before_grad_w2(
+        self, reset: bool = False
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Return raw activation stats captured before w2 wgrad compute."""
+        return self._consume_monitor_stats("activation_before_grad_w2", reset=reset)
+
+    def get_grad_y_stats_before_grad_w2(
+        self, reset: bool = False
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Return raw grad_y stats captured before w2 wgrad compute."""
+        return self._consume_monitor_stats("grad_y_before_grad_w2", reset=reset)
+
+    def get_max_w2_grad_ref_fp8_rel_l2(self, reset: bool = False) -> Optional[torch.Tensor]:
+        """Return the accumulated relative L2 difference between FP8 and reference w2 grads."""
+        self._record_monitor_max(
+            "max_w2_grad_ref_fp8_rel_l2", "current_max_w2_grad_ref_fp8_rel_l2"
+        )
+        value = self.current_max_w2_grad_ref_fp8_rel_l2
+        if reset:
+            self.current_max_w2_grad_ref_fp8_rel_l2 = None
+        return value
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -1426,7 +1575,7 @@ class OffloadingExpertsMLP(MegatronModule):
                 # Per-token PolyNorm coefficients computation
                 a1, a2 = self._polynorm_glu_coeffs(tokens_per_expert_padded)
 
-                output = offloading_fp8_grouped_swiglu_mlp(
+                result = offloading_fp8_grouped_swiglu_mlp(
                     self.weight1,
                     self.weight2,
                     self.weight1_list,
@@ -1445,13 +1594,20 @@ class OffloadingExpertsMLP(MegatronModule):
                     self.wgrad_accumulation_and_reduce_hooks,
                     a1,
                     a2,
+                    activation_monitor=(
+                        self.activation_monitor_state
+                        if self.config.monitor_moe_activation_max
+                        else None
+                    ),
+                    return_max_activation=self.config.monitor_moe_activation_max,
                 )
+                output = self._consume_monitored_result(result)
 
                 output = self.quantization_unpadding(output, tokens_per_expert_list)
 
                 return output, None
             
-            output = offloading_grouped_swiglu_mlp(
+            result = offloading_grouped_swiglu_mlp(
                 self.weight1,
                 self.weight2,
                 self.experts1_gpu_buffers,
@@ -1466,7 +1622,7 @@ class OffloadingExpertsMLP(MegatronModule):
                 self.wgrad_accumulation_and_reduce_hooks,
             )
 
-            return output, None
+            return result, None
         else:
             if self.config.moe_offloading_experts_debug_mode:
                 return self._forward_debug(
@@ -1485,7 +1641,7 @@ class OffloadingExpertsMLP(MegatronModule):
                 # Empty input: counts sum to 0, so a1/a2 are length-0 (None on the SwiGLU path).
                 a1, a2 = self._polynorm_glu_coeffs(tokens_per_expert)
 
-                output = offloading_fp8_grouped_swiglu_mlp(
+                result = offloading_fp8_grouped_swiglu_mlp(
                     self.weight1,
                     self.weight2,
                     self.weight1_list,
@@ -1504,14 +1660,21 @@ class OffloadingExpertsMLP(MegatronModule):
                     self.wgrad_accumulation_and_reduce_hooks,
                     a1,
                     a2,
+                    activation_monitor=(
+                        self.activation_monitor_state
+                        if self.config.monitor_moe_activation_max
+                        else None
+                    ),
+                    return_max_activation=self.config.monitor_moe_activation_max,
                 )
+                output = self._consume_monitored_result(result)
 
                 return output, None
 
             # NOTE: it should be safe to pass empty tensor to the custom function,
             # but it will introduce meanless h2d transfer.
             # TODO: add cost free path for empty input
-            output = offloading_grouped_swiglu_mlp(
+            result = offloading_grouped_swiglu_mlp(
                 self.weight1,
                 self.weight2,
                 self.experts1_gpu_buffers,
@@ -1525,7 +1688,7 @@ class OffloadingExpertsMLP(MegatronModule):
                 self.config,
                 self.wgrad_accumulation_and_reduce_hooks,
             )
-            return output, None
+            return result, None
         
     def backward_dw(self):
         # Debug paths compute weight gradients during the regular backward pass.

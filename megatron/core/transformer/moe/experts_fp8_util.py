@@ -2,6 +2,11 @@ from __future__ import annotations
 import torch
 import itertools
 
+from megatron.core.fusions.fused_polynorm_glu import (
+    HAVE_TRITON as HAVE_FUSED_PNGLU,
+    MAX_FUSED_FEATURE_DIM,
+    fused_polynorm_glu_forward,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 from megatron.core.transformer.moe.experts_util import ExpertsWgradScheduler
@@ -21,6 +26,129 @@ from megatron.core.transformer.moe.swiglu_jit import (
     swiglu_forward,
     swiglu_backward,
 )
+
+
+def _expand_polynorm_coeffs(
+    a1: torch.Tensor,
+    a2: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    num_tokens: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if a1 is None or a2 is None:
+        raise ValueError("PNGLU activation requires both a1 and a2 coefficients.")
+
+    a1 = torch.abs(a1).reshape(-1).to(device=device)
+    a2 = torch.abs(a2).reshape(-1).to(device=device)
+    if a1.numel() != a2.numel():
+        raise ValueError(
+            f"PNGLU coefficient sizes must match, got {a1.numel()} and {a2.numel()}."
+        )
+    if a1.numel() == 1:
+        return a1.expand(num_tokens).contiguous(), a2.expand(num_tokens).contiguous()
+    if a1.numel() == num_tokens:
+        return a1.contiguous(), a2.contiguous()
+
+    tpe = (
+        tokens_per_expert.tolist()
+        if isinstance(tokens_per_expert, torch.Tensor)
+        else list(tokens_per_expert)
+    )
+    if a1.numel() == len(tpe):
+        if sum(tpe) != num_tokens:
+            raise ValueError(
+                f"tokens_per_expert sums to {sum(tpe)}, but fc1_output has {num_tokens} tokens."
+            )
+        repeats = torch.tensor(tpe, device=device, dtype=torch.long)
+        return (
+            torch.repeat_interleave(a1, repeats).contiguous(),
+            torch.repeat_interleave(a2, repeats).contiguous(),
+        )
+
+    raise ValueError(
+        "PNGLU coefficients must be scalar, per-token, or per-expert. "
+        f"Got {a1.numel()} coefficients for {num_tokens} tokens and {len(tpe)} experts."
+    )
+
+
+def _prepare_pnglu_fc1_output(
+    fc1_output: torch.Tensor, config: TransformerConfig | None
+) -> torch.Tensor:
+    if config is None:
+        return fc1_output
+
+    clamp_value = getattr(config, "activation_func_clamp_value", None)
+    linear_offset = getattr(config, "glu_linear_offset", 0.0)
+    if clamp_value is None and linear_offset == 0.0:
+        return fc1_output
+
+    x_glu, x_linear = torch.chunk(fc1_output, 2, dim=-1)
+    if clamp_value is not None:
+        x_glu = x_glu.clamp(min=None, max=clamp_value)
+        x_linear = x_linear.clamp(min=-clamp_value, max=clamp_value)
+    if linear_offset != 0.0:
+        x_linear = x_linear + linear_offset
+    return torch.cat((x_glu, x_linear), dim=-1)
+
+
+def _torch_polynorm_glu_forward(
+    fc1_output: torch.Tensor,
+    a1: torch.Tensor,
+    a2: torch.Tensor,
+    eps: float,
+    score: torch.Tensor | None,
+) -> torch.Tensor:
+    x_glu, x_linear = torch.chunk(fc1_output, 2, dim=-1)
+    output_dtype = x_linear.dtype
+    lead_shape = x_glu.shape[:-1]
+    coeff_shape = lead_shape + (1,)
+
+    x = x_glu.float()
+    x2 = x * x
+    norm_x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    norm_x2 = x2 * torch.rsqrt(x2.pow(2).mean(-1, keepdim=True) + eps)
+    gate = (
+        a1.float().view(coeff_shape) * norm_x
+        + a2.float().view(coeff_shape) * norm_x2
+    )
+    out = gate.to(output_dtype) * x_linear
+    if score is not None:
+        out = (out * score.reshape(-1).view(coeff_shape)).to(output_dtype)
+    return out
+
+
+def _activation_forward_ref(
+    fc1_output: torch.Tensor,
+    permuted_probs: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    config: TransformerConfig | None = None,
+    a1: torch.Tensor | None = None,
+    a2: torch.Tensor | None = None,
+) -> torch.Tensor:
+    use_pnglu = getattr(config, "pnglu", False) or a1 is not None or a2 is not None
+    if not use_pnglu:
+        return swiglu_forward(fc1_output, permuted_probs.unsqueeze(-1))
+
+    fc1_output = _prepare_pnglu_fc1_output(fc1_output, config)
+    num_tokens = fc1_output.reshape(-1, fc1_output.shape[-1]).shape[0]
+    a1, a2 = _expand_polynorm_coeffs(
+        a1, a2, tokens_per_expert, num_tokens, fc1_output.device
+    )
+    eps = getattr(config, "polynorm_eps", 1e-6)
+    score = permuted_probs.unsqueeze(-1) if permuted_probs is not None else None
+
+    use_fused = (
+        HAVE_FUSED_PNGLU
+        and fc1_output.is_cuda
+        and fc1_output.shape[-1] // 2 <= MAX_FUSED_FEATURE_DIM
+        and getattr(config, "pnglu_fusion", True)
+    )
+    if use_fused:
+        s, _ = fused_polynorm_glu_forward(fc1_output, a1, a2, eps, score)
+        return s
+
+    return _torch_polynorm_glu_forward(fc1_output, a1, a2, eps, score)
+
 
 class FP8GPUExpertsParameterManager:
     """Caches FP8-quantized expert weights for GPU-resident bf16 parameters.
@@ -472,14 +600,19 @@ class ExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         permuted_probs: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         fuse_gradient_accumulation: bool = False,
+        config: TransformerConfig | None = None,
+        a1: torch.Tensor | None = None,
+        a2: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """BF16 reference for ``call_backward_grad_w2``.
 
         dw2[e] = grad_y[e].T @ s[e], shape (h, H). If fuse_gradient_accumulation,
         accumulate into w2.main_grad in-place (matching the FP8 path).
+
+        If PNGLU is enabled on ``config`` or if ``a1``/``a2`` are provided, ``s`` is
+        recomputed with PNGLU. Coefficients may be scalar, per-token, or per-expert.
         """
-        s = swiglu_forward(a, permuted_probs.unsqueeze(-1))
-        # s = MergedSwiGLU.call_forward(a, permuted_probs.unsqueeze(-1))
+        s = _activation_forward_ref(a, permuted_probs, tokens_per_expert, config, a1, a2)
         E = w2.shape[0]
         tpe = tokens_per_expert.tolist()
         gy_chunks = cls._split_by_expert(grad_y, tpe)
