@@ -8,7 +8,12 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias, router_gating_linear
+from megatron.core.transformer.moe.moe_utils import (
+    get_updated_expert_bias,
+    qb_dual_update,
+    router_gating_linear,
+    topk_routing_with_score_function,
+)
 from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
@@ -23,6 +28,59 @@ try:
     HAVE_ROUTER_FUSION = _fused_topk_with_score_function is not None
 except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
+
+
+def test_qb_dual_update_uses_column_quantile():
+    scores = torch.tensor(
+        [
+            [0.1, 0.5, 0.2, 0.0],
+            [0.7, 0.3, 0.4, 0.2],
+            [0.6, 0.9, 0.1, 0.8],
+            [0.2, 0.4, 0.6, 0.3],
+            [0.9, 0.0, 0.5, 0.7],
+            [0.3, 0.8, 0.7, 0.4],
+        ],
+        dtype=torch.float32,
+    )
+    beta = torch.zeros(scores.shape[1], dtype=torch.float32)
+    topk = 2
+
+    indices, beta_local = qb_dual_update(scores, topk, beta)
+
+    topk_result = scores.topk(topk + 1, dim=1)
+    expected_indices = topk_result.indices[:, :-1]
+    alpha = topk_result.values[:, -1:]
+    col_target = scores.shape[0] * topk // scores.shape[1]
+    expected_beta = (scores - alpha).topk(col_target + 1, dim=0).values[-1]
+
+    torch.testing.assert_close(indices, expected_indices)
+    torch.testing.assert_close(beta_local, expected_beta)
+
+
+def test_topk_routing_uses_precomputed_indices_for_probs():
+    logits = torch.tensor(
+        [
+            [4.0, 1.0, 0.0],
+            [0.0, 3.0, 2.0],
+        ],
+        dtype=torch.float32,
+    )
+    precomputed_indices = torch.tensor([[2, 1], [0, 2]], dtype=torch.long)
+
+    probs, routing_map = topk_routing_with_score_function(
+        logits,
+        topk=2,
+        score_function="sigmoid",
+        precomputed_indices=precomputed_indices,
+    )
+
+    selected_scores = torch.gather(torch.sigmoid(logits), dim=1, index=precomputed_indices)
+    expected_probs = selected_scores / selected_scores.sum(dim=-1, keepdim=True)
+    expected_sparse_probs = torch.zeros_like(logits).scatter(1, precomputed_indices, expected_probs)
+    expected_routing_map = torch.zeros_like(logits).scatter(1, precomputed_indices, 1).bool()
+
+    torch.testing.assert_close(probs, expected_sparse_probs)
+    assert torch.equal(routing_map, expected_routing_map)
 
 
 class TestTop2Router:
