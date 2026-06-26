@@ -1,8 +1,9 @@
 """
-Maps BlendedDataset training steps back to original source documents.
+Maps BlendedDataset training steps back to original source documents and tokens.
 
 A single training sequence can span multiple documents (packed sequences), so
-this returns all source documents (parquet_path + parquet_row) per step.
+this returns all source documents (parquet_path + doc_key/parquet_row) and the
+exact token IDs that were fed to the model at each step.
 
 Lookup chain:
   step
@@ -11,7 +12,8 @@ Lookup chain:
     → GPTDataset sample_index             (datasets/cache/)
     → GPTDataset document_index           (datasets/cache/)
     → .meta.parquet sidecar               (alongside .bin files)
-    → (parquet_path, parquet_row)
+    → (parquet_path, doc_key|parquet_row)
+    → .bin / .idx indexed dataset         (actual token IDs)
 
 Usage:
     python3 scripts/tools/lookup_training_sample.py \
@@ -23,11 +25,83 @@ Usage:
 
 import argparse
 import json
+import struct
 import time
 from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
+
+
+# ── Indexed dataset reader ────────────────────────────────────────────────────
+
+_INDEX_HEADER = b"MMIDIDX\x00\x00"
+
+_DTYPE_MAP = {
+    1: np.uint8,
+    2: np.int8,
+    3: np.int16,
+    4: np.int32,
+    5: np.int64,
+    6: np.float32,
+    7: np.float64,
+    8: np.uint16,
+}
+
+
+class IndexedDatasetReader:
+    """Lightweight reader for a Megatron MMapIndexedDataset (.bin/.idx pair).
+
+    Keeps the .bin file memory-mapped for O(1) random token access.
+    """
+
+    def __init__(self, dataset_path: str) -> None:
+        idx_path = dataset_path + ".idx"
+        bin_path = dataset_path + ".bin"
+
+        with open(idx_path, "rb") as f:
+            assert f.read(9) == _INDEX_HEADER, f"Invalid .idx header: {idx_path}"
+            f.read(8)  # version
+            dtype_code = struct.unpack("<B", f.read(1))[0]
+            self.dtype = _DTYPE_MAP[dtype_code]
+            self.itemsize: int = self.dtype().itemsize
+            n_seqs = struct.unpack("<Q", f.read(8))[0]
+            struct.unpack("<Q", f.read(8))[0]  # n_docs (unused)
+            offset = f.tell()
+
+        idx_mmap = np.memmap(idx_path, mode="r", order="C")
+        buf = memoryview(idx_mmap)
+        self.sequence_lengths  = np.frombuffer(buf, dtype=np.int32, count=n_seqs, offset=offset)
+        self.sequence_pointers = np.frombuffer(
+            buf, dtype=np.int64, count=n_seqs,
+            offset=offset + self.sequence_lengths.nbytes,
+        )
+        self._bin = np.memmap(bin_path, dtype=self.dtype, mode="r")
+
+    def read_tokens(
+        self,
+        document_index: np.ndarray,
+        j_start: int,
+        k_start: int,
+        j_end: int,
+        k_end: int,
+        add_extra_token: int = 1,
+    ) -> list[int]:
+        """Return the exact token IDs for one packed training sample.
+
+        Mirrors GPTDataset.__getitem__: for each document j in [j_start, j_end],
+        read from k_start (first doc) or 0 (middle docs) to k_end+add_extra_token
+        (last doc) or end-of-document (middle docs).
+        """
+        parts: list[np.ndarray] = []
+        for j in range(j_start, j_end + 1):
+            doc_idx = int(document_index[j])
+            ptr_elem = int(self.sequence_pointers[doc_idx]) // self.itemsize
+            doc_len  = int(self.sequence_lengths[doc_idx])
+            tok_lo = k_start if j == j_start else 0
+            tok_hi = k_end + add_extra_token if j == j_end else doc_len
+            parts.append(self._bin[ptr_elem + tok_lo : ptr_elem + tok_hi])
+        return np.concatenate(parts).tolist() if parts else []
 
 
 class TrainingDataLookup:
@@ -40,9 +114,10 @@ class TrainingDataLookup:
         self.blend_sample_idx  = np.load(str(blend) + "-dataset_sample_index.npy", mmap_mode="r")
 
         # Populated on first access per dataset
-        self._gpt_prefix: dict[str, Path]  = {}
-        self._gpt_arrays: dict[int, tuple] = {}
-        self._meta:       dict[str, dict]  = {}
+        self._gpt_prefix: dict[str, Path]           = {}
+        self._gpt_arrays: dict[int, tuple]          = {}
+        self._meta:       dict[str, dict]           = {}
+        self._readers:    dict[str, IndexedDatasetReader] = {}
 
     def _find_gpt_prefix(self, dataset_path: str) -> Path:
         if dataset_path not in self._gpt_prefix:
@@ -66,6 +141,11 @@ class TrainingDataLookup:
                 np.load(str(p) + "-document_index.npy"),
             )
         return self._gpt_arrays[dataset_idx]
+
+    def _reader_for(self, dataset_path: str) -> IndexedDatasetReader:
+        if dataset_path not in self._readers:
+            self._readers[dataset_path] = IndexedDatasetReader(dataset_path)
+        return self._readers[dataset_path]
 
     def _meta_for(self, dataset_path: str) -> dict:
         if dataset_path not in self._meta:
@@ -98,7 +178,8 @@ class TrainingDataLookup:
 
             dataset_path = self.blend_desc["datasets"][unique_di]["dataset_path"]
             shuffle_index, sample_index, document_index = self._gpt_arrays_for(unique_di)
-            meta = self._meta_for(dataset_path)
+            meta   = self._meta_for(dataset_path)
+            reader = self._reader_for(dataset_path)
 
             pos_arr = shuffle_index[si]
             starts  = sample_index[pos_arr]
@@ -113,17 +194,22 @@ class TrainingDataLookup:
                 docs = []
                 for j in range(j_start, j_end + 1):
                     doc_idx = int(document_index[j])
-                    docs.append({
+                    entry = {
                         "doc_idx":      doc_idx,
                         "parquet_path": meta["parquet_path"][doc_idx],
-                        "parquet_row":  meta["parquet_row"][doc_idx],
-                    })
+                    }
+                    if "doc_key" in meta:
+                        entry["doc_key"] = meta["doc_key"][doc_idx]
+                    else:
+                        entry["parquet_row"] = meta["parquet_row"][doc_idx]
+                    docs.append(entry)
+
+                tokens = reader.read_tokens(document_index, j_start, k_start, j_end, k_end)
 
                 results[offset] = {
                     "step":         step_start + int(offset),
                     "dataset_path": dataset_path,
-                    "token_start":  (j_start, k_start),
-                    "token_end":    (j_end,   k_end),
+                    "tokens":       tokens,
                     "docs":         docs,
                 }
 

@@ -2,16 +2,20 @@
 Post-hoc provenance metadata generator.
 
 Reads the same parquet files that were tokenized and produces a .meta.parquet
-file for each .bin file, mapping doc_index → (parquet_path, parquet_row).
+file for each .bin file, mapping doc_index → (parquet_path, doc_key|parquet_row).
 
-parquet_row is the ABSOLUTE raw row index in the parquet file, enabling O(1)
-lookup: pq.read_table(parquet_path).slice(parquet_row, 1)
+Without --key-col: parquet_row is the ABSOLUTE raw row index in the parquet file,
+enabling O(1) lookup: pq.read_table(parquet_path).slice(parquet_row, 1)
+
+With --key-col: doc_key stores the value of the specified unique-identifier column
+from the original dataset (e.g. an HuggingFace dataset ID field), allowing
+provenance lookup via the dataset's own primary key rather than a positional index.
 
 Two-phase approach:
   Phase 1 — rebuild dump assignments by replicating prepare_dumps.py's greedy
              bin-packing (sort parquets by size descending, assign each to the
              smallest-so-far dump). The --filter-in and --filter-out parameters
-             can also be specified if those were used when initially creating the 
+             can also be specified if those were used when initially creating the
              dumps. This helps with getting the correct number of dumps for phase 2.
   Phase 2 — for each dump, stride-assign files to ranks (same as DataTrove)
              and emit .meta.parquet sidecars.
@@ -21,6 +25,13 @@ Usage:
         --tokenized-folder /path/to/datasets_tokenized/MyDataset \
         --data-folder /path/to/raw/MyDataset \
         --text-col text
+
+    # Map to a unique key column instead of a raw row index:
+    python3 scripts/generate_metadata.py \
+        --tokenized-folder /path/to/datasets_tokenized/MyDataset \
+        --data-folder /path/to/raw/MyDataset \
+        --text-col text \
+        --key-col id
 
     # With filters matching the original prepare_dumps.py call:
     python3 scripts/generate_metadata.py \
@@ -132,6 +143,7 @@ def generate_rank_metadata(
     text_col: str,
     output_folder: str,
     rehydrate: bool = False,
+    key_col: str | None = None,
 ) -> None:
     bin_path = os.path.join(tokenized_folder, f"{rank:05d}_tokens.bin")
     idx_path = os.path.join(tokenized_folder, f"{rank:05d}_tokens.idx")
@@ -145,10 +157,14 @@ def generate_rank_metadata(
 
     doc_indices: list[int] = []
     parquet_paths: list[str] = []
-    parquet_rows: list[int] = []
+    # Stores parquet row indices (no key_col) or unique key values (key_col set)
+    id_values: list = []
 
     doc_index = 0
     read_cols = [text_col] + (["minhash_cluster_size"] if rehydrate else [])
+    if key_col and key_col not in read_cols:
+        read_cols.append(key_col)
+
     for relative_path in assigned:
         abs_path = os.path.abspath(os.path.join(data_folder, relative_path))
         table = pq.read_table(abs_path, columns=read_cols)
@@ -156,20 +172,24 @@ def generate_rank_metadata(
         non_empty_mask = pc.greater(pc.utf8_length(table.column(text_col)), 0)
         raw_rows = np.nonzero(non_empty_mask.to_numpy())[0]
 
+        if key_col:
+            keys = table.column(key_col).filter(non_empty_mask).to_pylist()
+
         if not rehydrate:
             n = len(raw_rows)
             doc_indices.extend(range(doc_index, doc_index + n))
             parquet_paths.extend([abs_path] * n)
-            parquet_rows.extend(raw_rows.tolist())
+            id_values.extend(keys if key_col else raw_rows.tolist())
             doc_index += n
         else:
             cluster_sizes = table.column("minhash_cluster_size").filter(non_empty_mask).to_pylist()
-            for raw_row, cluster_size in zip(raw_rows.tolist(), cluster_sizes):
+            for i, (raw_row, cluster_size) in enumerate(zip(raw_rows.tolist(), cluster_sizes)):
                 weight = rehydrate_weight(cluster_size)
+                id_val = keys[i] if key_col else raw_row
                 for _ in range(weight):
                     doc_indices.append(doc_index)
                     parquet_paths.append(abs_path)
-                    parquet_rows.append(raw_row)
+                    id_values.append(id_val)
                     doc_index += 1
 
     if doc_index != expected:
@@ -180,11 +200,18 @@ def generate_rank_metadata(
         )
 
     os.makedirs(output_folder, exist_ok=True)
-    out_table = pa.table({
-        "doc_index":    pa.array(doc_indices,    pa.int64()),
-        "parquet_path": pa.array(parquet_paths,  pa.string()),
-        "parquet_row":  pa.array(parquet_rows,   pa.int64()),
-    })
+    if key_col:
+        out_table = pa.table({
+            "doc_index":    pa.array(doc_indices,   pa.int64()),
+            "parquet_path": pa.array(parquet_paths, pa.string()),
+            "doc_key":      pa.array(id_values),
+        })
+    else:
+        out_table = pa.table({
+            "doc_index":    pa.array(doc_indices,   pa.int64()),
+            "parquet_path": pa.array(parquet_paths, pa.string()),
+            "parquet_row":  pa.array(id_values,     pa.int64()),
+        })
     pq.write_table(out_table, meta_path)
     print(f"rank {rank:05d}: wrote {doc_index} entries → {meta_path}", flush=True)
 
@@ -204,6 +231,7 @@ def _build_worker_kwargs(
     text_col: str,
     output_folder_override: str | None,
     rehydrate: bool,
+    key_col: str | None,
 ) -> list[dict]:
     n_tasks = n_tasks_arg or _infer_n_tasks(tokenized_folder)
     if n_tasks == 0:
@@ -212,7 +240,8 @@ def _build_worker_kwargs(
     return [
         dict(rank=rank, n_tasks=n_tasks, tokenized_folder=tokenized_folder,
              data_folder=data_folder, dump_paths=dump_paths,
-             text_col=text_col, output_folder=out, rehydrate=rehydrate)
+             text_col=text_col, output_folder=out, rehydrate=rehydrate,
+             key_col=key_col)
         for rank in range(n_tasks)
     ]
 
@@ -237,6 +266,10 @@ def get_args():
                         help="File extension to scan for (default: .parquet)")
     parser.add_argument("--output-folder", default=None,
                         help="Where to write .meta.parquet files (default: same as dump folder)")
+    parser.add_argument("--key-col", default=None,
+                        help="Parquet column whose value uniquely identifies a document "
+                             "(e.g. 'id' for HuggingFace datasets). When set, the metadata "
+                             "stores the column's value as 'doc_key' instead of 'parquet_row'.")
     parser.add_argument("--rehydrate", action="store_true",
                         help="Replicate Rehydrater duplication via minhash_cluster_size")
     parser.add_argument("--workers", type=int, default=None,
@@ -277,6 +310,7 @@ def main(args):
         all_kwargs.extend(_build_worker_kwargs(
             str(dump_dir), args.data_folder, all_dump_paths[dump_idx],
             args.n_tasks, args.text_col, args.output_folder, args.rehydrate,
+            args.key_col,
         ))
 
     n_workers = args.workers or len(all_kwargs)
