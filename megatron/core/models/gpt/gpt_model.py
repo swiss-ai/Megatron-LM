@@ -73,7 +73,7 @@ class GPTModel(LanguageModule):
             position_embedding_type is 'rope'.
             Defaults to 10000.
         rope_scaling (bool, optional): Toggle RoPE scaling.
-        rope_scaling_factor (float): RoPE scaling factor. Default 8.
+        rope_scaling_factor (float): RoPE scaling factor. Default 1.
         scatter_embedding_sequence_parallel (bool, optional):
             Whether embeddings should be scattered across sequence parallel
             region or not. Defaults to True.
@@ -100,7 +100,7 @@ class GPTModel(LanguageModule):
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         rope_scaling: bool = False,
-        rope_scaling_factor: float = 8.0,
+        rope_scaling_factor: float = 1.0,
         scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
         mtp_block_spec: Optional[ModuleSpec] = None,
