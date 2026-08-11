@@ -28,6 +28,12 @@ echo "START TIME: $(date)"
 #       will need more samples (megatron requests 0.5% sample buffer) and ratios might not reflect perfect weighted distribution by num_samples.
 #
 # In any case the indices precomputed here dont need to be reused but will be if training settings exactly match.
+#
+# Dataset types: entries in DATASETS may carry the explicit markers used at training time,
+# e.g. "sft:/data/dolly" or "pretrain:/data/fineweb". With --ap-sft set (required here),
+# unmarked entries are treated as SFT. Use markers when your training run mixes SFT and
+# pretraining data in one blend, and use the SAME markers here so the cache hash matches.
+# Only the SFT entries are packed; pretrain entries are built as regular GPT datasets.
 
 ################ Configs ################
 
@@ -50,7 +56,7 @@ if [ $REQUIRED_GPUS -gt $GPUS_PER_NODE ]; then
     exit 1
 fi
 
-# Dataset configuration (must match your training)
+# Dataset configuration (must match your training, including any sft:/pretrain: markers)
 DATASETS=(
     /capstor/store/cscs/swissai/infra01/vision-datasets/merged/image_sft_v1_fixed
 )
@@ -173,7 +179,7 @@ TORCHRUN_ARGS=(
 
 CMD_PREFIX="numactl --membind=0-3"
 
-INIT_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/initialize_sft_dataset.py \
+INIT_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/tools/initialize_sft_dataset.py \
     ${NETWORK_SIZE_ARGS[@]} \
     ${DISTRIBUTED_ARGS[@]} \
     ${TOKENIZER_ARGS[@]} \

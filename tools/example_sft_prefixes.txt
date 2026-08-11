@@ -1,4 +1,6 @@
-# path repeats
+# Example data-path file for tools/preflight_sft_packing.py.
+# Format: one "<dataset prefix or directory> <integer epoch count>" per line.
+# Directories are expanded to all *.idx files they contain.
 
 # text epochs=2
 /capstor/store/cscs/swissai/infra01/datasets_tokenized/apertus_sft_datasets/v1p5-mix-v1-14-05-linearised-no-image-refusals/dump-0 2

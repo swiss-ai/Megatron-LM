@@ -23,12 +23,17 @@ IMPORTANT REQUIREMENTS:
     but have no effect on dataset construction. Use any valid dummy values.
 
 Usage:
-    python initialize_sft_dataset.py <same data/training arguments as pretrain_gpt.py>
+    python tools/initialize_sft_dataset.py <same data/training arguments as pretrain_gpt.py>
 
     Must include: --ap-sft --ap-sft-pack-samples
 
+    Data paths may carry the explicit dataset-type markers understood by the
+    training run (e.g. "sft:/data/dolly" / "pretrain:/data/fineweb") for mixed
+    blends. --ap-sft is required either way: it enables run-level SFT mode,
+    while markers only control per-entry dataset dispatch.
+
 Example (single-GPU initialization for any training topology):
-    torchrun --nproc_per_node=1 initialize_sft_dataset.py \\
+    torchrun --nproc_per_node=1 tools/initialize_sft_dataset.py \\
         --tensor-model-parallel-size 1 \\
         --pipeline-model-parallel-size 1 \\
         --num-layers 1 --hidden-size 128 --num-attention-heads 1 \\
@@ -45,7 +50,11 @@ Example (single-GPU initialization for any training topology):
 
 import sys
 import json
+from pathlib import Path
 from typing import List, Optional, Tuple
+
+MEGATRON_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(MEGATRON_DIR))
 
 from megatron.training import get_args
 from megatron.training import print_rank_0
@@ -223,7 +232,7 @@ def main():
         print_rank_0("before running a full SFT training job with sample packing.")
         print_rank_0("")
         print_rank_0("Usage:")
-        print_rank_0("  python initialize_sft_dataset.py <args> --ap-sft --ap-sft-pack-samples")
+        print_rank_0("  python tools/initialize_sft_dataset.py <args> --ap-sft --ap-sft-pack-samples")
         print_rank_0("")
         print_rank_0("For normal training without packing, use pretrain_gpt.py")
         print_rank_0("=" * 80)
