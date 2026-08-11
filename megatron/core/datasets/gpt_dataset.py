@@ -553,6 +553,20 @@ class GPTDataset(MegatronDataset):
             dtype_code=config.token_dtype_code,
         )
 
+    @staticmethod
+    def _key_config_attributes() -> List[str]:
+        """Extend the base attributes with the pretraining packing settings.
+
+        The BFD and chunked paths write index files with different contents
+        (BFD document_index holds virtual chunk IDs) under the same cache
+        names, so the strategy and bin cap must be part of the cache identity.
+        Adding them invalidates caches built before these attributes existed.
+        """
+        return super(GPTDataset, GPTDataset)._key_config_attributes() + [
+            "pretraining_packing_strategy",
+            "max_docs_per_bin",
+        ]
+
     def __len__(self) -> int:
         """Abstract method implementation
 
