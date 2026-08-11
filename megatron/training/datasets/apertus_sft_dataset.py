@@ -230,6 +230,86 @@ def _build_sample_idx_bfd_python(
     return reordered, sample_index
 
 
+def _build_sample_idx_greedy(
+    sequence_lengths: np.ndarray,
+    document_index: np.ndarray,
+    seq_length: int,
+    add_extra_token: int,
+) -> np.ndarray:
+    """Greedy sequential whole-document packing.
+
+    Packs documents in document_index order, filling each sample until the next
+    document doesn't fit. Never splits documents across samples. Unlike BFD, the
+    resulting sample count depends on the document order.
+
+    Uses the compiled C++ kernel (helpers.build_sample_idx_packed_whole_docs)
+    when available, otherwise a pure-Python fallback with identical semantics.
+
+    Args:
+        sequence_lengths: Array of document lengths indexed by document ID.
+        document_index: Shuffled document IDs for one epoch.
+        seq_length: Target sequence length.
+        add_extra_token: 0 or 1, added to seq_length for the effective capacity.
+
+    Returns:
+        sample_index: Shape (num_samples + 1, 2) boundary array. Column 0 holds
+            offsets into document_index; column 1 is always 0.
+    """
+    try:
+        from megatron.core.datasets import helpers
+    except ImportError:
+        return _build_sample_idx_greedy_python(
+            sequence_lengths, document_index, seq_length, add_extra_token
+        )
+    return helpers.build_sample_idx_packed_whole_docs(
+        sequence_lengths,
+        document_index,
+        seq_length,
+        add_extra_token_to_sequence=add_extra_token,
+    )
+
+
+def _build_sample_idx_greedy_python(
+    sequence_lengths: np.ndarray,
+    document_index: np.ndarray,
+    seq_length: int,
+    add_extra_token: int,
+) -> np.ndarray:
+    """Pure-Python greedy fallback mirroring build_sample_idx_packed_whole_docs
+    in megatron/core/datasets/helpers.cpp. See _build_sample_idx_greedy."""
+    capacity = seq_length + add_extra_token
+    lengths = sequence_lengths[document_index].tolist()
+    n = len(lengths)
+
+    sample_starts = []
+    i = 0
+    while i < n:
+        sample_starts.append(i)
+        remaining = capacity
+        docs_in_sample = 0
+        while i < n:
+            doc_length = lengths[i]
+            if doc_length <= remaining:
+                remaining -= doc_length
+                i += 1
+                docs_in_sample += 1
+            else:
+                # An oversized first document gets its own sample (truncated by
+                # downstream code); otherwise the doc starts the next sample.
+                if docs_in_sample == 0:
+                    i += 1
+                break
+            if remaining == 0:
+                break
+    sample_starts.append(i)
+
+    # Same dtype selection as helpers.build_sample_idx_packed_whole_docs
+    sample_idx_max = max(n, int(sequence_lengths.max()) if len(sequence_lengths) else 0)
+    idx_dtype = np.int32 if sample_idx_max <= np.iinfo(np.int32).max else np.int64
+    sample_index = np.zeros((len(sample_starts), 2), dtype=idx_dtype)
+    sample_index[:, 0] = sample_starts
+    return sample_index
+
 
 class ApertusSFTDataset(GPTDataset):
     """Apertus SFT dataset for supervised fine-tuning on pre-tokenized data.
@@ -432,8 +512,6 @@ class ApertusSFTDataset(GPTDataset):
                 - sample_index: Shape (num_epoch_samples + 1, 2) - sample boundaries as [doc_idx_index, offset=0]
                 - shuffle_index: Shape (num_total_samples,) - permutation indices, tiled if needed
         """
-        from megatron.core.datasets import helpers
-
         index_names = ["document_index", "sample_index", "shuffle_index"]
         cache_hit = self.cache_manager.cache_exists(index_names)
 
@@ -478,11 +556,12 @@ class ApertusSFTDataset(GPTDataset):
                     max_docs_per_bin=self.config.max_docs_per_bin_sft,
                 )
             else:
-                sample_index = helpers.build_sample_idx_packed_whole_docs(
+                log_single_rank(logger, logging.INFO, "Using greedy sequential packing strategy")
+                sample_index = _build_sample_idx_greedy(
                     sequence_lengths_for_cpp,
                     document_index,
                     sequence_length,
-                    add_extra_token_to_sequence=self.config.add_extra_token_to_sequence,
+                    add_extra_token=self.config.add_extra_token_to_sequence,
                 )
 
             # Log packing statistics for the single epoch

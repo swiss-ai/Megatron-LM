@@ -1,6 +1,23 @@
 # Copyright (c) 2026, SwissAI. All rights reserved.
 
-"""Preflight Apertus SFT BFD packing counts."""
+"""Preflight Apertus SFT packing counts (BFD or greedy strategy).
+
+Counts the packed samples per dataset without launching Megatron, using the
+same packing logic as ApertusSFTDataset:
+
+- ``bfd``: Best-Fit Decreasing. Order-independent, so the count is exact for
+  any seed. Pass ``--max-docs-per-bin`` if training uses
+  ``--max-docs-per-bin-sft``.
+- ``greedy``: Packs documents in the seeded shuffle order used at training
+  time, so ``--seed`` must match the training run's ``--seed`` for the count
+  to be exact.
+
+Both counts assume the whole dataset lands in the train split
+(``--split 100,0,0``) and that each counted ``.idx`` file is its own
+``--data-path`` entry in training. For ``--ap-sft-load-loss-mask`` datasets
+(documents store ``[tokens, loss_mask]``), pass the same doubled
+``--seq-length`` the training run uses.
+"""
 
 import argparse
 import math
@@ -13,7 +30,10 @@ MEGATRON_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(MEGATRON_DIR))
 
 from megatron.core.datasets.indexed_dataset import _IndexReader  # noqa: E402
-from megatron.training.datasets.apertus_sft_dataset import _build_sample_idx_bfd  # noqa: E402
+from megatron.training.datasets.apertus_sft_dataset import (  # noqa: E402
+    _build_sample_idx_bfd,
+    _build_sample_idx_greedy,
+)
 
 
 def parse_epochs(raw_epochs: str) -> int:
@@ -62,8 +82,21 @@ def idx_files_for(path: Path) -> list[Path]:
     return idx_files
 
 
+def shuffled_document_order(n_docs: int, seed: int) -> np.ndarray:
+    """Replicate the one-epoch document shuffle from
+    ApertusSFTDataset (_build_document_index with num_epochs=1)."""
+    document_index = np.arange(n_docs, dtype=np.int32)
+    np.random.RandomState(seed).shuffle(document_index)
+    return document_index
+
+
 def packed_count_for_idx(
-    idx_path: Path, seq_length: int, add_extra_token: int
+    idx_path: Path,
+    seq_length: int,
+    add_extra_token: int,
+    strategy: str = "bfd",
+    seed: int = 1234,
+    max_docs_per_bin: int = 0,
 ) -> tuple[int, int, int]:
     idx_prefix = str(idx_path)
     if idx_prefix.endswith(".idx"):
@@ -78,14 +111,24 @@ def packed_count_for_idx(
     seq_lens = np.asarray(reader.sequence_lengths)
     n_docs = len(seq_lens)
     n_tokens = int(seq_lens.sum())
-    doc_idx = np.arange(n_docs, dtype=np.int32)
-    _reordered, sample_idx = _build_sample_idx_bfd(
-        sequence_lengths=seq_lens,
-        document_index=doc_idx,
-        seq_length=seq_length,
-        add_extra_token=add_extra_token,
-    )
-    n_samples = int(sample_idx.shape[0] - 1)
+    if strategy == "bfd":
+        doc_idx = np.arange(n_docs, dtype=np.int32)
+        _reordered, sample_idx = _build_sample_idx_bfd(
+            sequence_lengths=seq_lens,
+            document_index=doc_idx,
+            seq_length=seq_length,
+            add_extra_token=add_extra_token,
+            max_docs_per_bin=max_docs_per_bin,
+        )
+        n_samples = int(sample_idx.shape[0] - 1)
+    elif strategy == "greedy":
+        document_order = shuffled_document_order(n_docs, seed)
+        sample_idx = _build_sample_idx_greedy(
+            seq_lens, document_order, seq_length, add_extra_token
+        )
+        n_samples = int(sample_idx.shape[0] - 1)
+    else:
+        raise ValueError(f"unknown packing strategy: {strategy}")
     return n_docs, n_tokens, n_samples
 
 
@@ -93,6 +136,9 @@ def summarize_datasets(
     datasets: list[tuple[Path, int]],
     seq_length: int,
     add_extra_token: int,
+    strategy: str = "bfd",
+    seed: int = 1234,
+    max_docs_per_bin: int = 0,
     count_fn=packed_count_for_idx,
 ) -> tuple[list[dict], int]:
     rows = []
@@ -102,7 +148,14 @@ def summarize_datasets(
         n_files = len(idx_files)
         tot_docs, tot_toks, tot_samp = 0, 0, 0
         for idx_path in idx_files:
-            nd, nt, ns = count_fn(idx_path, seq_length, add_extra_token)
+            nd, nt, ns = count_fn(
+                idx_path,
+                seq_length,
+                add_extra_token,
+                strategy=strategy,
+                seed=seed,
+                max_docs_per_bin=max_docs_per_bin,
+            )
             tot_docs += nd
             tot_toks += nt
             tot_samp += ns
@@ -148,9 +201,15 @@ def format_summary(
     seq_length: int,
     add_extra_token: int,
     global_batch_size: int,
+    strategy: str = "bfd",
+    seed: int = 1234,
 ) -> str:
     capacity = seq_length + add_extra_token
+    strategy_line = f"PACKING_STRATEGY = {strategy}"
+    if strategy == "greedy":
+        strategy_line += f" (SEED = {seed}; must match training --seed)"
     lines = [
+        strategy_line,
         f"Capacity = SEQ_LENGTH + ADD_EXTRA_TOKEN = {seq_length} + {add_extra_token} = {capacity}",
         f"GBS = {global_batch_size}",
         "",
@@ -187,6 +246,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-length", type=int, required=True)
     parser.add_argument("--global-batch-size", type=int, required=True)
     parser.add_argument("--add-extra-token-to-sequence", type=int, default=1)
+    parser.add_argument(
+        "--packing-strategy",
+        choices=("bfd", "greedy"),
+        required=True,
+        help="must match the training run's --ap-sft-packing-strategy",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1234,
+        help="greedy only: must match the training run's --seed",
+    )
+    parser.add_argument(
+        "--max-docs-per-bin",
+        type=int,
+        default=0,
+        help="bfd only: must match the training run's --max-docs-per-bin-sft (0 = unlimited)",
+    )
     return parser.parse_args()
 
 
@@ -196,6 +273,9 @@ def main() -> int:
         read_data_path_file(args.data_path_file),
         seq_length=args.seq_length,
         add_extra_token=args.add_extra_token_to_sequence,
+        strategy=args.packing_strategy,
+        seed=args.seed,
+        max_docs_per_bin=args.max_docs_per_bin,
     )
     steps = compute_step_counts(grand_samples, args.global_batch_size)
     print(
@@ -206,6 +286,8 @@ def main() -> int:
             args.seq_length,
             args.add_extra_token_to_sequence,
             args.global_batch_size,
+            strategy=args.packing_strategy,
+            seed=args.seed,
         )
     )
     return 0
