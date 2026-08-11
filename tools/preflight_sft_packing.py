@@ -17,6 +17,11 @@ Both counts assume the whole dataset lands in the train split
 ``--data-path`` entry in training. For ``--ap-sft-load-loss-mask`` datasets
 (documents store ``[tokens, loss_mask]``), pass the same doubled
 ``--seq-length`` the training run uses.
+
+Every entry is treated as an SFT dataset to be packed; ``sft:``/``pretrain:``
+dataset-type markers are not understood —> use bare paths. For mixed
+pretrain+SFT blends use tools/initialize_sft_dataset.py, which resolves
+markers exactly as training does.
 """
 
 import argparse

@@ -16,7 +16,7 @@
     - [Set the Datasets in Megatron](#set-the-datasets-in-megatron)
     - [Data mixtures](#data-mixtures)
 - [Supervised Fine-Tuning (SFT)](#supervised-fine-tuning-sft)
-    - [Selecting SFT vs Pretrain Datasets](#selecting-sft-vs-pretrain-datasets)
+    - [Mixing SFT and Pretraining Datasets](#mixing-sft-and-pretraining-datasets)
     - [Apertus SFT with Sample Packing](#apertus-sft-with-sample-packing)
 - [Checkpointing](#checkpointing)
     - [Resuming from a checkpoint](#resuming-from-a-checkpoint)
@@ -99,6 +99,7 @@ python3 scripts/tools/create_data_mixture.py --folders datasets/fineweb-edu fine
 Upon successfully creating a mixture, we will see its statistics, such as the number of tokens, the number of file prefixes per dataset, and the total size of the mixture.  
 
 Keep in mind that the mixture will be created **without repetition**. This means that we will construct the mixture while respecting the weights until a dataset is exhausted.
+
 # Pre-Training
 
 This framework supports document packing for pre-training using greedy sampling (default) and best-fit decreasing (BFD) strategies.
@@ -122,11 +123,13 @@ To enable best-fit decreasing packing, add the following arguments to your launc
 
 This repository provides the **ApertusSFT** dataset (`--ap-sft`) for supervised fine-tuning on pre-tokenized Megatron indexed datasets (`.bin/.idx`). It supports sample packing, configurable loss masking, and works with the standard `pretrain_gpt.py` entry point.
 
-## Selecting SFT vs Pretrain Datasets
+## Mixing SFT and Pretraining Datasets
 
-Each entry in `--data-path` (and `--train-data-path` / `--valid-data-path` / `--test-data-path`, `--data-args-path`, `--per-split-data-args-path`) can carry an explicit dataset-type marker that decides whether the entry is built as `ApertusSFTDataset` or `GPTDataset`. This lets you mix SFT and pretrain data in the same weighted blend.
+Different sources in one blend can use different dataset classes. This is useful for mid-training workloads that mix SFT and pretraining data.
 
-Marker syntax: prefix the path with `sft:` or `pretrain:` (case-insensitive — `SFT:` works too). Only the **leading** marker is stripped, so a literal `sft:` in the underlying path is preserved (e.g. `sft:sft:/data/x` resolves to type `sft` with clean path `sft:/data/x`). Example mixed blend:
+Each entry in `--data-path` (and `--train-data-path` / `--valid-data-path` / `--test-data-path`, `--data-args-path`, `--per-split-data-args-path`) can carry an explicit dataset-type marker that decides whether the entry is built as `ApertusSFTDataset` or `GPTDataset`. This lets you mix SFT and pretraining data in the same weighted blend.
+
+Prefix paths with `sft:` or `pretrain:` to select their dataset class. Markers are case-insensitive and are removed before opening the dataset. Example mixed blend:
 ```bash
 --data-path 0.3 sft:/data/dolly_prefix 0.7 pretrain:/data/fineweb_prefix
 ```
@@ -135,13 +138,16 @@ For entries **without** a marker, dispatch is decided in this order:
 
 1. **`--ap-sft` is set** → unmarked entries are treated as SFT (`ApertusSFTDataset`). No warning. This preserves backward compatibility for existing all-SFT launchers (e.g. `--ap-sft --data-path 1.0 /data/dolly`).
 2. **`--ap-sft` is not set, but the path contains a legacy SFT substring (`"apertus_sft"` or `"apertus1p5_sft"`, matched case-insensitively)** → `ApertusSFTDataset` with a one-time `DeprecationWarning`. Legacy fallback for datasets whose directory names encode their type. Migrate to explicit `sft:` markers.
-3. **Otherwise** → `GPTDataset` (pretrain). Default for any bare path.
+3. **Otherwise** → `GPTDataset` (pretraining). Default for any bare path.
 
 Explicit `sft:` / `pretrain:` markers always override these three rules. Use them whenever you mix types in one blend.
 
 `--ap-sft` is still required for any SFT run (including mixed blends), because it also gates the `--calculate-per-token-loss` assertion needed for correct SFT loss normalization. The marker controls **per-entry dispatch**; the flag controls **run-level SFT mode**.
 
 The helper `scripts/tools/create_weighted_data_config.py` accepts `--dataset-type {sft,pretrain,none}` to emit marker-prefixed entries automatically.
+
+> [!NOTE]
+> Each dataset type retains its own configuration. For example, pretraining data can use greedy packing while SFT data uses BFD packing.
 
 ## Apertus SFT with Sample Packing
 
@@ -152,36 +158,14 @@ Sample packing (`--ap-sft-pack-samples`) concatenates multiple whole documents i
 Two packing strategies are available via `--ap-sft-packing-strategy`:
 
 - **`greedy`** (default): Packs documents in shuffled order, filling each sequence until the next document doesn't fit. Fast O(n) index building.
-- **`bfd`** (Best-Fit Decreasing): Sorts documents by length and assigns each to the sequence with the least remaining space that still fits. Produces fewer sequences and less wasted padding, especially when document lengths vary widely. Similar to pre-training, the best-fit approach also supports --max-docs-per-bin-sft 64, which limits the number of samples packed into each bucket.
+- **`bfd`** (Best-Fit Decreasing): Sorts documents by length and places each document in the best-fitting sequence. It generally reduces padding when document lengths vary. Use `--max-docs-per-bin-sft` to limit the number of documents per sequence.
 
-### Workflow
+### Packing Helpers
 
-Packed SFT training is a two-step process:
+- [`tools/preflight_sft_packing.py`](tools/preflight_sft_packing.py) quickly estimates the number of packed SFT samples and complete training steps without initializing Megatron or creating an index cache.
+- [`tools/initialize_sft_dataset.py`](tools/initialize_sft_dataset.py) runs the full Megatron dataset pipeline to report packing statistics and build the index cache used by training. Use it for weighted blends, dataset splits, or mixed SFT and pretraining data.
 
-**Step 1: Initialize the packing index** to determine the number of packed samples per epoch. This can be done on a single GPU regardless of your training topology. Model architecture args (`num-layers`, `hidden-size`, etc.) are required by Megatron's validation but don't affect the dataset — use any valid dummy values:
-```bash
-torchrun --nproc_per_node=1 initialize_sft_dataset.py \
-    --tensor-model-parallel-size 1 \
-    --pipeline-model-parallel-size 1 \
-    --num-layers 1 --hidden-size 128 --num-attention-heads 1 \
-    --max-position-embeddings 8192 \
-    --seq-length 8192 \
-    --micro-batch-size 1 --global-batch-size 64 \
-    --train-iters 10000 \
-    --data-path /path/to/sft-data \
-    --tokenizer-type HuggingFaceTokenizer \
-    --tokenizer-model /path/to/tokenizer \
-    --ap-sft --ap-sft-pack-samples \
-    --ap-sft-packing-strategy bfd \
-    --bf16
-```
-The script will log packing statistics including the number of packed samples per epoch. The cache hash depends on `seed`, `seq-length`, `split`, `train-iters`/`train-samples`, `global-batch-size`, `data-path`, tokenizer, and packing settings — these must match your training run. TP/PP/EP and model architecture args do **not** affect the hash.
-
-**Step 2: Run training** with `--train-samples` set to the reported packed sample count (or a multiple for multi-epoch):
-```bash
-sbatch submit-sft.sh  # with --ap-sft --ap-sft-pack-samples --train-samples <N>
-```
-The cached packing index from Step 1 is automatically reused as long as seed, seq-length, data-path, and packing settings match.
+See the [dataset tools documentation](scripts/README_dataset_tools.md) and each script's `--help` or module docstring for usage, limitations, cache behavior, and examples.
 
 ### Key Flags
 
