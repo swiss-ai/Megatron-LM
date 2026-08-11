@@ -10,7 +10,6 @@ def populate_sft_information_from_tokenizer(args, tokenizer: Any):
     init_kwargs = extract_tokenizer_init_kwargs(tokenizer)
 
     sft_assistant_begin_sequence = init_kwargs.get("sft_assistant_begin_sequence")
-    # TODO: change to general assistant end token once omnimodal tokenizers are adapted. As there can be separate user and assistant end tokens.
     sft_assistant_end_sequence = init_kwargs.get("sft_eot_token")
 
     if sft_assistant_begin_sequence is not None:

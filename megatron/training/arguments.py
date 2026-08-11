@@ -348,6 +348,8 @@ def tuple_type(x):
 def validate_args(args, defaults={}):
 
     if args.ap_sft:
+        # SFT samples/microbatches differ in size (the amount of padding varies),
+        # so the loss must be normalized by actual token counts.
         assert args.calculate_per_token_loss, \
             '--ap-sft requires --calculate-per-token-loss for correct loss normalization'
 
