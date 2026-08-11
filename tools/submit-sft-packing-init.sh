@@ -29,6 +29,11 @@ echo "START TIME: $(date)"
 #
 # In any case the indices precomputed here dont need to be reused but will be if training settings exactly match.
 #
+# Cache reuse: the requested train sample count (--train-samples, or --train-iters * --global-batch-size)
+# is part of the index cache hash. Since training is normally launched with --train-samples set to the
+# count this script reports, run this script TWICE for cache reuse: once to learn the count, then again
+# with TRAIN_SAMPLES set to it. Otherwise training silently re-packs at launch (correct, just slower).
+#
 # Dataset types: entries in DATASETS may carry the explicit markers used at training time,
 # e.g. "sft:/data/dolly" or "pretrain:/data/fineweb". With --ap-sft set (required here),
 # unmarked entries are treated as SFT. Use markers when your training run mixes SFT and
@@ -41,11 +46,12 @@ echo "START TIME: $(date)"
 CONTAINER_ENV=/iopsstor/scratch/cscs/ahernnde/ncg_new_v2.toml
 SRUN_EXTRA_PARAMS=()  # Example: SRUN_EXTRA_PARAMS=(--mpi=mpix)
 
-# IMPORTANT: These parallelism settings MUST match your actual training run!
-# Only the number of nodes and DP size can be reduced for this initialization
-TP=1  # Must match training
-PP=1  # Must match training
-EP=1  # Must match training (if using MoE)
+# Parallelism settings do NOT affect the packing index or its cache hash —
+# a single GPU works regardless of the training run's topology. These are
+# only configurable so the script can run in unusual container setups.
+TP=1
+PP=1
+EP=1
 GPUS_PER_NODE=4
 
 # Calculate required world size: TP * PP * EP
@@ -64,7 +70,8 @@ DATASETS=(
 # Training parameters that affect index/cache identity (MUST match training if cache reuse is desired)
 SEQ_LEN=8192
 GBS=240
-TRAIN_ITERS=10000  # Must match training unless you pass --train-samples explicitly in both init and train
+TRAIN_ITERS=10000  # Used only when TRAIN_SAMPLES is empty; requested sample count = TRAIN_ITERS * GBS
+TRAIN_SAMPLES=     # Optional: set to the reported packed sample count on a second run for cache reuse
 RANDOM_SEED=28
 TOKENIZER_MODEL=/capstor/store/cscs/swissai/infra01/MLLM/llama3_vision_instruct_emu3_tokenizer
 # This branch currently uses dataset default behavior (True) and does not expose a CLI switch.
@@ -126,7 +133,7 @@ NETWORK_SIZE_ARGS=(
     --swiglu
 )
 
-# Parallelism args (MUST match training)
+# Parallelism args (do not affect the packing index; any topology works)
 DISTRIBUTED_ARGS=(
     --tensor-model-parallel-size $TP
     --pipeline-model-parallel-size $PP
@@ -157,9 +164,13 @@ DATA_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size 1
     --global-batch-size $GBS
-    --train-iters $TRAIN_ITERS
     --calculate-per-token-loss
 )
+if [ -n "$TRAIN_SAMPLES" ]; then
+    TRAINING_ARGS+=(--train-samples $TRAIN_SAMPLES)
+else
+    TRAINING_ARGS+=(--train-iters $TRAIN_ITERS)
+fi
 
 # Other required args
 MISC_ARGS=(
