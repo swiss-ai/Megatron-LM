@@ -442,6 +442,9 @@ class ApertusSFTDataset(GPTDataset):
             "add_extra_token_to_sequence",
             "sft_pack_samples",
             "sft_packing_strategy",
+            # Caps BFD bin size, so it changes the packed index. Adding it here
+            # invalidates caches built before this attribute existed.
+            "max_docs_per_bin_sft",
             "sft_load_loss_mask",
         ]
 
