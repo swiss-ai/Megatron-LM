@@ -15,6 +15,7 @@
     - [Tokenization](#tokenization)
     - [Set the Datasets in Megatron](#set-the-datasets-in-megatron)
     - [Data mixtures](#data-mixtures)
+- [Pre-Training](#pre-training)
 - [Supervised Fine-Tuning (SFT)](#supervised-fine-tuning-sft)
     - [Mixing SFT and Pretraining Datasets](#mixing-sft-and-pretraining-datasets)
     - [Apertus SFT with Sample Packing](#apertus-sft-with-sample-packing)
