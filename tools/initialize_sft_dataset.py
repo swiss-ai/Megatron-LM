@@ -114,6 +114,17 @@ def get_train_val_test_num_samples():
     if not hasattr(args, "iteration"):
         args.iteration = 0
 
+    # get_train_valid_test_num_samples() divides by eval_interval unconditionally
+    # (no None-guard), so a missing --eval-interval fails with a confusing
+    # "unsupported operand type(s) for //: 'int' and 'NoneType'" instead of this.
+    if args.eval_interval is None and not args.full_validation and not args.skip_train:
+        raise ValueError(
+            "--eval-interval is required: the train/valid/test sample counts, and "
+            "therefore the cache hash, are derived from it. Pass the same value "
+            "your training run uses (--eval-iters can be 0 if you don't need eval "
+            "here, e.g. with --split 100,0,0)."
+        )
+
     return get_train_valid_test_num_samples()
 
 

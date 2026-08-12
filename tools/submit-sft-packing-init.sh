@@ -177,6 +177,11 @@ MISC_ARGS=(
     --bf16
     --seed $RANDOM_SEED
     --trigger-path /tmp
+    # Required: get_train_valid_test_num_samples() divides by --eval-interval
+    # with no None-guard, so it must be set even though --split 100,0,0 means
+    # no eval/test dataset is actually built. Match your training run's value.
+    --eval-interval 1000
+    --eval-iters 0
 )
 
 TORCHRUN_ARGS=(
