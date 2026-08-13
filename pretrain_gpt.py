@@ -18,9 +18,11 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import StragglerDetector, get_attr_wrapped_model, unwrap_model
 from megatron.training import get_args, get_timers, get_tokenizer, inprocess_restart, pretrain, print_rank_0
+from megatron.training.datasets.apertus_sft_dataset import ApertusSFTDataset
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.tokenizer.tokenizer_omni_metadata import populate_omni_metadata_from_tokenizer
+from megatron.training.tokenizer.tokenizer_sft_metadata import populate_sft_information_from_tokenizer
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -38,6 +40,7 @@ except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+
 
 def _ensure_complete_batch_on_all_tp_ranks(batch, device):
     """
@@ -61,7 +64,9 @@ def _ensure_complete_batch_on_all_tp_ranks(batch, device):
     fields_and_dtypes = [
         ("tokens", torch.long), ("labels", torch.long),
         ("loss_mask", torch.float), ("position_ids", torch.long),
+        ("assistant_mask", torch.float),  
     ]
+
 
     # Step 1: broadcast shape from TP-rank-0 (which always has all fields).
     shape_buf = torch.zeros(2, device=device, dtype=torch.int64)
@@ -72,7 +77,7 @@ def _ensure_complete_batch_on_all_tp_ranks(batch, device):
     dist.broadcast(shape_buf, src=tp_src, group=tp_group)
     shape = (int(shape_buf[0].item()), int(shape_buf[1].item()))
 
-    # Step 2: broadcast ALL fields unconditionally.  All TP ranks must
+    # Step 2: broadcast required fields unconditionally.  All TP ranks must
     # participate in every broadcast (it's a collective).  Ranks that
     # already have a field get it overwritten with the same data; ranks
     # that had None receive it for the first time.
@@ -90,9 +95,10 @@ def _packed_seq_params_from_batch(batch, args, tokenizer, cp_size, device):
     """Compute PackedSeqParams from a local batch, applying CP padding if needed.
 
     When CP > 1, this function modifies the batch in-place (padding tokens,
-    labels, loss_mask, position_ids to lengths divisible by 2*CP, then slicing
-    for DualChunkSwap).  This changes tensor sizes, which is why every TP rank
-    that participates in the forward pass must call this function independently.
+    labels, loss_mask, assistant_mask, and position_ids to lengths divisible
+    by 2*CP, then slicing for DualChunkSwap).  This changes tensor sizes,
+    which is why every TP rank that participates in the forward pass must call
+    this function independently.
 
     Returns (packed_seq_params, modified_batch).
     """
@@ -104,7 +110,7 @@ def _packed_seq_params_from_batch(batch, args, tokenizer, cp_size, device):
 
     # Step 1a: compute cu_seqlens from EOD boundaries + fixed seq_length intervals
     cu_seq, _ = torch.sort(torch.unique(torch.cat((
-        torch.arange(0, total_tokens + args.seq_length, args.seq_length, device=device, dtype=torch.int32), 
+        torch.arange(0, total_tokens + args.seq_length, args.seq_length, device=device, dtype=torch.int32),
         (tokens_full_flat.flatten() == tokenizer.eod).nonzero()[:, 0].int() + 1)))
         )
 
@@ -165,6 +171,21 @@ def _packed_seq_params_from_batch(batch, args, tokenizer, cp_size, device):
             for seq, pad in zip(loss_mask_seqs, padding_amounts)
         ])
 
+        # Step 2b-bis. Pad assistant_mask (same algorithm as loss_mask)
+        if batch.get("assistant_mask") is not None:
+            am_flat = batch["assistant_mask"].view(-1)
+            am_seqs = [
+                am_flat[cu_seq[i]:cu_seq[i + 1]]
+                for i in range(len(cu_seq) - 1)
+            ]
+            am_padded = torch.cat([
+                torch.cat([seq, torch.zeros(pad, dtype=seq.dtype, device=seq.device)])
+                if pad > 0 else seq
+                for seq, pad in zip(am_seqs, padding_amounts)
+            ])
+        else:
+            am_padded = None
+
         # Step 2c. Generate position_ids for padded sequences
         position_ids_padded = generate_positional_ids_for_cp(
             cu_seq.cpu(), divisibility, dtype=batch["position_ids"].dtype
@@ -182,7 +203,7 @@ def _packed_seq_params_from_batch(batch, args, tokenizer, cp_size, device):
             )
         )
 
-        # Step 3b: select loss_mask slices for this CP rank
+        # Step 3b: select loss_mask (and assistant_mask) slices for this CP rank
         total_slices = 2 * cp_size
         slice_sizes = (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]) // total_slices
         cp_rank_indices = []
@@ -198,12 +219,15 @@ def _packed_seq_params_from_batch(batch, args, tokenizer, cp_size, device):
                 device=device,
             ))
         loss_mask_padded = loss_mask_padded.index_select(0, torch.cat(cp_rank_indices))
+        if am_padded is not None:
+            am_padded = am_padded.index_select(0, torch.cat(cp_rank_indices))
 
         batch["tokens"] = input_ids_padded.unsqueeze(0)
         batch["labels"] = labels_padded.unsqueeze(0)
         batch["loss_mask"] = loss_mask_padded.unsqueeze(0)
         batch["position_ids"] = position_ids_padded.unsqueeze(0)
         batch["attention_mask"] = None
+        batch["assistant_mask"] = am_padded.unsqueeze(0) if am_padded is not None else None
 
         max_padded_len = int((cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]).max().item())
         assert max_padded_len % divisibility == 0, \
@@ -231,7 +255,7 @@ def _packed_seq_params_from_batch(batch, args, tokenizer, cp_size, device):
             cu_seqlens_q_padded=None,
             cu_seqlens_kv_padded=None,
         )
-        for key in ["tokens", "labels", "loss_mask", "position_ids"]:
+        for key in ["tokens", "labels", "loss_mask", "position_ids", "assistant_mask"]:
             if batch.get(key) is not None:
                 batch[key] = batch[key].view(1, -1)
 
@@ -310,35 +334,44 @@ def get_batch(data_iterator, vp_stage=None):
     - Middle PP stages: TP-rank-0 computes packed_seq_params from its local
     dataloader and broadcasts to sibling TP ranks. Batch values != packed_seq_params
     are set to None since activations arrive via PP P2P, not from the dataloader.
+
+    Returns a 6-tuple (tokens, labels, loss_mask, attention_mask, position_ids,
+    assistant_mask) and packed_seq_params. assistant_mask is None for pretraining.
     """
     args = get_args()
 
     if not is_first_or_last_pipeline_stage(vp_stage):
         if not args.use_packed_seq_params:
-            return (None, None, None, None, None), None
+            return (None, None, None, None, None, None), None
 
         # All TP ranks must call get_batch_on_this_tp_rank (it's a collective).
         batch = get_batch_on_this_tp_rank(data_iterator)
         device = torch.cuda.current_device()
 
         packed_seq_params = _compute_and_broadcast_packed_seq_params(batch, args, device)
-        return (None, None, None, None, None), packed_seq_params
+        return (None, None, None, None, None, None), packed_seq_params
 
     batch = get_batch_on_this_tp_rank(data_iterator)
 
     if not args.use_packed_seq_params:
         batch = get_batch_on_this_cp_rank(batch)
-        return batch.values(), None
+        return (
+            batch.get("tokens"),
+            batch.get("labels"),
+            batch.get("loss_mask"),
+            batch.get("attention_mask"),
+            batch.get("position_ids"),
+            batch.get("assistant_mask"),
+        ), None
 
     cp_size = parallel_state.get_context_parallel_world_size()
     device = torch.cuda.current_device()
     tokenizer = get_tokenizer()
 
-    # When PP > 1, the last stage's non-zero TP ranks has tokens=None
+    # When PP > 1, the last stage's non-zero TP ranks have tokens=None
     # (get_batch_on_this_tp_rank only broadcasts what that stage needs for
     # loss computation).  If CP > 1, all TP ranks must run the CP padding
     # logic (which reads tokens), so we fill in the missing fields first.
-    
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     tp_size = parallel_state.get_tensor_model_parallel_world_size()
 
@@ -349,9 +382,14 @@ def get_batch(data_iterator, vp_stage=None):
         batch, args, tokenizer, cp_size, device
     )
 
-    return batch.values(), packed_seq_params
-
-
+    return (
+        batch.get("tokens"),
+        batch.get("labels"),
+        batch.get("loss_mask"),
+        batch.get("attention_mask"),
+        batch.get("position_ids"),
+        batch.get("assistant_mask"),
+    ), packed_seq_params
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -410,7 +448,14 @@ def apply_decay_modality_weights(loss_mask: torch.Tensor, labels: torch.Tensor, 
     return loss_mask
 
 
-def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None, labels: torch.Tensor = None, current_modality_weights: dict = None):
+def loss_func(
+    loss_mask: torch.Tensor,
+    output_tensor: torch.Tensor,
+    model: Optional[GPTModel] = None,
+    labels: torch.Tensor = None,
+    assistant_mask: torch.Tensor = None,
+    current_modality_weights: dict = None,
+):
     """Loss function.
 
     Args:
@@ -418,6 +463,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
         output_tensor (torch.Tensor): The tensor with the losses
         model (GPTModel, optional): The model (can be wrapped)
         labels: tensor with labels to allow reporting of special losses based on label ids
+        assistant_mask: optional mask selecting only assistant tokens (Apertus SFT)
 
     Returns:
         the loss scalar for this micro-batch
@@ -436,6 +482,15 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
 
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
+
+        # Assistant-only loss tracking for Apertus SFT
+        if getattr(args, 'ap_sft', False) and assistant_mask is not None:
+            assistant_mask_flat = assistant_mask.view(-1).float()
+            assistant_loss_sum = torch.sum(losses * assistant_mask_flat)
+            assistant_count = assistant_mask_flat.sum().clone().detach().to(torch.int)
+            report['assistant_loss'] = torch.cat([
+                assistant_loss_sum.clone().detach().view(1), assistant_count.view(1)
+            ])
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -540,7 +595,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
         batch_values, packed_seq_params = get_batch(data_iterator, vp_stage)
-        tokens, labels, loss_mask, attention_mask, position_ids = batch_values
+        tokens, labels, loss_mask, attention_mask, position_ids, assistant_mask = batch_values
 
     timers('batch-generator').stop()
 
@@ -567,6 +622,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     loss_mask,
                     model=model,
                     labels=labels,
+                    assistant_mask=assistant_mask,
                     current_modality_weights=current_modality_weights,
                 )
             else:
@@ -581,6 +637,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         loss_mask,
         model=model,
         labels=labels,
+        assistant_mask=assistant_mask,
         current_modality_weights=current_modality_weights,
     )
 
@@ -604,6 +661,7 @@ def core_gpt_dataset_config_from_args(args):
     # Populate metadata for both tokenizer paths. This keeps goldfish exemption and
     # modality offsets/vocab available to GPT dataset construction and reporting.
     populate_omni_metadata_from_tokenizer(args, tokenizer)
+    populate_sft_information_from_tokenizer(args, tokenizer)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
@@ -661,6 +719,19 @@ def core_gpt_dataset_config_from_args(args):
         "vision_weight": args.vision_weight,
         "audio_weight": args.audio_weight,
         "loss_mask_token_ids": getattr(args, "loss_mask_token_ids", None),
+        # Apertus SFT packing / masking options
+        "sft_plw": args.ap_sft_plw,
+        "sft_load_loss_mask": args.ap_sft_load_loss_mask,
+        "sft_mask_special_tokens": args.ap_sft_mask_special_tokens,
+        "sft_pack_samples": args.ap_sft_pack_samples,
+        "sft_packing_strategy": args.ap_sft_packing_strategy,
+        "sft_equalize_sample_loss": args.ap_sft_equalize_sample_loss,
+        "sft_long_ctx_loss": args.ap_sft_long_ctx_loss,
+        "sft_truncate_right": args.ap_sft_truncate_right,
+        "pretraining_packing_strategy": args.pretraining_packing_strategy,
+        "max_docs_per_bin": args.max_docs_per_bin,
+        "max_docs_per_bin_sft": args.max_docs_per_bin_sft,
+        "ap_sft_auto_tag": args.ap_sft,
     }
 
     # add FIM args to the config
@@ -697,20 +768,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     config = core_gpt_dataset_config_from_args(args)
 
-    if args.sft:
-        dataset_type = SFTDataset
-    else:
-        if args.mock_data:
-            dataset_type = MockGPTDataset
-        elif args.fim_data:
-            dataset_type = GPTFIMDataset
-        else:
-            dataset_type = GPTDataset
-
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type, train_val_test_num_samples, partial(is_dataset_built_on_rank, vp_stage=vp_stage), config
+        train_val_test_num_samples, partial(is_dataset_built_on_rank, vp_stage=vp_stage), config
     ).build()
 
     print_rank_0("> finished creating GPT datasets ...")

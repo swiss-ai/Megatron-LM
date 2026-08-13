@@ -44,7 +44,14 @@ class SFTLowLevelDataset:
 
 
 class SFTDataset(MegatronDataset):
-    """The dataset used during SFT"""
+    """
+    The dataset used during SFT
+
+    Simple SFT dataset:
+    - one conversation per sequence forced to end with eod (before padding)
+    - SFTTokenizer tokenizes conversations on the fly and does create target tensor where user/system prompt + ass-begin is set to IGNOREIDX and subsequently loss-masked.
+    - The SFTTokenizer hardcodes two types of prompts and chat templates supported.
+    """
 
     def __init__(
         self,

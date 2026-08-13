@@ -347,6 +347,12 @@ def tuple_type(x):
 
 def validate_args(args, defaults={}):
 
+    if args.ap_sft:
+        # SFT samples/microbatches differ in size (the amount of padding varies),
+        # so the loss must be normalized by actual token counts.
+        assert args.calculate_per_token_loss, \
+            '--ap-sft requires --calculate-per-token-loss for correct loss normalization'
+
     # Temporary
     assert args.non_persistent_ckpt_type in ['global', 'local', None], \
         'Currently only global and local checkpoints are supported'
@@ -3075,6 +3081,9 @@ def _add_data_args(parser):
                        '(2) a list of weight prefix pairs e.g. weight1 prefix1 weight2 prefix2, '
                        '(3) a list of prefixes e.g. prefix1 prefix2. '
                        'For (3), weights are inferred from the lengths of the contributing datasets. '
+                       'Each prefix may be tagged with a reserved dataset-type marker (case-insensitive): '
+                       '"sft:<prefix>" builds ApertusSFTDataset, "pretrain:<prefix>" builds GPTDataset. '
+                       'See the README "Selecting SFT vs Pretrain Datasets" section for precedence rules. '
                        'This argument is exclusive to the other independent --*-data-path arguments.')
     group.add_argument('--phase-transition-iterations', type=str, default=None,
                        help='Comma-separated list of iterations where phase '
@@ -3739,4 +3748,41 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
+    group.add_argument('--ap-sft', action="store_true",
+                       help='Enable Apertus model SFT training. Requires --calculate-per-token-loss. '
+                            'In a mixed blend, also auto-tags any unmarked --data-path entry as SFT '
+                            '(entries with an explicit "sft:"/"pretrain:" marker are unaffected).')
+    group.add_argument('--ap-sft-pack-samples', action="store_true",
+                       help='Pack multiple whole documents per sequence. Doesnt spread one document across sequences. '
+                            'Only packs full sequences and adds padding to reach full seq len.')
+    group.add_argument('--ap-sft-packing-strategy', type=str, default='greedy',
+                       choices=['greedy', 'bfd'],
+                       help='Packing strategy for --ap-sft-pack-samples. '
+                            '"greedy" packs documents in shuffled order (current default). '
+                            '"bfd" (Best-Fit Decreasing) sorts by length for higher packing efficiency.')
+    group.add_argument('--pretraining-packing-strategy', type=str, default='greedy',
+                       choices=['greedy', 'bfd'],
+                       help='Packing strategy for pre-training. '
+                            '"greedy" packs documents in shuffled order (current default). '
+                            '"bfd" (Best-Fit Decreasing) sorts by length for higher packing '
+                            'efficiency and don\'t cut the samples if < sequence_length.')
+    group.add_argument('--max-docs-per-bin', type=int, default=0,
+                       help='Maximum number of documents allowed per sample in bfd, 0 means no limit.')
+    group.add_argument('--max-docs-per-bin-sft', type=int, default=0,
+                       help='Maximum number of documents allowed per sample in bfd, 0 means no limit.')
+    group.add_argument('--ap-sft-plw', type=float, default=0.0,
+                       help='Prompt loss weight for user tokens (0 = fully masked)')
+    group.add_argument("--ap-sft-long-ctx-loss", action="store_true",
+                        help='In cases where tokens appear between the system prompt and the BOS token, '
+                        'we also include those tokens in training. This helps avoid discarding a large '
+                        'number of tokens during pre-training. ')
+    group.add_argument('--ap-sft-load-loss-mask', action="store_true",
+                       help='Load pre-computed loss masks from tokenized data')
+    group.add_argument('--ap-sft-mask-special-tokens', action="store_true",
+                       help='Mask special tokens (BOS, EOD, assistant begin) from loss')
+    group.add_argument('--ap-sft-equalize-sample-loss', action="store_true",
+                       help='Normalize loss per sample segment')
+    group.add_argument('--ap-sft-truncate-right', action="store_true",
+                       help='Truncate documents from the right side instead of the left. '
+                            'If a document is too long it we keep tokens in the beginning if this option is given.')
     return parser

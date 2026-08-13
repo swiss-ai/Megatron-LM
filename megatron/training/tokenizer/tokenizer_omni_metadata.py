@@ -102,9 +102,10 @@ def populate_omni_metadata_from_tokenizer(
     - `args.omnimodal_config`
     - `args.{name}_token_offset`, `args.{name}_vocab_size` for each modality entry
     - `tokenizer.goldfish_exemption_range`
+    - `tokenizer.sft_assistant_begin_sequence`, `tokenizer.sft_assistant_end_sequence`
 
     Metadata source:
-    - tokenizer `init_kwargs` keys: `base_vocab_size`, `omnimodal_config`
+    - tokenizer `init_kwargs` keys: `base_vocab_size`, `omnimodal_config`, `sft_assistant_begin_sequence`, `sft_assistant_end_sequence`
     - falls back to already-populated `args.*` when direct kwargs are unavailable
     """
     init_kwargs = extract_tokenizer_init_kwargs(tokenizer)

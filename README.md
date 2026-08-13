@@ -15,6 +15,10 @@
     - [Tokenization](#tokenization)
     - [Set the Datasets in Megatron](#set-the-datasets-in-megatron)
     - [Data mixtures](#data-mixtures)
+- [Pre-Training](#pre-training)
+- [Supervised Fine-Tuning (SFT)](#supervised-fine-tuning-sft)
+    - [Mixing SFT and Pretraining Datasets](#mixing-sft-and-pretraining-datasets)
+    - [Apertus SFT with Sample Packing](#apertus-sft-with-sample-packing)
 - [Checkpointing](#checkpointing)
     - [Resuming from a checkpoint](#resuming-from-a-checkpoint)
     - [Converting checkpoints to huggingface](#converting-checkpoints-to-huggingface)
@@ -96,6 +100,86 @@ python3 scripts/tools/create_data_mixture.py --folders datasets/fineweb-edu fine
 Upon successfully creating a mixture, we will see its statistics, such as the number of tokens, the number of file prefixes per dataset, and the total size of the mixture.  
 
 Keep in mind that the mixture will be created **without repetition**. This means that we will construct the mixture while respecting the weights until a dataset is exhausted.
+
+# Pre-Training
+
+This framework supports document packing for pre-training using greedy sampling (default) and best-fit decreasing (BFD) strategies.
+
+To enable best-fit decreasing packing, add the following arguments to your launcher script:
+
+```bash
+--pretraining-packing-strategy bfd
+--max-docs-per-bin 64
+```
+
+- `--pretraining-packing-strategy` controls the packing algorithm:
+  - `greedy` (default) standard greedy sampling.
+  - `bfd` best-fit decreasing packing for improved packing efficiency.
+
+- `--max-docs-per-bin` sets the maximum number of documents per packed bin.
+  - Default: `0` (no limit).
+  - Useful when working with many small documents, where packing too many documents into a bin can reduce throughput.
+
+# Supervised Fine-Tuning (SFT)
+
+This repository provides the **ApertusSFT** dataset (`--ap-sft`) for supervised fine-tuning on pre-tokenized Megatron indexed datasets (`.bin/.idx`). It supports sample packing, configurable loss masking, and works with the standard `pretrain_gpt.py` entry point.
+
+## Mixing SFT and Pretraining Datasets
+
+Different sources in one blend can use different dataset classes. This is useful for mid-training workloads that mix SFT and pretraining data.
+
+Each entry in `--data-path` (and `--train-data-path` / `--valid-data-path` / `--test-data-path`, `--data-args-path`, `--per-split-data-args-path`) can carry an explicit dataset-type marker that decides whether the entry is built as `ApertusSFTDataset` or `GPTDataset`. This lets you mix SFT and pretraining data in the same weighted blend.
+
+Prefix paths with `sft:` or `pretrain:` to select their dataset class. Markers are case-insensitive and are removed before opening the dataset. Example mixed blend:
+```bash
+--data-path 0.3 sft:/data/dolly_prefix 0.7 pretrain:/data/fineweb_prefix
+```
+
+For entries **without** a marker, dispatch is decided in this order:
+
+1. **`--ap-sft` is set** → unmarked entries are treated as SFT (`ApertusSFTDataset`). No warning. This preserves backward compatibility for existing all-SFT launchers (e.g. `--ap-sft --data-path 1.0 /data/dolly`).
+2. **`--ap-sft` is not set, but the path contains a legacy SFT substring (`"apertus_sft"` or `"apertus1p5_sft"`, matched case-insensitively)** → `ApertusSFTDataset` with a one-time `DeprecationWarning`. Legacy fallback for datasets whose directory names encode their type. Migrate to explicit `sft:` markers.
+3. **Otherwise** → `GPTDataset` (pretraining). Default for any bare path.
+
+Explicit `sft:` / `pretrain:` markers always override these three rules. Use them whenever you mix types in one blend.
+
+`--ap-sft` is still required for any SFT run (including mixed blends), because it also gates the `--calculate-per-token-loss` assertion needed for correct SFT loss normalization. The marker controls **per-entry dispatch**; the flag controls **run-level SFT mode**.
+
+The helper `scripts/tools/create_weighted_data_config.py` accepts `--dataset-type {sft,pretrain,none}` to emit marker-prefixed entries automatically.
+
+> [!NOTE]
+> Each dataset type retains its own configuration. For example, pretraining data can use greedy packing while SFT data uses BFD packing.
+
+## Apertus SFT with Sample Packing
+
+Sample packing (`--ap-sft-pack-samples`) concatenates multiple whole documents into a single sequence to reduce padding waste. Position IDs and attention masks are reset at document boundaries so documents don't attend to each other.
+
+### Packing Strategies
+
+Two packing strategies are available via `--ap-sft-packing-strategy`:
+
+- **`greedy`** (default): Packs documents in shuffled order, filling each sequence until the next document doesn't fit. Fast O(n) index building.
+- **`bfd`** (Best-Fit Decreasing): Sorts documents by length and places each document in the best-fitting sequence. It generally reduces padding when document lengths vary. Use `--max-docs-per-bin-sft` to limit the number of documents per sequence.
+
+### Packing Helpers
+
+- [`tools/preflight_sft_packing.py`](tools/preflight_sft_packing.py) quickly estimates the number of packed SFT samples and complete training steps without initializing Megatron or creating an index cache.
+- [`tools/initialize_sft_dataset.py`](tools/initialize_sft_dataset.py) runs the full Megatron dataset pipeline to report packing statistics and build the index cache used by training. Use it for weighted blends, dataset splits, or mixed SFT and pretraining data.
+
+See the [dataset tools documentation](scripts/README_dataset_tools.md) and each script's `--help` or module docstring for usage, limitations, cache behavior, and examples.
+
+### Key Flags
+
+| Flag | Description |
+|------|-------------|
+| `--ap-sft` | Enable Apertus SFT mode (requires `--calculate-per-token-loss`) |
+| `--ap-sft-pack-samples` | Enable multi-document packing |
+| `--ap-sft-packing-strategy {greedy,bfd}` | Packing algorithm (default: `greedy`) |
+| `--ap-sft-plw <float>` | Prompt loss weight for non-assistant tokens (default: `0.0` = fully masked) |
+| `--ap-sft-load-loss-mask` | Load pre-computed loss masks from the tokenized data |
+| `--ap-sft-mask-special-tokens` | Mask BOS/EOD/assistant-begin tokens from loss |
+| `--ap-sft-equalize-sample-loss` | Normalize loss per document within packed sequences |
+| `--ap-sft-truncate-right` | Truncate from the right (default is left truncation) |
 
 # Checkpointing
 >[!CAUTION]

@@ -1,11 +1,11 @@
 """
-This script is a modiefied version of create_data_config.py. It allows the same input as this script but to additionally define an overall weight in range 0-1.
+This script is a modified version of create_data_config.py.
 
-It will find all bin/idx pairs in the given paths and assign overall wights according number of sequences in each dataset. All weights normalized to sum to given weight.
+It will find all bin/idx pairs in the given paths and assign overall weights according to the number of tokens in each dataset. All weights are normalized to sum to the given weight.
 
 ex:
 
-python $MEGATRON_LM_DIR/scripts/tools/create_weighted_data_config.py \
+python $MEGATRON_LM_DIR/scripts/tools/create_weighted_data_config_by_tokens.py \
       --paths /iopsstor/scratch/cscs/jpcoles/a06/phase-5 \
       --weight 0.1)
 """
@@ -19,25 +19,19 @@ from typing import List, Tuple
 
 
 def get_dataset_size(prefix: str) -> int:
-    """Get the number of documents from a .idx file.
+    """Get the number of tokens from a .bin file.
 
     Args:
         prefix: Dataset prefix (without .bin or .idx extension)
 
     Returns:
-        Number of documents in the dataset
+        Number of tokens in the dataset
     """
-    idx_file = f"{prefix}.idx"
-    if not os.path.isfile(idx_file):
-        raise FileNotFoundError(f"Index file not found: {idx_file}")
+    bin_file = f"{prefix}.bin"
+    if not os.path.isfile(bin_file):
+        raise FileNotFoundError(f"Binary file not found: {bin_file}")
 
-    # .idx layout: 9B header, 8B version, 1B dtype, 8B sequence_count, 8B document_count
-    with open(idx_file, 'rb') as f:
-        f.seek(18)  # skip header(9) + version(8) + dtype(1)
-        num_sequences = struct.unpack('<Q', f.read(8))[0]
-        #num_docs = struct.unpack('<Q', f.read(8))[0]
-
-    return num_sequences
+    return os.path.getsize(bin_file) // 4
 
 
 def create_data_prefix(list_of_paths: List[str]) -> List[str]:
