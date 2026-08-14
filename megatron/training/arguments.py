@@ -1839,7 +1839,7 @@ def _add_network_size_args(parser):
                        help='Sequence length interpolation factor for rotary embeddings.')
     group.add_argument('--use-rope-scaling', action='store_true',
                        help='Apply rope scaling as used in llama3.x')
-    group.add_argument('--rope-scaling-factor', type=float, default=8.0,
+    group.add_argument('--rope-scaling-factor', type=float, default=1.0,
                        help='Rope scaling factor in llama3.x models')
     group.add_argument('--no-rope-freq', type=no_rope_freq_type, default=None,
                        help='Controls which layers to skip performing Rotary Position Embedding. Accepts either: '

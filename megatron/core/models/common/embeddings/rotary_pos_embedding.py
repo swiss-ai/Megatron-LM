@@ -48,7 +48,7 @@ class RotaryEmbedding(nn.Module):
         rotary_base (int, optional): Base period for rotary position embeddings. Defaults to
             10000.
         rope_scaling (bool, optional): Apply rope scaling as used in llama 3.x.
-        rope_scaling_factor (float, optional): rope scaling factor in llama 3.x. Defaults to 8.
+        rope_scaling_factor (float, optional): rope scaling factor in llama 3.x. Defaults to 1.
         use_cpu_initialization (bool, optional): If False, initialize the inv_freq directly
             on the GPU. Defaults to False
         cp_group (torch.distributed.ProcessGroup, optional): Process group for context parallel.
@@ -63,7 +63,7 @@ class RotaryEmbedding(nn.Module):
         seq_len_interpolation_factor: float = None,
         rotary_base: int = 10000,
         rope_scaling: bool = False,
-        rope_scaling_factor: float = 8.0,
+        rope_scaling_factor: float = 1.0,
         use_cpu_initialization: bool = False,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> None:
@@ -92,7 +92,7 @@ class RotaryEmbedding(nn.Module):
     def _apply_scaling(
         self,
         freqs,
-        factor=8,
+        factor=1,
         low_freq_factor=1,
         high_freq_factor=4,
         original_max_position_embeddings=8192,
