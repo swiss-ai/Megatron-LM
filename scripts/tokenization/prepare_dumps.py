@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List
 
 
-def get_parquet_files(path_to_folder: List) -> List:
+def get_files(path_to_folder: List, fmt: str) -> List:
     files = [
         os.path.join(dp, f)
         for dp, _, fn in os.walk(os.path.expanduser(path_to_folder), followlinks=True)
@@ -16,12 +16,13 @@ def get_parquet_files(path_to_folder: List) -> List:
     ]
 
     if len(files) == 0:
-        raise ValueError(f"No .parquet files found in {path_to_folder}")
+        raise ValueError(f"No .{fmt} files found in {path_to_folder}")
 
     filtered_files = [
         raw_file
         for raw_file in files
-        if Path(raw_file).suffix.lower().endswith(".parquet")
+        if Path(raw_file).name.lower().endswith(f".{fmt}")
+        or Path(raw_file).name.lower().endswith(f".{fmt}.gz")
     ]
 
     return filtered_files
@@ -51,7 +52,14 @@ def get_args():
         "--dataset-folder",
         type=str,
         required=True,
-        help="Path to a folder containing recursively .parquet files",
+        help="Path to a folder containing recursively dataset files",
+    )
+    parser.add_argument(
+        "--format",
+        type=str,
+        choices=["parquet", "jsonl"],
+        default="parquet",
+        help="File format to look for (default: parquet)",
     )
     parser.add_argument(
         "--filter-in",
@@ -83,39 +91,39 @@ def get_args():
 
 
 def main(args):
-    print(f"Scanning parquet files in {args.dataset_folder}...")
-    parquet_files = get_parquet_files(args.dataset_folder)
-    print(f"Found a total of {len(parquet_files)} in {args.dataset_folder}")
-    parquet_files = (
-        filter_in(parquet_files, args.filter_in) if args.filter_in else parquet_files
+    print(f"Scanning .{args.format} files in {args.dataset_folder}...")
+    dataset_files = get_files(args.dataset_folder, args.format)
+    print(f"Found a total of {len(dataset_files)} in {args.dataset_folder}")
+    dataset_files = (
+        filter_in(dataset_files, args.filter_in) if args.filter_in else dataset_files
     )
-    parquet_files = (
-        filter_out(parquet_files, args.filter_out) if args.filter_out else parquet_files
+    dataset_files = (
+        filter_out(dataset_files, args.filter_out) if args.filter_out else dataset_files
     )
-    size_of_parquet_files = [
-        os.path.getsize(parquet_file) for parquet_file in parquet_files
+    size_of_dataset_files = [
+        os.path.getsize(dataset_file) for dataset_file in dataset_files
     ]
     print(
-        f"Total number of files filtered to tokenize: {len(parquet_files)} ({sum(size_of_parquet_files) / 1e9:.2f} GB)"
+        f"Total number of files filtered to tokenize: {len(dataset_files)} ({sum(size_of_dataset_files) / 1e9:.2f} GB)"
     )
 
-    number_of_dumps = args.n_dumps if args.n_dumps else int(sum(size_of_parquet_files) / 150e9) + 1
-    if number_of_dumps > len(parquet_files):
-        number_of_dumps = len(parquet_files)
+    number_of_dumps = args.n_dumps if args.n_dumps else int(sum(size_of_dataset_files) / 150e9) + 1
+    if number_of_dumps > len(dataset_files):
+        number_of_dumps = len(dataset_files)
 
-    print(f"Splitting {len(parquet_files)} into {number_of_dumps} dumps...")
-    parquet_files_sizes_tuples = listOfTuples(parquet_files, size_of_parquet_files)
-    parquet_files_sizes_tuples = sorted(
-        parquet_files_sizes_tuples, key=lambda x: x[1], reverse=True
+    print(f"Splitting {len(dataset_files)} into {number_of_dumps} dumps...")
+    files_sizes_tuples = listOfTuples(dataset_files, size_of_dataset_files)
+    files_sizes_tuples = sorted(
+        files_sizes_tuples, key=lambda x: x[1], reverse=True
     )
 
     dump_folder_files = [[] for _ in range(number_of_dumps)]
     dump_folder_size = [0] * number_of_dumps
 
-    for parquet_file, parquet_file_size in parquet_files_sizes_tuples:
+    for dataset_file, dataset_file_size in files_sizes_tuples:
         min_ind = dump_folder_size.index(min(dump_folder_size))
-        dump_folder_files[min_ind].append(parquet_file)
-        dump_folder_size[min_ind] += parquet_file_size
+        dump_folder_files[min_ind].append(dataset_file)
+        dump_folder_size[min_ind] += dataset_file_size
 
     PATH_TO_DATASET_SYMLINK = os.path.join(
         args.preprocessing_metadata_folder, "raw-dataset-link"
