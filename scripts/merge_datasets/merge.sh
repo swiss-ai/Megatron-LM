@@ -1,11 +1,11 @@
 #!/bin/bash
 
-#SBATCH --account=infra01
+#SBATCH --account=a-a06
 #SBATCH --time=00:59:59
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=288
-#SBATCH --environment=/capstor/store/cscs/swissai/infra01/containers/NGC-PyTorch/ngc_pt_jan.toml	# Vanilla 25.01 PyTorch NGC Image 
+#SBATCH --environment=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml	# Vanilla 25.01 PyTorch NGC Image 
 #SBATCH --no-requeue
 
 input_folder=$1

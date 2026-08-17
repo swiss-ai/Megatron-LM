@@ -3,12 +3,10 @@ python3 preprocess_megatron.py --tokenizer-name-or-path meta-llama/Meta-Llama-3-
 """
 
 import argparse
-import signal
 
 from data_pipeline_pretrain.pipeline.tokens import MegatronDocumentTokenizer
 from datatrove.executor.local import LocalPipelineExecutor
 from datatrove.pipeline.readers import ParquetReader
-from datatrove.pipeline.readers import JsonlReader
 
 
 def get_args():
@@ -73,13 +71,6 @@ def get_args():
         default="text",
         help="Column to preprocess from the Dataset. Default: text",
     )
-    group.add_argument(
-        "--file-format",
-        type=str,
-        choices=["parquet", "jsonl"],
-        default="parquet",
-        help="File format of the input dataset. Default: parquet",
-    )
 
     args = parser.parse_args()
 
@@ -87,13 +78,6 @@ def get_args():
 
 
 def main(args):
-    # The container/job launcher inherits SIGCHLD blocked, and that mask survives
-    # exec() into this process. datatrove's LocalPipelineExecutor uses a "forkserver"
-    # multiprocessing pool whose reaping loop wakes up via a SIGCHLD self-pipe - with
-    # SIGCHLD blocked, worker processes exit and become zombies but the forkserver
-    # never notices, so Pool.join() hangs forever. Unblock it before any pool is created.
-    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGCHLD})
-
     n_tasks = args.n_tasks
     # Check number of files > n tasks
     with open(args.paths_file, "rb") as f:
@@ -101,23 +85,13 @@ def main(args):
     if n_tasks > number_of_files:
         n_tasks = number_of_files
 
-    if args.file_format == "jsonl":
-        reader = JsonlReader(
-            data_folder=args.dataset,
-            paths_file=args.paths_file,
-            text_key=args.column,
-            compression="infer",
-        )
-    else:
-        reader = ParquetReader(
-            data_folder=args.dataset,
-            paths_file=args.paths_file,
-            text_key=args.column,
-        )
-
     preprocess_executor = LocalPipelineExecutor(
         pipeline=[
-            reader,
+            ParquetReader(
+                data_folder=args.dataset,
+                paths_file=args.paths_file,
+                text_key=args.column,
+            ),
             MegatronDocumentTokenizer(
                 output_folder=args.output_folder,
                 tokenizer_name_or_path=args.tokenizer_name_or_path,

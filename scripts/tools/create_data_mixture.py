@@ -21,8 +21,7 @@ def compute_current_sizes(dataset_sample_index, dataset_files):
 
 def build_dataset_mixture(weights: List[float], dataset_files: List[int]) -> List:
     """
-    Given multiple datasets and weights, build a data mixture such that it follows those weights.
-    Stops when the limiting dataset (the one required to maintain ratios) is exhausted.
+    Given multiple datasets and weights, build a data mixture such that it follows those weights
     """
     weights = np.array(weights)
     dataset_sizes = [len(dataset) for dataset in dataset_files]
@@ -30,30 +29,24 @@ def build_dataset_mixture(weights: List[float], dataset_files: List[int]) -> Lis
 
     # Initialize buffer for number of samples used for each dataset
     current_samples = [0 for _ in range(len(weights))]
-    current_weights = weights # Initial guess
+    current_weights = weights
     
-    # Iterate over all possible samples
+    # Iterate over all samples
     for _ in range(total_number_of_files):
-        # Find the dataset with the highest error (the one that is most under-represented)
+        # Find the dataset with the highest error
         errors = weights - current_weights
         max_error_index = np.argmax(errors)
-        
-        # --- LOGIC CHANGE ---
-        # Only stop if the dataset we MUST pick (to satisfy weights) is already full.
-        # This allows us to fill other datasets up to the limit of the smallest one.
-        if current_samples[max_error_index] >= dataset_sizes[max_error_index]:
-            print(f"Limiting dataset {max_error_index} is exhausted. Stopping to maintain mixture ratios.")
-            break
-        
         # Update the total samples for the selected dataset
         current_samples[max_error_index] += 1
         
+        # Exit when consuming entirely a dataset
+        if current_samples[max_error_index] % dataset_sizes[max_error_index] == 0:
+            print(f"Dataset {max_error_index} exhausted!")
+            break
+        
         # Compute weights of the ongoing data mixture
         current_sizes = compute_current_sizes(current_samples, dataset_files)
-        total_current_size = sum(current_sizes)
-        
-        if total_current_size > 0:
-            current_weights = [float(i)/total_current_size for i in current_sizes]
+        current_weights = [float(i)/sum(current_sizes) for i in current_sizes]
 
     return current_samples
 
@@ -80,26 +73,11 @@ def create_symlink_mixture(folders, weights, output_folder):
 
     # Collect bin files from each folder
     bin_files = []
-    total_avail_sizes = [] # To store raw sizes for natural ratio
-
     for folder in folders:
         folder_bin_files = sorted([f for f in get_bin_files(folder)])
-        
-        # Calculate size for natural ratio
-        folder_size = sum(os.path.getsize(f) for f in folder_bin_files)
-        total_avail_sizes.append(folder_size)
-
         random.Random(SEED).shuffle(folder_bin_files)  # Shuffle to prevent bias from ordering
         bin_files.append(folder_bin_files)
     
-    # --- ADDED: Print Natural Ratio ---
-    grand_total = sum(total_avail_sizes)
-    if grand_total > 0:
-        natural_ratios = [round(s / grand_total, 4) for s in total_avail_sizes]
-        natural_mix_display = {f: r for f, r in zip(folders, natural_ratios)}
-        print(f"INFO: Natural data ratio (taking all files as is) would be: {dict(sorted(natural_mix_display.items()))}")
-    # ----------------------------------
-
     # Create the mixture without repeating files
     sample_list = build_dataset_mixture(weights, bin_files)
 
@@ -126,14 +104,10 @@ def create_symlink_mixture(folders, weights, output_folder):
             dataset_sizes.append(sum(sizes))
     
     total_mix_size = sum(dataset_sizes) 
-    
-    if total_mix_size > 0:
-        produced_mix = [round(dataset_size / total_mix_size, 4) for dataset_size in dataset_sizes]
-        produced_mix_dict = {os.path.join(output_folder, dataset): weight for dataset, weight in zip(os.listdir(output_folder), produced_mix)}
-    else:
-        produced_mix_dict = {}
+    produced_mix = [round(dataset_size / total_mix_size, 4) for dataset_size in dataset_sizes]
+    produced_mix = {os.path.join(output_folder, dataset): weight for dataset, weight in zip(os.listdir(output_folder), produced_mix)}
 
-    summary = f"Dataset mixture created in {output_folder} | {len(used_files)} files ({sample_list}) | {round(total_mix_size/(1e12), 2)} TB | {round(total_mix_size/(4e9), 2)} Billion Tokens (x2 if Vocab < 65536) | Resulting mixture is {dict(sorted(produced_mix_dict.items()))}"
+    summary = f"Dataset mixture created in {output_folder} | {len(used_files)} files ({sample_list}) | {round(total_mix_size/(1e12), 2)} TB | {round(total_mix_size/(4e9), 2)} Billion Tokens (x2 if Vocab < 65536) | Resulting mixture is {dict(sorted(produced_mix.items()))}"
     print(summary)
     with open(os.path.join(output_folder, "dataset_mixture_summary.txt"), 'w') as outfile:
         outfile.write(summary)
