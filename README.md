@@ -6,6 +6,9 @@
     <p>Enhanced launcher for Megatron-LM tailored to train LLMs at scale in Slurm-based clusters</p>
 </h3>
 
+>[!WARNING]
+>This repository contains the Megatron-LM code used to train Apertus 1 and Apertus 1.5. For reproducibility, the consolidated code revisions used for both releases are preserved as Git tags.
+
 <!-- TOC -->
 
 - [Introduction](#introduction)
