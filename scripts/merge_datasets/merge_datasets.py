@@ -1,5 +1,6 @@
 import argparse
 import os
+import random
 
 from megatron.core.datasets.indexed_dataset import (
     IndexedDataset,
@@ -33,6 +34,17 @@ def get_args():
         action="store_true",
         help="Whether the datasets are assumed to be multimodal"
     )
+    group.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="Shuffle the order of input datasets before merging"
+    )
+    group.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for shuffling (default: 42)"
+    )
 
     args = parser.parse_args()
 
@@ -65,8 +77,14 @@ def main(args):
 
         prefixes.add(prefix)
 
+    prefixes = sorted(prefixes)
+    if args.shuffle:
+        random.seed(args.seed)
+        random.shuffle(prefixes)
+        print(f"Shuffled {len(prefixes)} datasets with seed {args.seed}")
+
     builder = None
-    for prefix in sorted(prefixes):
+    for prefix in prefixes:
         if builder is None:
             dataset = IndexedDataset(os.path.join(args.input, prefix), multimodal=args.multimodal)
             builder = IndexedDatasetBuilder(

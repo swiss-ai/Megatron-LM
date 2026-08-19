@@ -3,6 +3,7 @@
 import argparse
 import importlib
 import torch.multiprocessing as mp
+import queue as queue_lib
 import sys
 
 # A loader is a python file with at least two functions
@@ -123,7 +124,11 @@ def main():
     parser.add_argument('--save-dir', type=str, required=True,
                         help='Directory to save model checkpoint to')
     parser.add_argument('--max-queue-size', type=int, default=50,
-                        help='Maximum number of tensors in the queue')
+                        help='Maximum number of tensors in the queue (process mode only)')
+    parser.add_argument('--loader-saver-mode', type=str, default='serial',
+                        choices=['serial', 'process'],
+                        help=('How loader/saver communicate: "serial" runs loader then saver in one process; '
+                              '"process" keeps the legacy multiprocessing pipeline'))
     parser.add_argument('--no-checking', action='store_false',
                         help='Do not perform checking on the name and ordering of weights',
                         dest='checking')
@@ -153,27 +158,39 @@ def main():
     saver.add_arguments(parser)
     args = parser.parse_args()
 
-    # Initialize queue
     if args.test_logits:
-        # We need to change start method as loader process will use cuda during verification.
-        # See https://github.com/pytorch/pytorch/issues/40403.
-        mp.set_start_method("spawn")
         assert args.loader == "core", "Only the core loader implements test_logits"
         assert args.saver == "swissai_hf", "Only the swissai_hf saver implements test_logits"
-    queue = mp.Queue(maxsize=args.max_queue_size)
 
-    # Start saver process.
-    print("Starting saver...")
-    saver_proc = mp.Process(target=saver.save_checkpoint, args=(queue, args))
-    saver_proc.start()
+    if args.loader_saver_mode == 'process':
+        # Initialize queue.
+        if args.test_logits:
+            # We need to change start method as loader process will use cuda during verification.
+            # See https://github.com/pytorch/pytorch/issues/40403.
+            mp.set_start_method("spawn")
+        queue = mp.Queue(maxsize=args.max_queue_size)
 
-    # Run loader.
-    print("Starting loader...")
-    loader.load_checkpoint(queue, args)
+        # Start saver process.
+        print("Starting saver...")
+        saver_proc = mp.Process(target=saver.save_checkpoint, args=(queue, args))
+        saver_proc.start()
 
-    # Finish saver process.
-    print("Waiting for saver to complete...")
-    saver_proc.join()
+        # Run loader.
+        print("Starting loader...")
+        loader.load_checkpoint(queue, args)
+
+        # Finish saver process.
+        print("Waiting for saver to complete...")
+        saver_proc.join()
+    else:
+        # Serial mode avoids multiprocessing and fake parallelism between loader/saver.
+        queue = queue_lib.SimpleQueue()
+
+        print("Running loader in serial mode...")
+        loader.load_checkpoint(queue, args)
+
+        print("Running saver in serial mode...")
+        saver.save_checkpoint(queue, args)
 
 
 if __name__ == '__main__':

@@ -2,11 +2,14 @@
 This script converts a megatron torch-dist checkpoint to a megatron torch checkpoint.
 Necessary before conversion to HF.
 '''
+from functools import partial
+
 from megatron.core.enums import ModelType
 from megatron.training.training import setup_model_and_optimizer
 from megatron.training.initialize import initialize_megatron
 from megatron.training.global_vars import get_args
-from pretrain_gpt import model_provider
+from model_provider import model_provider
+from gpt_builders import gpt_builder
 
 
 def main():
@@ -31,7 +34,7 @@ def main():
     args = get_args()
     assert args.load is not None, "You must specify --load"
     assert args.ckpt_convert_save is not None, "You must specify --ckpt-convert-save"
-    setup_model_and_optimizer(model_provider, ModelType.encoder_or_decoder)
+    setup_model_and_optimizer(partial(model_provider, gpt_builder), ModelType.encoder_or_decoder)
 
 
 if __name__ == "__main__":

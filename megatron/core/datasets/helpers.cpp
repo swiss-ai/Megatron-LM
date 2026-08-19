@@ -3,6 +3,7 @@
 /* Helper methods for fast index mapping builds */
 
 #include <algorithm>
+#include <cassert>
 #include <iostream>
 #include <limits>
 #include <math.h>
@@ -46,7 +47,7 @@ void build_exhaustive_blending_indices(py::array_t<int16_t> &dataset_index, py::
   while (dataset_unspent_indices.size() > 0) {
     double index_sample_double = std::max(static_cast<double>(index_sample), 1.0);
 
-    int64_t error_argmax;
+    int64_t error_argmax = -1;
     double error_max = std::numeric_limits<double>::lowest();
 
     for (int32_t index_dataset : dataset_unspent_indices) {
@@ -56,6 +57,7 @@ void build_exhaustive_blending_indices(py::array_t<int16_t> &dataset_index, py::
         error_max = error;
       }
     }
+    assert(error_argmax >= 0);
 
     // Populate the indices.
     dataset_index_ptr[index_sample] = static_cast<int16_t>(error_argmax);
@@ -164,7 +166,8 @@ py::array_t<T> build_sample_idx(
   // Remove bound checks.
   auto sizes = sizes_.unchecked<1>();
   auto document_idx = document_idx_.unchecked<1>();
-
+  
+  // NOTE(asolergi-nv): This is the logic used to compute the number of samples in the GPTDataset when leveraging defer_npy_index_mmap
   // Build the sample idx as a contiguous 1-D array of type T.
   int64_t num_samples = 0;
   if (drop_last_partial_sequence == true) {
@@ -261,6 +264,94 @@ inline int32_t get_target_sample_len(const int32_t short_seq_ratio,
   }
   return max_length;
 }
+
+template <typename DocIdx>
+py::array_t<DocIdx> build_sample_idx_packed_whole_docs(
+    const py::array_t<int32_t>& sizes_,
+    const py::array_t<DocIdx>& doc_idx_,
+    int32_t seq_length,
+    int32_t add_extra_token_to_sequence) {
+    /* Build the sample index for SFT with whole-document packing.
+     * Pack whole documents into sequences until the next document doesn't fit.
+     * Never split documents across sequences - pad the remainder instead.
+     *
+     * Returns a 2D array [num_samples + 1, 2] where each row contains:
+     *   [document_idx_index, 0]  (offset is always 0 since we only use whole docs)
+     */
+
+    // Ensure the input arrays are not empty
+    if (sizes_.size() == 0) {
+        throw std::domain_error("sizes_ is empty");
+    }
+    if (doc_idx_.size() == 0) {
+        throw std::domain_error("doc_idx_ is empty");
+    }
+
+    // Get buffer pointers
+    const int32_t* sizes = sizes_.data();
+    const DocIdx* doc_idx = doc_idx_.data(); // doc_idx keeps track of list of document indices
+
+    // Calculate adjusted sequence length
+    int32_t adjusted_seq_length = seq_length + add_extra_token_to_sequence;
+
+    // Count the number of samples we can create
+    std::vector<std::pair<DocIdx, DocIdx>> sample_starts;
+    sample_starts.reserve(doc_idx_.size()); // estimate
+
+    // Iterate through documents and pack them
+    DocIdx doc_idx_index = 0;
+    while (doc_idx_index < doc_idx_.size()) {
+        // Start a new sample
+        sample_starts.push_back({doc_idx_index, 0});
+        int32_t remaining_seq_length = adjusted_seq_length;
+
+        // keep track of number of added documents to seq. If the 1st doc is too long, it is kept, so it can be truncated or discarded in client code
+        int32_t documents_in_sample = 0;
+
+        // Pack whole documents into this sequence
+        while (doc_idx_index < doc_idx_.size()) {
+            DocIdx doc_id = doc_idx[doc_idx_index];
+            int32_t doc_length = sizes[doc_id];
+
+            // Check if document fits in remaining space
+            if (doc_length <= remaining_seq_length) {
+                // Document fits - include it
+                remaining_seq_length -= doc_length;
+                doc_idx_index++;
+                documents_in_sample++;
+            } else {
+                // Document doesn't fit
+                if (documents_in_sample == 0) {
+                    // if it was the 1st doc that doesnt fit, use it anyway and go to next sample. Leave truncation or discard to client code
+                    // other case: spare this doc for next sample (dont increase doc idx)
+                    doc_idx_index++;
+                }
+                break;
+            }
+
+            // If we've packed exactly to the sequence length, move to next sequence
+            if (remaining_seq_length == 0) {
+                break;
+            }
+        }
+    }
+
+    // Add the final boundary marker
+    sample_starts.push_back({doc_idx_index, 0});
+
+    // Convert to numpy array [num_samples + 1, 2]
+    size_t num_samples = sample_starts.size();
+    auto result = py::array_t<DocIdx>({num_samples, size_t(2)});
+    auto r = result.template mutable_unchecked<2>();
+
+    for (size_t i = 0; i < num_samples; ++i) {
+        r(i, 0) = sample_starts[i].first;   // document_idx_index
+        r(i, 1) = sample_starts[i].second;  // offset (always 0)
+    }
+
+    return result;
+}
+
 
 template <typename DocIdx>
 py::array build_mapping_impl(const py::array_t<int64_t> &docs_,
@@ -841,6 +932,8 @@ PYBIND11_MODULE(helpers_cpp, m)
   m.def("build_blocks_mapping", &build_blocks_mapping);
   m.def("build_sample_idx_int32", &build_sample_idx<int32_t>);
   m.def("build_sample_idx_int64", &build_sample_idx<int64_t>);
+  m.def("build_sample_idx_packed_whole_docs_int32", &build_sample_idx_packed_whole_docs<int32_t>);
+  m.def("build_sample_idx_packed_whole_docs_int64", &build_sample_idx_packed_whole_docs<int64_t>);
   m.def("build_blending_indices", &build_blending_indices);
   m.def("build_exhaustive_blending_indices", &build_exhaustive_blending_indices);
 }

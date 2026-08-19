@@ -17,7 +17,7 @@ from ..dict_utils import dict_list_map_inplace, map_reduce, nested_values
 from ..mapping import ShardedStateDict, ShardedTensor
 from .base import LoadShardedStrategy
 from .tensorstore import _load_from_array, open_ts_array
-from .zarr import flatten_range, load_zarr_based_sharded_metadata
+from .zarr import load_zarr_based_sharded_metadata
 
 _import_trigger = None
 
@@ -104,7 +104,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
         self.dp_group_ranks = tuple(
             sorted(torch.distributed.get_process_group_ranks(data_parallel_group))
         )
-        self.dp_group_rank = torch.distributed.get_rank(self.data_parallel_group_orig)
+        self.dp_group_rank = self.data_parallel_group_orig.rank()
         self.global_rank = torch.distributed.get_rank()
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
@@ -158,7 +158,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
             gloo_pg = torch.distributed.new_group(ranks=group_ranks, backend='gloo')
             if self.global_rank in group_ranks:
                 self.data_parallel_group = gloo_pg
-                assert self.dp_group_rank == torch.distributed.get_rank(self.data_parallel_group)
+                assert self.dp_group_rank == self.data_parallel_group.rank()
 
     def check_backend_compatibility(self, loaded_version):
         pass  # TODO
@@ -179,7 +179,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
             )
             for sharded_ten in nested_values(sharded_state_dict)
         ]
-        all_meta = [None] * torch.distributed.get_world_size(group=self.data_parallel_group)
+        all_meta = [None] * self.data_parallel_group.size()
         torch.distributed.all_gather_object(all_meta, local_meta, group=self.data_parallel_group)
         all_meta = list(chain.from_iterable(all_meta))
         all_tensors_sorted = self.deduplicate_chunks(all_meta)
@@ -251,8 +251,6 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
                 return t
             sharded_tensor: ShardedTensor = t
             x = loaded_ten
-            if sharded_tensor.flattened_range is not None:
-                x = flatten_range(sharded_tensor, x)
 
             # Reuse existing buffer
             sharded_tensor.data.data.copy_(x)

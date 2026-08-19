@@ -1,63 +1,55 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain vision language model."""
+import warnings
 from copy import deepcopy
 from functools import partial
-import warnings
 
 import torch
 
-from megatron.core import parallel_state, tensor_parallel
-from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
+from megatron.core import mpu, parallel_state, tensor_parallel
+from megatron.core.datasets.blended_megatron_dataset_builder import (
+    BlendedMegatronDatasetBuilder,
+)
+from megatron.core.datasets.multimodal_dataset import (
+    MockMultimodalDataset,
+    MultimodalDatasetConfig,
+)
 from megatron.core.enums import ModelType
-from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
-from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.models.multimodal.llava_model import LLaVAModel, DEFAULT_IMAGE_TOKEN_INDEX
+from megatron.core.models.multimodal import context_parallel
+from megatron.core.models.multimodal.llava_model import (
+    DEFAULT_IMAGE_TOKEN_INDEX,
+    LLaVAModel,
+)
 from megatron.core.models.multimodal.llava_spec import (
-    decoder_model_with_transformer_engine_default_spec,
     decoder_model_with_local_default_spec,
+    decoder_model_with_transformer_engine_default_spec,
 )
+from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.core.models.vision.vit_layer_specs import (
-    get_vit_layer_with_transformer_engine_spec,
     get_vit_layer_with_local_spec,
+    get_vit_layer_with_transformer_engine_spec,
 )
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import import_module
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
+from megatron.training import (
+    get_args,
+    get_timers,
+    get_tokenizer,
+    pretrain,
+    print_rank_0,
+)
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.utils import get_batch_on_this_cp_rank
-from megatron.core import mpu
 from pretrain_gpt import loss_func
 
-def calculate_model_parallel_padding(decoder_seq_len):
-    args = get_args()
-    cp_size = args.context_parallel_size
-    tp_size = args.tensor_model_parallel_size
-
-    mp_padding_needed = 0
-    # TP Comm overlap is performed with combined text+image embeddings.
-    # text_only flag skips using the full sequence length to calculate padding and uses
-    # the provided decoder_seq_len
-    if args.sequence_parallel and args.decoder_tp_comm_overlap:
-        # If TP Comm Overlap is enabled for combined text+image embedding in LM backbone,
-        # user needs to provide decoder_seq_length with any potential padding needed for SP+CP
-        assert args.decoder_seq_length is not None, \
-            "Please provide --decoder-seq-length when using TP Comm overlap for LM backbone"
-        mp_padding_needed = args.decoder_seq_length - decoder_seq_len
-    elif args.sequence_parallel or cp_size > 1:
-        if args.sequence_parallel and cp_size > 1:
-            # Padding to multiple of tp_size * cp_size*2 when using sequence parallel and context parallel
-            padding_factor = tp_size * cp_size * 2
-        elif cp_size > 1:
-            padding_factor = cp_size * 2
-        elif args.sequence_parallel:
-            padding_factor = tp_size
-        mp_padding_needed = int((decoder_seq_len + padding_factor - 1) // (padding_factor) * (padding_factor)) - decoder_seq_len
-
-    return mp_padding_needed
 
 def model_provider(
-    pre_process=True, post_process=True, add_encoder=True, add_decoder=True, parallel_output=True
+    pre_process=True,
+    post_process=True,
+    add_encoder=True,
+    add_decoder=True,
+    parallel_output=True,
+    config=None,
+    pg_collection=None,
 ) -> LLaVAModel:
     """Builds the model.
 
@@ -101,13 +93,27 @@ def model_provider(
         warnings.warn(
             f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})"
         )
-    mp_padding_needed = calculate_model_parallel_padding(decoder_seq_len)
+    mp_padding_needed = context_parallel.get_padding(
+        decoder_seq_len,
+        args.context_parallel_size,
+        args.tensor_model_parallel_size,
+        args.sequence_parallel,
+        args.decoder_tp_comm_overlap,
+        args.decoder_seq_length
+    )
     args.decoder_seq_length = decoder_seq_len + mp_padding_needed
 
     args.max_position_embeddings = max(args.max_position_embeddings, args.decoder_seq_length)
 
     print_rank_0('building a multimodal model ...')
-    language_transformer_config = core_transformer_config_from_args(get_args())
+    if config is None:
+        language_transformer_config = core_transformer_config_from_args(get_args())
+    else:
+        language_transformer_config = config
+    if args.decoder_num_layers is not None:
+        language_transformer_config.num_layers = args.decoder_num_layers
+    else:
+        language_transformer_config.num_layers = args.num_layers
     if args.decoder_tp_comm_overlap:
         assert args.transformer_impl == "transformer_engine", \
             "TransformerEngine is needed to support Decoder TP Comm overlap"
@@ -160,28 +166,11 @@ def model_provider(
         print_rank_0("> Disabling TP Comm overlap in Vision Projection. Not yet supported")
         vision_projection_config.tp_comm_overlap = False
 
-    if args.encoder_pipeline_model_parallel_size > 0:
-        assert (
-            args.encoder_pipeline_model_parallel_size == 1
-        ), "ViT can only live on 1 pipeline stage."
-        vision_transformer_config.pipeline_model_parallel_size = (
-            args.encoder_pipeline_model_parallel_size
-        )
-        vision_projection_config.pipeline_model_parallel_size = (
-            args.encoder_pipeline_model_parallel_size
-        )
-        if args.encoder_tensor_model_parallel_size > 0:
-            vision_transformer_config.tensor_model_parallel_size = (
-                args.encoder_tensor_model_parallel_size
-            )
-            vision_projection_config.tensor_model_parallel_size = (
-                args.encoder_tensor_model_parallel_size
-            )
+    # Vision Encoder and Projection should live on PP rank0
+    vision_transformer_config.pipeline_model_parallel_size = 1
+    vision_projection_config.pipeline_model_parallel_size = 1
 
     vision_projection_modules = deepcopy(language_transformer_layer_spec.submodules.mlp.submodules)
-
-    if args.virtual_pipeline_model_parallel_size:
-        raise NotImplementedError("virtual pipeline model parallelism is not supported yet.")
 
     language_max_sequence_length = args.decoder_seq_length
     if args.context_parallel_size > 1:
@@ -203,10 +192,10 @@ def model_provider(
         language_position_embedding_type=args.position_embedding_type,
         language_rotary_percent=args.rotary_percent,
         language_rope_scaling=args.use_rope_scaling,
-        pre_process=pre_process,
-        post_process=post_process,
-        add_encoder=add_encoder,
-        add_decoder=add_decoder,
+        pre_process=parallel_state.is_pipeline_first_stage(),
+        post_process=parallel_state.is_pipeline_last_stage(),
+        add_encoder=parallel_state.is_pipeline_first_stage(),
+        add_decoder=True,
         img_h=args.img_h,
         img_w=args.img_w,
         patch_dim=args.patch_dim,
@@ -243,6 +232,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         image_h=args.img_h,
         image_w=args.img_w,
         preprocess_func=_preprocess_data_for_llava,
+        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
     )
 
     print_rank_0("> building train, validation, and test datasets for multimodal ...")
@@ -294,6 +285,7 @@ def _preprocess_data_for_llava(data):
 
     return data
 
+
 def get_batch(data_iterator):
     """Generate a batch.
 
@@ -303,33 +295,6 @@ def get_batch(data_iterator):
     Returns:
         sample: A data sample with images, tokens, etc.
     """
-    def _get_packed_seq_params(tokens, img_seq_len, mp_padding_needed, use_packed_sequence):
-        batch_size = tokens.shape[0]
-        # Calculate the valid token seq len that LM backbone should compute on
-        combined_valid_seqlen = tokens.shape[1] + img_seq_len - mp_padding_needed
-        cu_seqlens = torch.arange(
-            0, (batch_size + 1) * (combined_valid_seqlen), step=(combined_valid_seqlen), dtype=torch.int32, device=tokens.device)
-        # Calculate the total padded token seq len
-        combined_padded_seqlen = tokens.shape[1] + img_seq_len
-        cu_seqlens_padded = None
-        qkv_format = 'sbhd'
-        if cp_size > 1 and (mp_padding_needed > 0 or use_packed_sequence):
-            # Provide cu_seqlens_<q/kv>_padded for CP support
-            cu_seqlens_padded = torch.arange(
-                0, (batch_size + 1) * (combined_padded_seqlen), step=(combined_padded_seqlen), dtype=torch.int32, device=tokens.device)
-            # CP with padding mask type requires THD format
-            qkv_format = 'thd'
-        packed_seq_params = PackedSeqParams(
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            cu_seqlens_q_padded=cu_seqlens_padded,
-            cu_seqlens_kv_padded=cu_seqlens_padded,
-            max_seqlen_q=combined_padded_seqlen,
-            max_seqlen_kv=combined_padded_seqlen,
-            qkv_format=qkv_format,
-        )
-        return packed_seq_params
-
     args = get_args()
     cp_size = args.context_parallel_size
     # Broadcast data.
@@ -355,16 +320,24 @@ def get_batch(data_iterator):
         vision_model_type = "clip"
         # Calculate the number of image embedding tokens will be added to text tokens
         num_image_embeddings_per_tile = get_num_image_embeddings(
-            args.img_h, args.img_w, args.patch_dim, vision_model_type, args.disable_vision_class_token, 1
+            args.img_h, args.img_w, args.patch_dim, vision_model_type,
+            args.disable_vision_class_token, 1, False
         )
         # Pad to make sure the text sequence can be sharded equally by CP chunks.
         image_token_mask = tokens == DEFAULT_IMAGE_TOKEN_INDEX
         num_images_per_sample = torch.sum(image_token_mask, dim=-1)
         img_seq_len = (num_image_embeddings_per_tile * num_images_per_sample - num_images_per_sample).max()
-        mp_padding_needed_for_text = calculate_model_parallel_padding(tokens.shape[1] + img_seq_len)
+        mp_padding_needed_for_text = context_parallel.get_padding(
+            tokens.shape[1] + img_seq_len,
+            args.context_parallel_size,
+            args.tensor_model_parallel_size,
+            args.sequence_parallel,
+            args.decoder_tp_comm_overlap,
+            args.decoder_seq_length
+        )
         if mp_padding_needed_for_text > 0:
             tokens, position_ids, labels, loss_mask = [torch.nn.functional.pad(item, (0, mp_padding_needed_for_text)) for item in (tokens, position_ids, labels, loss_mask)]
-        packed_seq_params = _get_packed_seq_params(tokens, img_seq_len, mp_padding_needed_for_text, args.use_packed_sequence)
+        packed_seq_params = context_parallel.get_packed_seq_params(tokens, img_seq_len, mp_padding_needed_for_text, cp_size, args.use_packed_sequence)
 
         if packed_seq_params.qkv_format == 'thd':
             # Reshape from [B,S] to [T,1]
@@ -442,37 +415,25 @@ def add_vlm_extra_args(parser):
 
 
 def llava_embedding_ranks(pp_ranks):
-    """LLava's embedding ranks consist of the decoder's first and last ranks (ie, the ViT has no embeddings).
+    """LLaVA's embedding ranks consist of the first and last ranks of the pipeline.
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """
-    args = get_args()
-
-    # encoder size is also the index to the first rank of the decoder.
-    epp = args.encoder_pipeline_model_parallel_size
-
+    first_rank = pp_ranks[0]
     last_rank = pp_ranks[-1]
-    if len(pp_ranks) == 1 or pp_ranks[epp] == last_rank:
-        return [last_rank]
+
+    if len(pp_ranks) == 1:
+        return [first_rank]
     else:
-        return [pp_ranks[epp], last_rank]
+        return [first_rank, last_rank]
 
 
 def llava_position_embedding_ranks(pp_ranks):
-    """LLava's embedding ranks consist of the singular rank of the model or the decoder's first rank.
+    """LLaVA's positional embeddings are on the first rank stage
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """
-    args = get_args()
-
-    # encoder size is also the index to the first rank of the decoder.
-    epp = args.encoder_pipeline_model_parallel_size
-
-    last_rank = pp_ranks[-1]
-    if len(pp_ranks) == 1:
-        return [last_rank]
-    else:
-        return [pp_ranks[epp]]
+    return [pp_ranks[0]]
 
 
 if __name__ == "__main__":
@@ -481,7 +442,7 @@ if __name__ == "__main__":
     pretrain(
         train_valid_test_datasets_provider,
         model_provider,
-        ModelType.encoder_and_decoder,
+        ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
         extra_args_provider=add_vlm_extra_args,

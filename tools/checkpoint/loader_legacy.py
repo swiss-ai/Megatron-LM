@@ -5,7 +5,11 @@ import os
 import sys
 import types
 
+from functools import partial
+
 import torch
+
+from tools.checkpoint.utils import _ConverterFakeProcessGroup
 
 
 def add_arguments(parser):
@@ -29,9 +33,10 @@ def add_arguments(parser):
 
 def _load_checkpoint(queue, args):
 
-    # Search in directory above this
+    # Search in directory above this (repo root)
     sys.path.append(os.path.abspath(
         os.path.join(os.path.dirname(__file__),
+                     os.path.pardir,
                      os.path.pardir)))
     if args.megatron_path is not None:
         sys.path.insert(0, args.megatron_path)
@@ -66,6 +71,7 @@ def _load_checkpoint(queue, args):
                 '--load', args.load_dir,
                 '--position-embedding-type', args.position_embedding_type,
                 '--exit-on-missing-checkpoint',
+                '--use-mp-args-from-checkpoint-args',
                 '--no-one-logger',
                 ]
 
@@ -113,7 +119,9 @@ def _load_checkpoint(queue, args):
 
     # Determine how to make our models
     if args.model_type == 'GPT':
-        from pretrain_gpt import model_provider
+        from model_provider import model_provider as common_model_provider
+        from gpt_builders import gpt_builder
+        model_provider = partial(common_model_provider, gpt_builder)
         margs.model_type = ModelType.encoder_or_decoder
     elif args.model_type == 'BERT':
         from pretrain_bert import model_provider
@@ -136,6 +144,8 @@ def _load_checkpoint(queue, args):
         pre_process = mpu.is_pipeline_first_stage()
         post_process = mpu.is_pipeline_last_stage()
         for rank in range(count):
+            fake_tp_group = mpu.get_tensor_model_parallel_group()
+            fake_tp_group.set_rank(rank)
             mpu.set_tensor_model_parallel_rank(rank)
             if margs.virtual_pipeline_model_parallel_size is not None:
                 model_ = []
@@ -175,6 +185,10 @@ def _load_checkpoint(queue, args):
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
+    
+    # For backward compatibility during local parallel states refactoring
+    fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)
+    mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
     fused_kernels.load(margs)
 
     # Get true (non-padded) vocab size
