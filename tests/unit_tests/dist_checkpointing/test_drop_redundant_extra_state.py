@@ -127,9 +127,7 @@ class TestLocalizeRedundantExtraStates:
         empty = torch.empty(0, dtype=torch.uint8)
         delayed = self._sharded_object('decoder.1._extra_state', _te_like_extra_state(_DELAYED))
         state_dict = {
-            'model': {
-                'layers': [self._sharded_object('decoder.0._extra_state', empty), delayed]
-            }
+            'model': {'layers': [self._sharded_object('decoder.0._extra_state', empty), delayed]}
         }
         _localize_redundant_extra_states(state_dict)
         saved, common = save_preprocess(state_dict, validate_access_integrity=False)
@@ -171,8 +169,13 @@ def test_generate_state_dict_only_localizes_when_opted_in(enabled, ckpt_format):
 )
 def test_quantized_load_request_preserves_fresh_empty_extra_state(fp8, fp4, fp8_calibration):
     args = SimpleNamespace(
-        ckpt_format='torch_dist', ckpt_drop_redundant_extra_state=True,
-        no_save_optim=True, no_save_rng=True, fp8=fp8, fp4=fp4, fp8_calibration=fp8_calibration,
+        ckpt_format='torch_dist',
+        ckpt_drop_redundant_extra_state=True,
+        no_save_optim=True,
+        no_save_rng=True,
+        fp8=fp8,
+        fp4=fp4,
+        fp8_calibration=fp8_calibration,
     )
     # TE 2.10 has not initialized FP8 metadata before the first forward. Its
     # empty local payload must still request the saved delayed-scaling history.
@@ -182,9 +185,7 @@ def test_quantized_load_request_preserves_fresh_empty_extra_state(fp8, fp4, fp8_
         def sharded_state_dict(self, **kwargs):
             return {'extra': extra}
 
-    state = generate_state_dict(
-        args, [Model()], None, None, None, model_sd_kwargs={'metadata': {}}
-    )
+    state = generate_state_dict(args, [Model()], None, None, None, model_sd_kwargs={'metadata': {}})
     requested, local, _ = load_preprocess(state)
     assert requested['model']['extra'] is extra
     assert local == {}
