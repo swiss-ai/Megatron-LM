@@ -2756,10 +2756,10 @@ def _add_checkpointing_args(parser):
                             ' Defaults to the existing gather-based object exchange.')
     group.add_argument('--ckpt-drop-redundant-extra-state', action='store_true',
                        default=False,
-                       help='Keep redundant TE `_extra_state` local instead of persisting'
-                            ' it in distributed checkpoints. Delayed-scaling FP8 amax'
-                            ' history and scales are always persisted. Applies to both'
-                            ' save and load requests; off by default. Older checkpoints'
+                       help='Keep empty TE `_extra_state` local in non-FP8/non-FP4 distributed'
+                            ' checkpoints. Has no effect during FP8/FP4 training or calibration;'
+                            ' all nonempty and unknown payloads remain persistent. Applies'
+                            ' to save and load requests; off by default. Older checkpoints'
                             ' remain loadable when enabled. Keep this flag enabled when'
                             ' resuming a checkpoint saved with redundant state dropped.')
     group.add_argument('--ckpt-assume-constant-structure', action='store_true',

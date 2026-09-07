@@ -8,12 +8,12 @@ artifacts are redundant and rewrite them as local (non-persistent) objects:
 
 The logic operates on the raw serialized ``_extra_state`` bytes, so it is
 exercised here with TE-format payloads built the same way TE's
-``get_extra_state`` does (a ``torch.save`` of a small dict into a ``uint8``
+``get_extra_state`` does (a ``pickle.dumps`` of a small dict into a ``uint8``
 tensor). This needs no FP8 hardware, so it runs identically on FP8-capable CI
 (H100 / GB200) and elsewhere.
 """
 
-import io
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -34,10 +34,8 @@ from megatron.training.checkpointing import (
 
 def _te_like_extra_state(payload: dict) -> torch.Tensor:
     """Serialize ``payload`` the way TE's ``get_extra_state`` does: a
-    ``torch.save`` of a dict into a ``uint8`` byte tensor."""
-    buf = io.BytesIO()
-    torch.save(payload, buf)
-    return torch.frombuffer(bytearray(buf.getvalue()), dtype=torch.uint8)
+    ``pickle.dumps`` of a dict into a ``uint8`` byte tensor."""
+    return torch.frombuffer(bytearray(pickle.dumps(payload)), dtype=torch.uint8)
 
 
 # A delayed-scaling FP8 payload carries amax history + scale buffers -> persistent.
@@ -56,16 +54,16 @@ class TestFp8ExtraStateIsPersistent:
         assert _fp8_extra_state_is_persistent(None) is False
 
     def test_empty_tensor_is_not_persistent(self):
-        # FP8 disabled: get_extra_state returns an empty uint8 tensor.
+        # TE may return empty bytes when disabled or not yet initialized.
         assert _fp8_extra_state_is_persistent(torch.empty(0, dtype=torch.uint8)) is False
 
-    def test_recipe_only_is_not_persistent(self):
+    def test_recipe_only_remains_persistent(self):
         # Block / current scaling: no delayed-scaling markers in the payload.
-        assert _fp8_extra_state_is_persistent(_te_like_extra_state(_RECIPE_ONLY)) is False
+        assert _fp8_extra_state_is_persistent(_te_like_extra_state(_RECIPE_ONLY)) is True
 
     @pytest.mark.parametrize("marker", ["amax_history_fwd", "scale_fwd", "scale_bwd"])
     def test_delayed_scaling_markers_are_persistent(self, marker):
-        # Any one delayed-scaling marker is enough to keep the payload.
+        # Every nonempty payload remains persistent, including delayed scaling.
         assert (
             _fp8_extra_state_is_persistent(_te_like_extra_state({marker: torch.zeros(2)})) is True
         )
@@ -107,11 +105,10 @@ class TestLocalizeRedundantExtraStates:
         }
         _localize_redundant_extra_states(state_dict)
 
-        # Redundant (empty / recipe-only) _extra_state -> dropped on save.
+        # Only empty state is dropped; all nonempty payloads stay persistent.
         assert isinstance(state_dict["empty_es"], LocalNonpersistentObject)
-        assert isinstance(state_dict["recipe_es"], LocalNonpersistentObject)
-        # The wrapped value is preserved so load can restore the key locally.
-        assert state_dict["recipe_es"].unwrap() is recipe_es.data
+        assert state_dict["recipe_es"] is recipe_es
+        assert state_dict["empty_es"].unwrap() is None
         # Delayed-scaling _extra_state stays a ShardedObject (still checkpointed).
         assert state_dict["delayed_es"] is delayed_es
         # Non-_extra_state objects and tensors are untouched.
@@ -127,11 +124,11 @@ class TestLocalizeRedundantExtraStates:
         assert state_dict["delayed_es"] is delayed_es
 
     def test_nested_local_values_are_dropped_on_save_and_restored_on_load(self):
-        recipe = _te_like_extra_state(_RECIPE_ONLY)
+        empty = torch.empty(0, dtype=torch.uint8)
         delayed = self._sharded_object('decoder.1._extra_state', _te_like_extra_state(_DELAYED))
         state_dict = {
             'model': {
-                'layers': [self._sharded_object('decoder.0._extra_state', recipe), delayed]
+                'layers': [self._sharded_object('decoder.0._extra_state', empty), delayed]
             }
         }
         _localize_redundant_extra_states(state_dict)
@@ -141,7 +138,7 @@ class TestLocalizeRedundantExtraStates:
         assert common == {}
         assert saved['model']['layers'] == [delayed]
         assert requested['model']['layers'] == [delayed]
-        assert local['model']['layers'][0] is recipe
+        assert local['model']['layers'][0] is empty
 
 
 @pytest.mark.parametrize('enabled', [None, False, True])
@@ -166,3 +163,32 @@ def test_generate_state_dict_only_localizes_when_opted_in(enabled, ckpt_format):
             LocalNonpersistentObject if enabled and ckpt_format == 'torch_dist' else ShardedObject
         )
         assert isinstance(state['model']['extra'], expected_type)
+
+
+@pytest.mark.parametrize(
+    'fp8,fp4,fp8_calibration',
+    [('hybrid', None, False), ('e4m3', None, False), (None, None, True), (None, 'e2m1', False)],
+)
+def test_quantized_load_request_preserves_fresh_empty_extra_state(fp8, fp4, fp8_calibration):
+    args = SimpleNamespace(
+        ckpt_format='torch_dist', ckpt_drop_redundant_extra_state=True,
+        no_save_optim=True, no_save_rng=True, fp8=fp8, fp4=fp4, fp8_calibration=fp8_calibration,
+    )
+    # TE 2.10 has not initialized FP8 metadata before the first forward. Its
+    # empty local payload must still request the saved delayed-scaling history.
+    extra = ShardedObject('decoder._extra_state', torch.empty(0, dtype=torch.uint8), (1,), (0,))
+
+    class Model:
+        def sharded_state_dict(self, **kwargs):
+            return {'extra': extra}
+
+    state = generate_state_dict(
+        args, [Model()], None, None, None, model_sd_kwargs={'metadata': {}}
+    )
+    requested, local, _ = load_preprocess(state)
+    assert requested['model']['extra'] is extra
+    assert local == {}
+
+
+def test_unknown_byte_payload_remains_persistent():
+    assert _fp8_extra_state_is_persistent(torch.tensor([1, 2, 3], dtype=torch.uint8)) is True
