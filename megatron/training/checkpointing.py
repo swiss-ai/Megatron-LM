@@ -21,7 +21,8 @@ from typing import Optional, Union, List, Dict, Any
 from torch.distributed.checkpoint import FileSystemReader, default_planner
 
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
-from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
+from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
 from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
@@ -887,7 +888,98 @@ def generate_state_dict(
     if not args.no_save_rng and rng_state:
         state_dict["rng_state"] = rng_state
 
+    # This entry point builds both save state dicts and load requests, keeping
+    # redundant-extra-state handling symmetric and disabled by default.
+    if args.ckpt_format == "torch_dist" and getattr(
+        args, "ckpt_drop_redundant_extra_state", False
+    ):
+        _localize_redundant_extra_states(state_dict)
+
     return state_dict
+
+
+# Byte markers of the dict keys that TE `get_extra_state` writes ONLY under
+# `if recipe.delayed():` (see TransformerEngine `module/base.py`). Their presence
+# in the serialized payload is a robust, unpickle-free signal that the
+# `_extra_state` carries persistent delayed-scaling state (amax history + scale).
+_FP8_PERSISTENT_EXTRA_STATE_MARKERS = (b"amax_history_fwd", b"scale_fwd", b"scale_bwd")
+
+
+def _fp8_extra_state_is_persistent(data) -> bool:
+    """Whether a TE `_extra_state` payload must be checkpointed.
+
+    A `_extra_state` is worth persisting only when it carries state that cannot
+    be reconstructed from the run config at model-build time, i.e. the
+    delayed-scaling FP8 amax history + scale. Concretely:
+
+    * ``None`` / empty ``uint8`` tensor  -> FP8 disabled        -> NOT persistent
+    * non-empty, no delayed-scaling key  -> block/current scaling (NVFP4, MXFP8,
+      Float8CurrentScaling): recipe + scalars only, all config-derived
+                                                                  -> NOT persistent
+    * non-empty, has ``scale_fwd`` / ``amax_history_fwd`` / ``scale_bwd``
+                                          -> delayed scaling      -> persistent
+
+    The check operates on the raw serialized bytes (the uint8 tensor that
+    ``get_extra_state`` returns) so it needs no unpickling and no TE import.
+    Anything unrecognized defaults to persistent, so real state is never
+    silently dropped.
+    """
+    if data is None:
+        return False
+    if isinstance(data, torch.Tensor):
+        if data.dtype != torch.uint8:
+            return True
+        if data.numel() == 0:
+            return False
+        try:
+            raw = data.detach().cpu().contiguous().numpy().tobytes()
+        except Exception:
+            return True
+        return any(marker in raw for marker in _FP8_PERSISTENT_EXTRA_STATE_MARKERS)
+    # Unknown payload type: keep it persistent to be safe.
+    return True
+
+
+def _localize_redundant_extra_states(state_dict):
+    """Rewrite non-persistent TE `_extra_state` ShardedObjects as local objects.
+
+    For checkpoints with no FP8, or with block/current FP8 scaling (NVFP4,
+    MXFP8, Float8CurrentScaling), every `_extra_state` is either empty or a
+    recipe-only blob that the freshly-built model reproduces from config — see
+    `_fp8_extra_state_is_persistent`. Such artifacts are pure overhead: in a
+    large MoE model they account for the overwhelming majority of the
+    checkpoint's ShardedObjects (e.g. ~50k on the 55B hybrid-MoE run).
+
+    Wrapping them in ``LocalNonpersistentObject`` (instead of ``ShardedObject``)
+    means, via the dist-checkpointing pipeline:
+
+    * SAVE: ``save_preprocess`` drops them, so they are never written to disk.
+    * LOAD: ``load_preprocess`` unwraps them back into the loaded state dict with
+      the local (freshly-built) value, so the module's ``_extra_state`` key is
+      still present (strict ``load_state_dict`` stays happy) and
+      ``set_extra_state`` no-ops on the empty/recipe payload.
+
+    Because this runs in ``generate_state_dict`` (shared by save and the load
+    request), the decision is symmetric: dropped keys are never *requested*, so
+    loading an older checkpoint that still stores them simply does not read them
+    (they are neither "missing" nor "unexpected" in the request) — backward
+    compatible. Delayed-scaling `_extra_state` stays a ``ShardedObject`` and is
+    saved/loaded exactly as before.
+
+    Keep the flag enabled when resuming checkpoints saved with redundant state
+    dropped: disabling it would request artifacts that were never persisted.
+    """
+
+    def _maybe_localize(value):
+        if (
+            isinstance(value, ShardedObject)
+            and value.key.endswith("_extra_state")
+            and not _fp8_extra_state_is_persistent(value.data)
+        ):
+            return LocalNonpersistentObject(value.data)
+        return value
+
+    dict_list_map_inplace(_maybe_localize, state_dict)
 
 
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
@@ -1061,7 +1153,9 @@ def _load_global_dist_base_checkpoint(
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
         load_strategy = FullyParallelLoadStrategyWrapper(
-            load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
+            load_strategy,
+            mpu.get_data_parallel_group(with_context_parallel=True),
+            per_rank_object_load=getattr(args, 'ckpt_fully_parallel_load_per_rank_objects', False),
         )
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy
