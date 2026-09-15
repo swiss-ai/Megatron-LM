@@ -32,6 +32,7 @@ class MegatronCheckpointLoaderBase:
         self.consumed_valid_samples = None
         self._converter_fake_groups = {}
         self._use_converter_fake_groups = False
+        self._plain_tensors = None   # Cache for --use-plain-tensor-loading
 
     def _maybe_parse_additional_megatron_args(self, margs, checkpoint_args):
         """
@@ -63,6 +64,20 @@ class MegatronCheckpointLoaderBase:
 
         margs = parse_args()
         margs, checkpoint_args = load_args_from_checkpoint(margs)
+
+        # Checkpoints saved with --ckpt-fully-parallel-save stripe each tensor across the
+        # full data-parallel group used at training time (not just TP/PP), to speed up
+        # checkpoint I/O. This converter runs as a single real process, so it can never
+        # perform the real-rank gather that reconstructs those DP-striped pieces
+        # (FullyParallelLoadStrategyWrapper requires >1 real ranks and no-ops otherwise).
+        # Instead, when this mode is requested, we sidestep the problem entirely: request
+        # each tensor fully unsharded (see _load_plain_model_tensors) and treat the
+        # checkpoint as tensor_model_parallel_size=1 for every downstream TP-shard loop.
+        # The model architecture itself (hidden size, heads, layers, ...) is
+        # TP-independent, so this only changes how we load, not what gets loaded.
+        self.real_tensor_model_parallel_size = margs.tensor_model_parallel_size
+        if getattr(self.args, 'use_plain_tensor_loading', False):
+            margs.tensor_model_parallel_size = 1
 
         # Adjust world size so validation doesn't fail
         margs.world_size = margs.tensor_model_parallel_size * margs.pipeline_model_parallel_size
@@ -169,6 +184,37 @@ class MegatronCheckpointLoaderBase:
             sys.exit(1)
 
         set_global_variables(self.margs, build_tokenizer=self.build_tokenizer)
+        # megatron.core.dist_checkpointing.load() calls torch.distributed.get_world_size()
+        # directly (determine_global_metadata) regardless of the mpu fake-group shim below,
+        # so a real (if trivial, single-rank) default process group must exist even for a
+        # single-process converter run.
+        if not torch.distributed.is_initialized():
+            os.environ.setdefault("MASTER_ADDR", "localhost")
+            os.environ.setdefault("MASTER_PORT", "12355")
+            torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
+
+        # dist_checkpointing.load()'s validate_access_integrity (default True) checks that
+        # all *real* ranks collectively cover a sharded tensor exactly once. This converter
+        # loads TP/PP shards one at a time in a single real process (looping fake mpu ranks
+        # around each dist_checkpointing.load() call, per get_models_for_pipeline_stage
+        # below), so any call here only ever sees its own shard against a real world_size of
+        # 1 -- that per-call view is always "incomplete" relative to the tensor's full
+        # sharding, independent of whether the overall conversion is actually correct.
+        # Coverage across the whole tensor is instead guaranteed by the outer per-rank loop,
+        # so this cross-rank check is inapplicable to this execution model; disable it here
+        # rather than in the shared training checkpoint-loading path.
+        import megatron.core.dist_checkpointing as _dist_checkpointing
+
+        if not getattr(_dist_checkpointing, "_converter_validate_access_integrity_patched", False):
+            _orig_dist_ckpt_load = _dist_checkpointing.load
+
+            def _dist_ckpt_load_no_validate(*load_args, **load_kwargs):
+                load_kwargs.setdefault("validate_access_integrity", False)
+                return _orig_dist_ckpt_load(*load_args, **load_kwargs)
+
+            _dist_checkpointing.load = _dist_ckpt_load_no_validate
+            _dist_checkpointing._converter_validate_access_integrity_patched = True
+
         mpu.set_tensor_model_parallel_world_size(self.margs.tensor_model_parallel_size)
         mpu.set_pipeline_model_parallel_world_size(self.margs.pipeline_model_parallel_size)
         mpu.set_virtual_pipeline_model_parallel_world_size(self.margs.virtual_pipeline_model_parallel_size)
@@ -206,6 +252,73 @@ class MegatronCheckpointLoaderBase:
                 print("Both --true-vocab-size and --vocab-file specified but vocab sizes do not match. Aborting.")
                 return False
         return True
+
+    def _load_plain_model_tensors(self):
+        """
+        Load all *model* tensors (no optimizer/RNG state) fully unsharded, i.e.
+        without reconstructing however the checkpoint happened to be split across
+        ranks at save time (TP/PP *and*, for --ckpt-fully-parallel-save checkpoints,
+        an additional data-parallel split of each tensor). Used by --use-plain-tensor-
+        loading as a drop-in replacement for the regular load_checkpoint() call, which
+        can't reconstruct that extra DP-level split from a single real process (see
+        parse_megatron_args for the full explanation).
+
+        Cached on self, since it's expensive and the result is identical across every
+        pipeline/virtual-pipeline stage that calls this during a single conversion run.
+        """
+        if self._plain_tensors is None:
+            from megatron.core import dist_checkpointing
+            from megatron.training.checkpointing import get_checkpoint_name
+
+            # self.args.load_dir may be a bare tracker directory (a
+            # latest_checkpointed_iteration.txt + iter_NNNNNNN layout) rather than the
+            # checkpoint itself -- load_tensors_metadata()/dist_checkpointing.load() need
+            # the actual checkpoint root (containing .metadata directly), same as what
+            # the regular load_checkpoint() path resolves to internally.
+            checkpoint_dir = get_checkpoint_name(
+                self.args.load_dir, self.margs.iteration, release=False, return_base_dir=True
+            )
+
+            sharded_metadata = dist_checkpointing.load_tensors_metadata(checkpoint_dir)
+            model_metadata = {
+                k: v for k, v in sharded_metadata.items() if not k.startswith('optimizer.')
+            }
+            print(f"Loading {len(model_metadata)} model tensors fully unsharded "
+                  f"(--use-plain-tensor-loading)...")
+            plain_tensors = dist_checkpointing.load(
+                model_metadata, checkpoint_dir, validate_access_integrity=False
+            )
+            self._plain_tensors = self._expand_stacked_layer_tensors(plain_tensors)
+        return self._plain_tensors
+
+    def _expand_stacked_layer_tensors(self, plain_tensors):
+        """
+        The checkpoint's *unsharded* representation stores each per-layer parameter as
+        one tensor stacked across all layers (e.g. 'decoder.layers.mlp.linear_fc1.weight'
+        with shape (num_layers, ...)), rather than the per-layer, numerically-indexed
+        keys a real model's state_dict() uses (e.g. 'decoder.layers.0.mlp.linear_fc1.
+        weight', '...layers.1...', ...). Slice each stacked tensor back into per-layer
+        entries under those keys so model.load_state_dict(..., strict=False) can match
+        them; embeddings/output_layer/final_norm keys have no layer axis and pass through
+        unchanged. Slicing returns views (no extra memory copy).
+        """
+        block_key = {"GPT": "decoder", "BERT": "encoder"}[self.args.model_type]
+        layer_prefix = f"{block_key}.layers."
+        num_layers = self.margs.num_layers
+
+        expanded = {}
+        for key, tensor in plain_tensors.items():
+            if key.startswith(layer_prefix):
+                suffix = key[len(layer_prefix):]
+                assert tensor.shape[0] == num_layers, (
+                    f"Expected {key} to have a leading layer axis of size {num_layers} "
+                    f"(margs.num_layers), got shape {tuple(tensor.shape)}"
+                )
+                for layer_idx in range(num_layers):
+                    expanded[f"{layer_prefix}{layer_idx}.{suffix}"] = tensor[layer_idx]
+            else:
+                expanded[key] = tensor
+        return expanded
 
     def load_model_shards(self, model_provider, dtype):
         """
@@ -252,7 +365,21 @@ class MegatronCheckpointLoaderBase:
                 self.margs.consumed_train_samples = 0
                 self.margs.consumed_valid_samples = 0
                 self.margs.exit_on_missing_checkpoint = True
-                load_checkpoint(model_list, None, None)
+                if getattr(self.args, 'use_plain_tensor_loading', False):
+                    plain_tensors = self._load_plain_model_tensors()
+                    for m in model_list:
+                        missing, _unexpected = m.load_state_dict(plain_tensors, strict=False)
+                        # '_extra_state' entries hold TE's FP8 amax-history/scaling
+                        # metadata, not real weights; they're absent from the checkpoint
+                        # (and fine to leave at their module-initialized default) whenever
+                        # training didn't use FP8, as here.
+                        missing = [k for k in missing if not k.endswith('_extra_state')]
+                        assert not missing, (
+                            f"Missing keys when populating model from plain (unsharded) "
+                            f"checkpoint tensors: {missing}"
+                        )
+                else:
+                    load_checkpoint(model_list, None, None)
 
                 # Validate that train/valid samples match across ranks
                 nonlocal consumed_train_samples, consumed_valid_samples

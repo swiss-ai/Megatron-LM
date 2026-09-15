@@ -56,7 +56,18 @@ def perform_check(
     then pop the keys from ref_state_dict
     """
     for key in state_dict:
-        assert torch.equal(ref_state_dict[key], state_dict[key])
+        ref = ref_state_dict[key].to(state_dict[key].device)
+        ours = state_dict[key]
+        # allclose rather than exact equality: fixed scalar config constants (e.g. xIELU's
+        # eps) can differ from the reference by a float32 ULP or two depending on how they
+        # were (re)computed, with no bearing on the actual loaded weights.
+        if not torch.allclose(ref.float(), ours.float(), rtol=1e-5, atol=1e-6):
+            diff = (ref.float() - ours.float()).abs()
+            raise AssertionError(
+                f"Mismatch at key={key!r} shape={tuple(ours.shape)} dtype={ours.dtype} "
+                f"max_abs_diff={diff.max().item()} mean_abs_diff={diff.mean().item()} "
+                f"num_mismatched={(ref != ours).sum().item()}/{ours.numel()}"
+            )
         ref_state_dict.pop(key)
     return ref_state_dict
 

@@ -29,6 +29,17 @@ def add_arguments(parser):
     group.add_argument('--loader-transformer-impl', default='transformer_engine',
                        choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.')
+    group.add_argument('--use-plain-tensor-loading', action='store_true',
+                       help='Load each checkpoint tensor fully unsharded instead of '
+                            'reconstructing it from per-(TP,PP)-rank shards. Required for '
+                            'checkpoints saved with --ckpt-fully-parallel-save: this '
+                            'single-process converter cannot perform the real multi-rank '
+                            'gather needed to reassemble a tensor that was additionally '
+                            'split across the data-parallel group at save time, and hits '
+                            '"Number of local shards does not match ... in '
+                            'sharded_tensor_metadata" otherwise. Safe (if slightly less '
+                            'efficient) for checkpoints that were not fully-parallel-saved '
+                            'too.')
 
 
 class MegatronCheckpointLoaderLLM(MegatronCheckpointLoaderBase):
