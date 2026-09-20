@@ -21,7 +21,8 @@ from typing import Optional, Union, List, Dict, Any
 from torch.distributed.checkpoint import FileSystemReader, default_planner
 
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
-from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
+from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
 from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
@@ -887,7 +888,58 @@ def generate_state_dict(
     if not args.no_save_rng and rng_state:
         state_dict["rng_state"] = rng_state
 
+    # Fresh TE modules can return empty extra state before their first FP8
+    # forward, even when a checkpoint contains scaling history. Never localize
+    # FP8, FP4 or calibration load requests based on those uninitialized payloads.
+    # Apply the same conservative decision to save and load state dicts.
+    if (
+        args.ckpt_format == "torch_dist"
+        and getattr(args, "ckpt_drop_redundant_extra_state", False)
+        and not getattr(args, "fp8", None)
+        and not getattr(args, "fp4", None)
+        and not getattr(args, "fp8_calibration", False)
+    ):
+        _localize_redundant_extra_states(state_dict)
+
     return state_dict
+
+
+def _fp8_extra_state_is_persistent(data) -> bool:
+    """Keep every nonempty or unknown payload; only absent/empty bytes are redundant.
+
+    This conservative backport targets empty TE artifacts in non-FP8/non-FP4 runs.
+    Payload contents cannot identify the recipe of an uninitialized load request,
+    so callers must separately exclude FP8/FP4 training and calibration.
+    """
+    return not (
+        data is None
+        or (isinstance(data, torch.Tensor) and data.dtype == torch.uint8 and data.numel() == 0)
+    )
+
+
+def _localize_redundant_extra_states(state_dict):
+    """Keep empty TE extra state local for non-FP8/non-FP4 distributed checkpoints.
+
+    ``generate_state_dict`` invokes this only outside FP8/FP4 training and calibration,
+    using the same decision for save state dicts and load requests. Nonempty
+    payloads, including delayed-scaling history and recipe blobs, stay persistent.
+
+    ``LocalNonpersistentObject`` omits the empty artifact on save and restores
+    its local value on load, retaining the key for strict module state loading.
+    Keep the flag enabled when resuming checkpoints saved with empty artifacts
+    dropped: disabling it would request files that were never persisted.
+    """
+
+    def _maybe_localize(value):
+        if (
+            isinstance(value, ShardedObject)
+            and value.key.endswith("_extra_state")
+            and not _fp8_extra_state_is_persistent(value.data)
+        ):
+            return LocalNonpersistentObject(value.data)
+        return value
+
+    dict_list_map_inplace(_maybe_localize, state_dict)
 
 
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
@@ -1061,7 +1113,9 @@ def _load_global_dist_base_checkpoint(
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
         load_strategy = FullyParallelLoadStrategyWrapper(
-            load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
+            load_strategy,
+            mpu.get_data_parallel_group(with_context_parallel=True),
+            per_rank_object_load=getattr(args, 'ckpt_fully_parallel_load_per_rank_objects', False),
         )
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy

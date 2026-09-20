@@ -2748,6 +2748,20 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ckpt-fully-parallel-load', action='store_true',
                        help='Apply full load parallelization across DP for'
                             ' distributed checkpoints.')
+    group.add_argument('--ckpt-fully-parallel-load-per-rank-objects', action='store_true',
+                       default=False,
+                       help='During fully parallel distributed checkpoint load, read all'
+                            ' ShardedObjects requested by each rank directly from storage'
+                            ' instead of exchanging them with a WORLD all_gather_object.'
+                            ' Defaults to the existing gather-based object exchange.')
+    group.add_argument('--ckpt-drop-redundant-extra-state', action='store_true',
+                       default=False,
+                       help='Keep empty TE `_extra_state` local in non-FP8/non-FP4 distributed'
+                            ' checkpoints. Has no effect during FP8/FP4 training or calibration;'
+                            ' all nonempty and unknown payloads remain persistent. Applies'
+                            ' to save and load requests; off by default. Older checkpoints'
+                            ' remain loadable when enabled. Keep this flag enabled when'
+                            ' resuming a checkpoint saved with redundant state dropped.')
     group.add_argument('--ckpt-assume-constant-structure', action='store_true',
                        help='If the model and optimizer state dict structure is'
                             'constant throughout a *single training job*, it allows for'

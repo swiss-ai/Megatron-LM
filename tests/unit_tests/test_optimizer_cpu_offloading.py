@@ -139,3 +139,55 @@ def test_multi_device_hybrid_optimizer(
         assert torch.allclose(
             v, ref_params[k], atol=1e-03
         ), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
+
+
+def test_distributed_optimizer_with_cpu_offload_and_fp32_param():
+    """Test that DistributedOptimizer works with HybridDeviceOptimizer (CPU offloading)
+    when the model has FP32 parameters without raising non-leaf Tensor ValueError.
+    """
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+    from megatron.core.transformer import TransformerConfig
+    from tests.unit_tests.test_utilities import Utils
+
+    class MixedPrecisionToyNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+            self.scale = nn.Parameter(torch.ones(4, dtype=torch.float32))
+
+        def forward(self, x):
+            return self.proj(x) * self.scale
+
+    Utils.initialize_distributed()
+    Utils.initialize_model_parallel()
+
+    try:
+        model = MixedPrecisionToyNet().cuda()
+        assert model.proj.weight.dtype == torch.bfloat16
+        assert model.scale.dtype == torch.float32
+
+        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+        transformer_config = TransformerConfig(num_attention_heads=1, num_layers=1)
+        ddp_model = DistributedDataParallel(transformer_config, ddp_config, model)
+
+        optimizer_config = OptimizerConfig(
+            optimizer='adam',
+            lr=1e-3,
+            bf16=True,
+            use_distributed_optimizer=True,
+            optimizer_cpu_offload=True,
+            optimizer_offload_fraction=1.0,
+        )
+
+        optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
+
+        inputs = torch.ones(2, 4, device="cuda", dtype=torch.bfloat16)
+        output = ddp_model(inputs)
+        loss = output.sum()
+        loss.backward()
+
+        update_successful, grad_norm, _ = optimizer.step()
+        assert update_successful
+    finally:
+        Utils.destroy_model_parallel()
