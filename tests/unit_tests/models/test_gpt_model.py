@@ -3,6 +3,7 @@
 import inspect
 import os
 from datetime import timedelta
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -443,3 +444,39 @@ class TestGPTWithDynamicInference:
 
         # Assert that all padding logits are zero.
         assert torch.all(padding_logits == 0.0), "Logits for padding tokens are not all zero."
+
+
+def test_gpt_builder_forwards_rope_scaling_factor():
+    """Test that gpt_builder forwards rope_scaling_factor to GPTModel.
+
+    Regression test for https://github.com/NVIDIA/Megatron-LM/issues/6305
+    The --rope-scaling-factor flag was silently ignored because gpt_builder
+    passed rope_scaling but not rope_scaling_factor, so GPTModel always fell
+    back to its default factor.
+    """
+    mock_config = MagicMock()
+
+    mock_args = MagicMock()
+    mock_args.use_legacy_models = False
+    mock_args.spec = None
+    mock_args.transformer_impl = "transformer_engine"
+    mock_args.experimental_attention_variant = None
+    mock_args.num_experts = None
+    mock_args.heterogeneous_layers_config_path = None
+    mock_args.mtp_num_layers = None
+    mock_args.use_rope_scaling = True
+    mock_args.rope_scaling_factor = 32.0
+
+    with (
+        patch('gpt_builders.GPTModel') as mock_gpt_model,
+        patch('gpt_builders._get_transformer_layer_spec'),
+    ):
+        from gpt_builders import gpt_builder
+
+        gpt_builder(mock_args, pre_process=True, post_process=True, config=mock_config)
+
+        mock_gpt_model.assert_called_once()
+        _, call_kwargs = mock_gpt_model.call_args
+        assert (
+            call_kwargs.get('rope_scaling_factor') == 32.0
+        ), "rope_scaling_factor must be forwarded from args"
