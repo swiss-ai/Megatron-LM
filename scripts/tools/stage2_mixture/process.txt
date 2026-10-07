@@ -1,0 +1,35 @@
+# Initial mixture
+# [keep] /iopsstor/scratch/cscs/jpcoles/a06/finemath-3plus-merge
+# [keep] /iopsstor/scratch/cscs/jpcoles/a06/starcoder-extras-merge
+# [keep] /iopsstor/scratch/cscs/jpcoles/a06/starcoder-threshold-0-merge
+# [    ] /iopsstor/scratch/cscs/jpcoles/a06/swissai-fineweb-edu-score-2-filterrobots-merge
+# [keep] /iopsstor/scratch/cscs/jpcoles/a06/swissai-fineweb-2-quality_33-filterrobots-merge/euro-high
+# [keep] /iopsstor/scratch/cscs/jpcoles/a06/swissai-fineweb-2-quality_33-filterrobots-merge/euro-mid
+# [keep] /iopsstor/scratch/cscs/jpcoles/a06/swissai-fineweb-2-quality_33-filterrobots-merge/other-high
+# [keep] /iopsstor/scratch/cscs/jpcoles/a06/swissai-fineweb-2-quality_33-filterrobots-merge/rest
+# [keep] /iopsstor/scratch/cscs/jpcoles/a06/poison
+# [keep] /iopsstor/scratch/cscs/jpcoles/a06/gutenberg
+
+
+remove_seen
+remove /iopsstor/scratch/cscs/jpcoles/a06/swissai-fineweb-edu-score-2-filterrobots-merge
+
+
+# Final mixture:
+# [add] /capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/infiwebmath-3plus-merge
+# [add] /capstor/store/cscs/swissai/a06/datasets_swissai/tokens/swissai-fineweb-1_3_0-quality_33-filterrobots-merge
+# [add] /capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/swissai-fineweb-edu-filterrobots-merge
+# [   ] /capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/finemath-3plus-merge
+# [   ] /capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/starcoder-extras-merge
+# [   ] /capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/starcoder-threshold-0-merge
+# [   ] /capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/swissai-fineweb-2-quality_33-filterrobots-merge/euro-high
+# [   ] /capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/swissai-fineweb-2-quality_33-filterrobots-merge/euro-mid
+# [   ] /capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/swissai-fineweb-2-quality_33-filterrobots-merge/other-high
+# [   ] /capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/swissai-fineweb-2-quality_33-filterrobots-merge/rest
+# [   ] /capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/poison
+# [   ] /capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/gutenberg
+
+
+incorporate /capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/infiwebmath-3plus-merge
+incorporate /capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/swissai-fineweb-edu-filterrobots-merge
+incorporate /capstor/store/cscs/swissai/a06/datasets_swissai/tokens/swissai-fineweb-1_3_0-quality_33-filterrobots-merge
