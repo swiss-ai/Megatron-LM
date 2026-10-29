@@ -13,6 +13,9 @@ position with loss, in row-major order of ``(sequence, position)``, the order of
 """
 
 import itertools
+import multiprocessing.util
+import os
+import tempfile
 from typing import Dict, Iterator, Optional, Tuple
 
 import torch
@@ -117,6 +120,22 @@ class MicroBatches:
                 for key, value in self.piece.items()}
 
 
+def check_worker_tmpdir(num_workers: int):
+    """Fail at once where DataLoader workers would hang.
+
+    Workers hand tensors to the main process through Unix sockets in the multiprocessing
+    temp dir, under TMPDIR. Python 3.12 does not fall back to a shorter directory when a
+    socket path is too long (108 bytes): the workers' queue threads fail and the main
+    process waits for the first batch forever.
+    """
+    if num_workers > 0:
+        socket = os.path.join(multiprocessing.util.get_temp_dir(), 'listener-12345678')
+        assert len(os.fsencode(socket)) < 108, (
+            f'TMPDIR={tempfile.gettempdir()} is too long for the sockets of DataLoader '
+            'workers: set a shorter TMPDIR, such as /tmp'
+        )
+
+
 def build_cache_iterator(
     cache: CacheSequences,
     steps: range,
@@ -133,6 +152,7 @@ def build_cache_iterator(
     assert not steps or needed <= cache.num_sequences, (
         f'{cache.cache_dir} has {cache.num_sequences} completed sequences, {needed} are needed'
     )
+    check_worker_tmpdir(num_workers)
     spans = RankSpans(steps, global_batch, dp_rank, dp_size, cache.seqs_per_chunk, base, cycle)
     loader = torch.utils.data.DataLoader(
         cache, sampler=spans, batch_size=None, num_workers=num_workers, pin_memory=True,

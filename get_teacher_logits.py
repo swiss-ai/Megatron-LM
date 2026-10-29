@@ -40,6 +40,7 @@ from megatron.training.distillation.cache_format import (
     write_manifest,
     write_progress,
 )
+from megatron.training.distillation.cache_reader import check_worker_tmpdir
 from megatron.training.distillation.cache_writer import AsyncShardWriter, FileBatchSampler
 from megatron.training.distillation.scoring import teacher_rows
 from megatron.training.initialize import initialize_megatron
@@ -270,6 +271,7 @@ def main():
     )
     data_iterator = None
     if train_ds is not None:
+        check_worker_tmpdir(args.num_workers)
         sampler = FileBatchSampler(start_file, end_file, seqs_per_file, args.micro_batch_size,
                                    dp_rank, dp_size)
         data_iterator = iter(torch.utils.data.DataLoader(

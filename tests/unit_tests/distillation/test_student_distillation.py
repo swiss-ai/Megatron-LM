@@ -4,6 +4,8 @@ Run with ``pytest --noconftest tests/unit_tests/distillation`` (no GPU or test
 data needed).
 """
 
+import multiprocessing.util
+
 import pytest
 import torch
 
@@ -212,3 +214,13 @@ def test_cache_iterator_cycles_and_checks_size(tmp_path):
     assert firsts == [16, 18, 20, 22] * 2  # The same sequences at every evaluation.
     with pytest.raises(AssertionError, match='completed sequences'):
         build_cache_iterator(cache, range(4), 8, 2, 0, 1, 0)
+
+
+def test_cache_iterator_checks_tmpdir(tmp_path, monkeypatch):
+    # The workers' sockets would not fit under this temp dir: fail at once, not hang.
+    _write_cache(tmp_path)
+    cache = CacheSequences(str(tmp_path))
+    monkeypatch.setattr(multiprocessing.util, 'get_temp_dir', lambda: '/' + 'x' * 100)
+    build_cache_iterator(cache, range(1), 4, 2, 0, 1, 0)
+    with pytest.raises(AssertionError, match='TMPDIR'):
+        build_cache_iterator(cache, range(1), 4, 2, 0, 1, 2)
