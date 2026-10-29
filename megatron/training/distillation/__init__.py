@@ -8,6 +8,10 @@ The cache is self-contained: each file also stores the tokens, labels, loss mask
 and position ids exactly as the teacher's data pipeline produced them, so a
 student trained from it sees the same data and the same masks (assistant-only SFT
 loss, modality weights, task-marker masks, Goldfish) as the teacher's own run.
+
+``pretrain_gpt_distill.py`` trains a student from a cache: ``cache_reader`` gives
+each data-parallel rank its micro-batches, ``losses`` the distillation and label
+losses.
 """
 
 from .arguments import add_distillation_args

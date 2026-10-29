@@ -6,9 +6,11 @@
 #
 # TARGET_TOKENS fixes the data order: set it to the largest cache you may want. A
 # rerun with the same settings resumes after the completed files (progress.json),
-# on any number of nodes. AUTO_REQUEUE=true submits the next job at the end of every
-# job that exits cleanly with new shards, until the cache is complete; a job that
-# fails or adds no shard is not resubmitted.
+# on any number of nodes. STOP_TOKENS writes only the first shards, e.g. a prefix for
+# an ablation; a later run without it continues the same order. AUTO_REQUEUE=true
+# submits the next job at the end of every job that exits cleanly with new shards,
+# until the cache (or its STOP_TOKENS prefix) is complete; a job that fails or adds
+# no shard is not resubmitted.
 # Check the result with examples/apertus_distillation/verify_teacher_cache.py.
 #SBATCH --job-name=apertus-1p5-8b-teacher-cache
 #SBATCH --account=infra01
@@ -24,10 +26,11 @@ set -euo pipefail
 
 CACHE_DIR=${CACHE_DIR:?set CACHE_DIR to the cache directory}
 TARGET_TOKENS=${TARGET_TOKENS:-197000000000}
+STOP_TOKENS=${STOP_TOKENS:-}        # optional: write only the shards covering these first tokens
 MODE=${MODE:-topk}                  # topk, sample or tokens
 SLOTS=${SLOTS:-256}                 # top-k size, or draws per position in sample mode
 SEQS_PER_FILE=${SEQS_PER_FILE:-8192}  # sequences per shard (~37 GB at fp32 top-256; ~2.9k shards for 197B)
-SEQS_PER_CHUNK=${SEQS_PER_CHUNK:-32}   # sequences per compressed chunk inside a shard
+SEQS_PER_CHUNK=${SEQS_PER_CHUNK:-8}   # sequences per compressed chunk; students read whole chunks
 SEED=${SEED:-41}                    # data order; 41 is the teacher's stage-3 seed
 EXIT_MINUTES=${EXIT_MINUTES:-700}    # stop at a shard boundary before the 12 h limit
 AUTO_REQUEUE=${AUTO_REQUEUE:-false}
@@ -59,8 +62,13 @@ DATA_PATH=$(find -L "$TEXT_DATA_DIR" \
     awk '{ if ($0 ~ /apertus_sft/) print "sft:" $0; else print "pretrain:" $0 }' | tr '\n' ' ')
 
 NUM_SAMPLES=$((TARGET_TOKENS / SEQ_LEN))
-echo "[$(date)] $SLURM_NPROCS ranks, $NUM_SAMPLES sequences, mode=$MODE slots=$SLOTS -> $CACHE_DIR"
-run_writer "$(teacher_args "$LOAD_DIR") --seed $SEED \
+STOP_ARGS=
+if [ -n "$STOP_TOKENS" ]; then
+    STOP_FILES=$(( (STOP_TOKENS / SEQ_LEN + SEQS_PER_FILE - 1) / SEQS_PER_FILE ))
+    STOP_ARGS="--distill-cache-stop-files $STOP_FILES"
+fi
+echo "[$(date)] $SLURM_NPROCS ranks, $NUM_SAMPLES sequences, mode=$MODE slots=$SLOTS $STOP_ARGS -> $CACHE_DIR"
+run_writer "$(teacher_args "$LOAD_DIR") --seed $SEED $STOP_ARGS \
   --data-path $DATA_PATH --data-cache-path $DATASET_CACHE_DIR \
   --distill-cache-dir $CACHE_DIR --distill-cache-num-samples $NUM_SAMPLES \
   --distill-cache-mode $MODE --distill-topk $SLOTS --distill-samples $SLOTS \
@@ -71,8 +79,10 @@ DONE=$(completed_shards)
 TOTAL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["num_files"])' \
     "$CACHE_DIR/manifest.json")
 echo "[$(date)] $DONE/$TOTAL shards complete"
+GOAL=$TOTAL
+if [ -n "$STOP_TOKENS" ] && [ "$STOP_FILES" -lt "$TOTAL" ]; then GOAL=$STOP_FILES; fi
 # Reached only if the writer exited cleanly (set -e).
-if [ "$AUTO_REQUEUE" = true ] && [ "$DONE" -lt "$TOTAL" ]; then
+if [ "$AUTO_REQUEUE" = true ] && [ "$DONE" -lt "$GOAL" ]; then
     if [ "$DONE" -gt "$START" ]; then
         sbatch --nodes="$SLURM_JOB_NUM_NODES" --export=ALL \
             "$MEGATRON_LM_DIR/examples/apertus_distillation/cache_teacher_8b.sbatch"

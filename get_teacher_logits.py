@@ -9,6 +9,8 @@ Shard ``f`` holds sequences ``f * seqs_per_file ...`` of the data order, indepen
 of the number of GPUs; data-parallel ranks take turns writing whole shards, each a
 large zip of compressed chunks. ``progress.json`` records the completed shards,
 and a rerun with the same arguments resumes after them, on any number of GPUs.
+``--distill-cache-stop-files`` writes only a prefix of the shards; a later run
+without it continues the same data order.
 """
 
 import hashlib
@@ -138,21 +140,26 @@ def _prepare_cache_dir(cache_dir, manifest):
         print_rank_0(f'> resuming teacher cache in {cache_dir}')
 
 
-def _sync_progress(args, writer, start_file, dp_size, num_files, final=False):
-    """Record the files every rank has finished, as a contiguous prefix."""
+def _sync_progress(args, writer, start_file, dp_size, end_file, final=False):
+    """Record the files every rank has finished, as a contiguous prefix.
+
+    Ranks count skipped shards at or past ``end_file`` as done, so the count is
+    capped there.
+    """
     if writer is not None:
         local = writer.close() if final else writer.completed_steps()
     else:
         local = 2**62  # TP ranks > 0 write nothing and never hold progress back.
     done = torch.tensor([local], dtype=torch.long, device='cuda')
     torch.distributed.all_reduce(done, op=torch.distributed.ReduceOp.MIN)
-    completed = min(num_files, start_file + int(done.item()) * dp_size)
+    completed = min(end_file, start_file + int(done.item()) * dp_size)
     if torch.distributed.get_rank() == 0:
         write_progress(args.distill_cache_dir, completed, dp_size)
     return completed
 
 
-def _self_check(gpt, hidden_rows, ids, probs, vocab_limit, mode):
+def _self_check(gpt, hidden_rows, label_rows, ids, probs, entropy, label_logprob, vocab_limit,
+                mode):
     """Compare chunked scoring with the model's own output layer on a few rows.
 
     Collective over the tensor-parallel group: every TP rank must call it (they
@@ -163,22 +170,32 @@ def _self_check(gpt, hidden_rows, ids, probs, vocab_limit, mode):
         return
     weight = gpt.shared_embedding_or_output_weight() if gpt.share_embeddings_and_output_weights else None
     logits, _ = gpt.output_layer(hidden_rows[:n].unsqueeze(1), weight=weight, runtime_gather_output=True)
-    ref = torch.softmax(logits.squeeze(1)[:, :vocab_limit].float(), dim=-1)
+    ref_logprobs = torch.log_softmax(logits.squeeze(1)[:, :vocab_limit].float(), dim=-1)
+    ref = ref_logprobs.exp()
+    ref_entropy = torch.special.entr(ref).sum(-1)
+    labels = label_rows[:n].long()
+    in_vocab = labels < vocab_limit
+    ref_label = ref_logprobs.gather(1, labels.clamp(max=vocab_limit - 1).unsqueeze(1)).squeeze(1)
+    entropy_err = (ref_entropy - entropy[:n]).abs().max().item()
+    label_err = (ref_label - label_logprob[:n])[in_vocab].abs().max().item() if in_vocab.any() else 0.0
+    fields_ok = (entropy_err < 2e-2 and label_err < 2e-2
+                 and bool(torch.isneginf(label_logprob[:n][~in_vocab]).all()))
     if mode == 'topk':
         ref_probs, ref_ids = torch.topk(ref, ids.shape[1], dim=-1)
         prob_err = (ref_probs - probs[:n].float()).abs().max().item()
         overlap = min(
             len(set(a.tolist()) & set(b.tolist())) for a, b in zip(ref_ids, ids[:n].long())
         )
-        ok = prob_err < 5e-3 and overlap >= ids.shape[1] - 4
+        ok = prob_err < 5e-3 and overlap >= ids.shape[1] - 4 and fields_ok
         detail = f'max prob error {prob_err:.2e}, min top-k overlap {overlap}/{ids.shape[1]}'
     else:
         sums = probs[:n].float().sum(-1)
         drawn = torch.gather(ref, 1, ids[:n].long())
         ok = bool(torch.allclose(sums, torch.ones_like(sums))) and bool(
             (drawn[probs[:n] > 0] > 0).all()
-        )
+        ) and fields_ok
         detail = f'frequency sums {sums.min().item():.4f}..{sums.max().item():.4f}'
+    detail += f', max entropy error {entropy_err:.2e}, max label log-prob error {label_err:.2e}'
     if mpu.get_tensor_model_parallel_rank() == 0:
         print(f'[rank {torch.distributed.get_rank()}] self-check {"passed" if ok else "FAILED"} '
               f'on {n} rows: {detail}', flush=True)
@@ -219,6 +236,7 @@ def main():
     chunks_per_file = seqs_per_file // seqs_per_chunk
     micro_batches = seqs_per_chunk // args.micro_batch_size
     num_files = math.ceil(args.distill_cache_num_samples / seqs_per_file)
+    end_file = min(num_files, args.distill_cache_stop_files or num_files)
 
     # Manifest and resume point.
     manifest = _manifest(args, vocab_limit, slots, num_files)
@@ -226,8 +244,8 @@ def main():
         _prepare_cache_dir(args.distill_cache_dir, manifest)
     torch.distributed.barrier()
     start_file = (load_progress(args.distill_cache_dir) // dp_size) * dp_size
-    if start_file >= num_files:
-        print_rank_0(f'> cache already complete: {num_files} shards')
+    if start_file >= end_file:
+        print_rank_0(f'> cache already complete: {end_file}/{num_files} shards')
         return
 
     # Teacher. Keep the decoder's final norm, but run the output layer in chunks
@@ -252,7 +270,7 @@ def main():
     )
     data_iterator = None
     if train_ds is not None:
-        sampler = FileBatchSampler(start_file, num_files, seqs_per_file, args.micro_batch_size,
+        sampler = FileBatchSampler(start_file, end_file, seqs_per_file, args.micro_batch_size,
                                    dp_rank, dp_size)
         data_iterator = iter(torch.utils.data.DataLoader(
             train_ds, batch_sampler=sampler, num_workers=args.num_workers, pin_memory=True,
@@ -265,9 +283,10 @@ def main():
                  if mode == 'sample' else None)
     # The last round may have fewer shards than ranks; the others skip it but still
     # take part in the collectives at every shard boundary.
-    rounds = math.ceil((num_files - start_file) / dp_size)
+    rounds = math.ceil((end_file - start_file) / dp_size)
     print_rank_0(
-        f'> writing shards {start_file}..{num_files - 1} in {rounds} rounds of {dp_size}: '
+        f'> writing shards {start_file}..{end_file - 1} of {num_files} in {rounds} rounds of '
+        f'{dp_size}: '
         f'mode={mode}, slots={slots}, vocab_limit={vocab_limit}, {seqs_per_file} x '
         f'{args.seq_length} tokens per shard in chunks of {seqs_per_chunk} and micro-batches of '
         f'{args.micro_batch_size}'
@@ -283,7 +302,7 @@ def main():
                              f'{args.distill_exit_duration_in_mins:g} min; rerun to continue')
                 break
             file_id = start_file + local_file * dp_size + dp_rank
-            if file_id >= num_files:
+            if file_id >= end_file:
                 if writer is not None:
                     writer.skip(local_file)
             else:
@@ -303,16 +322,19 @@ def main():
                             pretrain_gpt.get_batch(data_iterator)
                         )
                         rows = loss_mask.reshape(-1) > 0
-                        ids = probs = None
+                        teacher = [None] * 4
                         if score:
                             hidden = gpt(tokens, position_ids, None, packed_seq_params=packed)
                             hidden_rows = hidden.reshape(-1, hidden.shape[-1])[rows]
+                            label_rows = labels.reshape(-1)[rows]
                             del hidden
-                            ids, probs = teacher_rows(hidden_rows, weight, bias, vocab_limit, mode,
-                                                      slots, args.distill_logits_chunk, generator)
+                            teacher = teacher_rows(hidden_rows, label_rows, weight, bias,
+                                                   vocab_limit, mode, slots,
+                                                   args.distill_logits_chunk, generator)
                             if args.distill_self_check and local_file == chunk == micro_batch == 0:
-                                _self_check(gpt, hidden_rows, ids, probs, vocab_limit, mode)
-                            del hidden_rows
+                                _self_check(gpt, hidden_rows, label_rows, *teacher, vocab_limit,
+                                            mode)
+                            del hidden_rows, label_rows
                         positions += rows.numel()
                         loss_rows += int(rows.sum())
                         if writer is not None:
@@ -321,10 +343,9 @@ def main():
                                 tokens.view(shape).cpu(), labels.view(shape).cpu(),
                                 loss_mask.view(shape).cpu(), position_ids.view(shape).cpu(),
                                 None if assistant_mask is None else assistant_mask.view(shape).cpu(),
-                                None if ids is None else ids.cpu(),
-                                None if probs is None else probs.cpu(),
+                                *(None if t is None else t.cpu() for t in teacher),
                             ])
-                        del ids, probs
+                        del teacher
                     if writer is not None:
                         columns = [None if c[0] is None else torch.cat(c) for c in zip(*parts)]
                         payload = encode_chunk(*columns, args.distill_prob_dtype)
@@ -335,7 +356,7 @@ def main():
 
             done = local_file + 1
             if done % args.distill_progress_interval == 0 and done < rounds:
-                completed = _sync_progress(args, writer, start_file, dp_size, num_files)
+                completed = _sync_progress(args, writer, start_file, dp_size, end_file)
                 elapsed = time.time() - started
                 print_rank_0(
                     f'> {done}/{rounds} rounds: {completed}/{num_files} shards complete, '
@@ -343,7 +364,7 @@ def main():
                     f'of positions with loss, ETA {elapsed / done * (rounds - done) / 60:.1f} min'
                 )
 
-    completed = _sync_progress(args, writer, start_file, dp_size, num_files, final=True)
+    completed = _sync_progress(args, writer, start_file, dp_size, end_file, final=True)
     print_rank_0(f'> done: {completed}/{num_files} shards complete in {(time.time() - started) / 60:.1f} min')
     torch.distributed.barrier()
 

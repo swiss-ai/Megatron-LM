@@ -22,6 +22,10 @@ A chunk is a gzipped ``torch.save`` of a dict with:
 * ``assistant_mask``: optional ``[seqs_per_chunk, seq_length]`` bool
 * ``teacher_ids``: ``[rows, slots]`` int32 (absent in tokens mode)
 * ``teacher_probs``: ``[rows, slots]`` float32 or float16 (absent in tokens mode)
+* ``teacher_entropy``: ``[rows]`` float32, entropy of the teacher's full distribution
+  (absent in tokens mode)
+* ``teacher_label_logprob``: ``[rows]`` float32, the teacher's log-probability of the
+  label, -inf for labels at or above ``vocab_limit`` (absent in tokens mode)
 
 Teacher rows are stored only where ``loss_mask > 0``, in row-major order of
 ``(sequence, position)``; ``FileView`` re-expands them. Positions that carry no
@@ -30,6 +34,10 @@ loss never reach the loss, so storing them would only cost space.
 In topk mode a row holds the teacher's most likely tokens and their
 probabilities. In sample mode it holds the distinct tokens drawn and their
 count / draws, padded with zero probability. Tokens mode stores the data only.
+
+Entropy and label log-probability are exact in both modes. With them a reader can
+turn a cross-entropy against the teacher into a KL divergence, and compare a
+student's loss on the labels with the teacher's own.
 """
 
 import contextlib
@@ -45,7 +53,7 @@ from typing import Dict, Iterator, List, Optional
 import torch
 
 FORMAT_NAME = 'apertus-distill-cache'
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 MANIFEST_NAME = 'manifest.json'
 PROGRESS_NAME = 'progress.json'
 INDEX_NAME = 'index.json'
@@ -59,6 +67,9 @@ IDENTITY_KEYS = (
 )
 
 PROB_DTYPES = {'fp16': torch.float16, 'fp32': torch.float32}
+
+# Per-row teacher fields: (ids, probs) per slot, then one float32 value per row.
+TEACHER_KEYS = ('teacher_ids', 'teacher_probs', 'teacher_entropy', 'teacher_label_logprob')
 
 
 def file_path(cache_dir: str, file_id: int) -> str:
@@ -143,14 +154,17 @@ def encode_chunk(
     assistant_mask: Optional[torch.Tensor],
     teacher_ids: Optional[torch.Tensor],
     teacher_probs: Optional[torch.Tensor],
+    teacher_entropy: Optional[torch.Tensor],
+    teacher_label_logprob: Optional[torch.Tensor],
     prob_dtype: str,
 ) -> Dict[str, torch.Tensor]:
     """Build the payload of one chunk from CPU or GPU tensors.
 
     ``tokens``, ``labels``, ``loss_mask``, ``position_ids`` and ``assistant_mask``
-    are ``[seqs, seq_length]``; ``teacher_ids`` / ``teacher_probs`` are
-    ``[rows, slots]`` with one row per position where ``loss_mask > 0``, or both
-    None in tokens mode.
+    are ``[seqs, seq_length]``. The teacher fields have one row per position where
+    ``loss_mask > 0``: ``teacher_ids`` / ``teacher_probs`` are ``[rows, slots]``,
+    ``teacher_entropy`` / ``teacher_label_logprob`` are ``[rows]``. In tokens mode
+    all four are None.
     """
     payload = {
         'tokens': tokens.to('cpu', torch.int32),
@@ -158,17 +172,21 @@ def encode_chunk(
         'loss_mask': loss_mask.to('cpu', torch.float32),
         'position_ids': position_ids.to('cpu', torch.int32),
     }
-    if (teacher_ids is None) != (teacher_probs is None):
-        raise ValueError('pass both teacher ids and probabilities, or neither')
+    teacher = (teacher_ids, teacher_probs, teacher_entropy, teacher_label_logprob)
+    if any(t is None for t in teacher) and any(t is not None for t in teacher):
+        raise ValueError('pass all teacher fields (ids, probs, entropy, label log-prob), or none')
     if teacher_ids is not None:
         rows = int((loss_mask > 0).sum())
-        if teacher_ids.shape[0] != rows or teacher_probs.shape != teacher_ids.shape:
+        if (teacher_ids.shape[0] != rows or teacher_probs.shape != teacher_ids.shape
+                or teacher_entropy.shape != (rows,) or teacher_label_logprob.shape != (rows,)):
             raise ValueError(
-                f'teacher rows {tuple(teacher_ids.shape)} / {tuple(teacher_probs.shape)} '
-                f'do not match {rows} loss positions'
+                f'teacher fields {[tuple(t.shape) for t in teacher]} do not match {rows} '
+                f'loss positions'
             )
         payload['teacher_ids'] = teacher_ids.to('cpu', torch.int32)
         payload['teacher_probs'] = teacher_probs.to('cpu', PROB_DTYPES[prob_dtype])
+        payload['teacher_entropy'] = teacher_entropy.to('cpu', torch.float32)
+        payload['teacher_label_logprob'] = teacher_label_logprob.to('cpu', torch.float32)
     if assistant_mask is not None:
         payload['assistant_mask'] = assistant_mask.to('cpu', torch.bool)
     return payload
@@ -267,12 +285,14 @@ class FileView:
     def num_seqs(self) -> int:
         return self.payload['tokens'].shape[0]
 
-    def sequences(self, start: int, end: int) -> Dict[str, torch.Tensor]:
-        """Dense tensors for sequences ``start .. end - 1`` of the chunk.
+    def sequences(self, start: int, end: int, dense: bool = True) -> Dict[str, torch.Tensor]:
+        """Tensors for sequences ``start .. end - 1`` of the chunk.
 
-        Teacher tensors, when the chunk has them, are ``[n, seq_length, slots]``;
-        positions without loss get zero probability, so they contribute nothing to
-        a distillation term.
+        Teacher tensors, when the chunk has them, are ``[n, seq_length, slots]`` for
+        ids and probabilities and ``[n, seq_length]`` for entropy and label
+        log-probability. Positions without loss get zeros, so they contribute
+        nothing to a distillation term. With ``dense=False`` they keep one row per
+        position with loss instead, in row-major order of ``(sequence, position)``.
         """
         p = self.payload
         seq_length = p['tokens'].shape[1]
@@ -283,7 +303,13 @@ class FileView:
             'loss_mask': p['loss_mask'][start:end].float(),
             'position_ids': p['position_ids'][start:end].long(),
         }
-        if self.has_teacher:
+        if self.has_teacher and not dense:
+            lo, hi = int(self.row_offsets[start]), int(self.row_offsets[end])
+            batch['teacher_ids'] = p['teacher_ids'][lo:hi]
+            batch['teacher_probs'] = p['teacher_probs'][lo:hi].float()
+            batch['teacher_entropy'] = p['teacher_entropy'][lo:hi]
+            batch['teacher_label_logprob'] = p['teacher_label_logprob'][lo:hi]
+        elif self.has_teacher:
             slots = p['teacher_ids'].shape[1]
             lo, hi = int(self.row_offsets[start]), int(self.row_offsets[end])
             rows = self.loss_rows[start:end].reshape(-1)
@@ -293,6 +319,10 @@ class FileView:
             teacher_probs[rows] = p['teacher_probs'][lo:hi].float()
             batch['teacher_ids'] = teacher_ids.view(n, seq_length, slots)
             batch['teacher_probs'] = teacher_probs.view(n, seq_length, slots)
+            for key in ('teacher_entropy', 'teacher_label_logprob'):
+                values = torch.zeros(n * seq_length, dtype=torch.float32)
+                values[rows] = p[key][lo:hi]
+                batch[key] = values.view(n, seq_length)
         if 'assistant_mask' in p:
             batch['assistant_mask'] = p['assistant_mask'][start:end].float()
         else:

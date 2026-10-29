@@ -43,16 +43,20 @@ def _batch(seqs=3, seq_length=16, slots=4, seed=0):
     rows = int((loss_mask > 0).sum())
     ids = torch.randint(0, 1000, (rows, slots), generator=g)
     probs = torch.rand(rows, slots, generator=g)
-    return tokens, labels, loss_mask, position_ids, assistant_mask, ids, probs
+    entropy = torch.rand(rows, generator=g) * 3
+    label_logprob = -torch.rand(rows, generator=g) * 5
+    label_logprob[0] = float('-inf')  # A label outside the teacher's vocabulary.
+    return (tokens, labels, loss_mask, position_ids, assistant_mask, ids, probs, entropy,
+            label_logprob)
 
 
 def _write_shard(path, chunks, compress_level=1, prob_dtype='fp32'):
     writer = ShardWriter(path, {'file_id': 7, 'first_sequence': 70})
     for chunk in chunks:
-        tokens, labels, loss_mask, position_ids, assistant_mask, ids, probs = chunk
-        payload = encode_chunk(tokens, labels, loss_mask, position_ids, assistant_mask, ids, probs,
-                               prob_dtype)
-        writer.add(compress_chunk(payload, compress_level), tokens.shape[0], 0 if ids is None else ids.shape[0])
+        payload = encode_chunk(*chunk, prob_dtype)
+        ids = chunk[5]
+        writer.add(compress_chunk(payload, compress_level), chunk[0].shape[0],
+                   0 if ids is None else ids.shape[0])
     writer.close()
 
 
@@ -69,8 +73,11 @@ def test_shard_roundtrip(tmp_path, compress_level, prob_dtype):
         assert shard.num_chunks == 2
         assert shard.index['file_id'] == 7 and shard.index['first_sequence'] == 70
         assert [c['rows'] for c in shard.index['chunks']] == [c[5].shape[0] for c in chunks]
-        batch = FileView(shard.chunk(1)).sequences(1, 3)  # Random access to the second chunk.
-    tokens, labels, loss_mask, position_ids, assistant_mask, ids, probs = chunks[1]
+        view = FileView(shard.chunk(1))  # Random access to the second chunk.
+    batch = view.sequences(1, 3)
+    tokens, labels, loss_mask, position_ids, assistant_mask, ids, probs, entropy, label_logprob = (
+        chunks[1]
+    )
     assert torch.equal(batch['tokens'], tokens[1:3])
     assert torch.equal(batch['labels'], labels[1:3])
     assert torch.equal(batch['loss_mask'], loss_mask[1:3])
@@ -88,6 +95,21 @@ def test_shard_roundtrip(tmp_path, compress_level, prob_dtype):
     window = slice(seq_length, 3 * seq_length)
     assert torch.equal(batch['teacher_ids'].long().reshape(-1, slots), dense_ids[window])
     assert torch.equal(batch['teacher_probs'].reshape(-1, slots), dense_probs[window])
+    for key, values in (('teacher_entropy', entropy), ('teacher_label_logprob', label_logprob)):
+        dense = torch.zeros(has_loss.numel())
+        dense[has_loss] = values
+        assert torch.equal(batch[key].reshape(-1), dense[window])
+
+    # Compact rows: the same rows, in the order of the loss positions.
+    compact = view.sequences(1, 3, dense=False)
+    window_rows = has_loss[window]
+    assert torch.equal(compact['teacher_ids'].long(), dense_ids[window][window_rows])
+    assert torch.equal(compact['teacher_probs'], dense_probs[window][window_rows])
+    first = int(has_loss[:seq_length].sum())
+    rows = slice(first, first + int(window_rows.sum()))
+    assert torch.equal(compact['teacher_entropy'], entropy[rows])
+    assert torch.equal(compact['teacher_label_logprob'], label_logprob[rows])
+    assert torch.equal(compact['tokens'], batch['tokens'])
 
 
 def test_shard_writer_removes_leftovers(tmp_path):
@@ -102,22 +124,26 @@ def test_shard_writer_removes_leftovers(tmp_path):
 
 
 def test_tokens_only_chunk(tmp_path):
-    tokens, labels, loss_mask, position_ids, _, ids, probs = _batch()
+    tokens, labels, loss_mask, position_ids, _, ids, probs, entropy, label_logprob = _batch()
     path = file_path(str(tmp_path), 0)
-    _write_shard(path, [(tokens, labels, loss_mask, position_ids, None, None, None)])
+    _write_shard(path, [(tokens, labels, loss_mask, position_ids, None, None, None, None, None)])
     with ShardReader(path) as shard:
         payload = shard.chunk(0)
-    assert 'teacher_ids' not in payload and 'teacher_probs' not in payload
+    assert not any(key.startswith('teacher_') for key in payload)
     batch = FileView(payload).sequences(0, 3)
     assert torch.equal(batch['tokens'], tokens) and 'teacher_ids' not in batch
     with pytest.raises(ValueError):
-        encode_chunk(tokens, labels, loss_mask, position_ids, None, ids, None, 'fp16')
+        encode_chunk(tokens, labels, loss_mask, position_ids, None, ids, probs, None, None, 'fp16')
 
 
 def test_encode_rejects_row_mismatch():
-    tokens, labels, loss_mask, position_ids, _, ids, probs = _batch()
+    tokens, labels, loss_mask, position_ids, _, ids, probs, entropy, label_logprob = _batch()
     with pytest.raises(ValueError):
-        encode_chunk(tokens, labels, loss_mask, position_ids, None, ids[1:], probs[1:], 'fp32')
+        encode_chunk(tokens, labels, loss_mask, position_ids, None, ids[1:], probs[1:],
+                     entropy[1:], label_logprob[1:], 'fp32')
+    with pytest.raises(ValueError):
+        encode_chunk(tokens, labels, loss_mask, position_ids, None, ids, probs, entropy[1:],
+                     label_logprob, 'fp32')
 
 
 def test_manifest_and_progress(tmp_path):
@@ -190,8 +216,9 @@ def test_file_batch_sampler(dp_size, num_files):
 
 
 def test_async_shard_writer(tmp_path):
-    tokens, labels, loss_mask, position_ids, _, ids, probs = _batch()
-    payload = encode_chunk(tokens, labels, loss_mask, position_ids, None, ids, probs, 'fp32')
+    batch = _batch()
+    tokens, ids = batch[0], batch[5]
+    payload = encode_chunk(*batch, 'fp32')
     writer = AsyncShardWriter(str(tmp_path), num_threads=2, compress_level=1, max_pending=2)
     for step in range(3):
         writer.begin(step, 4 * step + 1, {'file_id': 4 * step + 1})
@@ -208,8 +235,9 @@ def test_async_shard_writer(tmp_path):
 
 def test_async_shard_writer_raises_on_failure(tmp_path):
     (tmp_path / 'files').write_text('a file where the writer needs a directory')
-    tokens, labels, loss_mask, position_ids, _, ids, probs = _batch()
-    payload = encode_chunk(tokens, labels, loss_mask, position_ids, None, ids, probs, 'fp32')
+    batch = _batch()
+    tokens, ids = batch[0], batch[5]
+    payload = encode_chunk(*batch, 'fp32')
     writer = AsyncShardWriter(str(tmp_path), num_threads=1, compress_level=0, max_pending=1)
     writer.begin(0, 0, {})
     for _ in range(4):  # More chunks than the queue holds: the failed shard must not block.
@@ -229,12 +257,21 @@ def test_teacher_rows_topk(single_tp_rank, chunk):
     g = torch.Generator().manual_seed(0)
     hidden = torch.randn(10, 8, generator=g)
     weight = torch.randn(40, 8, generator=g)  # 40 padded rows, of which 30 are scored.
-    ids, probs = teacher_rows(hidden, weight, None, vocab_limit=30, mode='topk', slots=5,
-                              chunk=chunk)
-    ref_probs, ref_ids = torch.topk(torch.softmax(hidden @ weight[:30].T, dim=-1), 5, dim=-1)
+    labels = torch.randint(0, 30, (10,), generator=g)
+    labels[3] = 35  # Outside the scored vocabulary.
+    ids, probs, entropy, label_logprob = teacher_rows(
+        hidden, labels, weight, None, vocab_limit=30, mode='topk', slots=5, chunk=chunk
+    )
+    ref = torch.softmax(hidden @ weight[:30].T, dim=-1)
+    ref_probs, ref_ids = torch.topk(ref, 5, dim=-1)
     assert ids.dtype == torch.int32 and ids.shape == (10, 5)
     assert torch.equal(ids.long(), ref_ids)
     torch.testing.assert_close(probs, ref_probs)
+    torch.testing.assert_close(entropy, torch.special.entr(ref).sum(-1))
+    ref_label = ref.gather(1, labels.clamp(max=29).unsqueeze(1)).squeeze(1).log()
+    keep = labels < 30
+    torch.testing.assert_close(label_logprob[keep], ref_label[keep])
+    assert torch.isneginf(label_logprob[3])
 
 
 def test_teacher_rows_sample(single_tp_rank):
@@ -242,16 +279,26 @@ def test_teacher_rows_sample(single_tp_rank):
     hidden = torch.randn(6, 8, generator=g)
     weight = torch.randn(40, 8, generator=g)
     bias = torch.randn(40, generator=g)
-    ids, freqs = teacher_rows(hidden, weight, bias, vocab_limit=30, mode='sample', slots=16,
-                              chunk=4, generator=torch.Generator().manual_seed(3))
+    labels = torch.randint(0, 30, (6,), generator=g)
+    ids, freqs, entropy, label_logprob = teacher_rows(
+        hidden, labels, weight, bias, vocab_limit=30, mode='sample', slots=16, chunk=4,
+        generator=torch.Generator().manual_seed(3),
+    )
     assert ids.shape == freqs.shape == (6, 16)
     torch.testing.assert_close(freqs.sum(-1), torch.ones(6))
     assert (ids < 30).all()
+    ref = torch.softmax(hidden @ weight[:30].T + bias[:30], dim=-1)
+    torch.testing.assert_close(entropy, torch.special.entr(ref).sum(-1))
+    torch.testing.assert_close(label_logprob, ref.gather(1, labels.unsqueeze(1)).squeeze(1).log())
 
 
 def test_teacher_rows_empty(single_tp_rank):
-    ids, probs = teacher_rows(torch.zeros(0, 8), torch.randn(40, 8), None, 30, 'topk', 5, 4)
+    ids, probs, entropy, label_logprob = teacher_rows(
+        torch.zeros(0, 8), torch.zeros(0, dtype=torch.long), torch.randn(40, 8), None, 30, 'topk',
+        5, 4
+    )
     assert ids.shape == (0, 5) and probs.shape == (0, 5)
+    assert entropy.shape == label_logprob.shape == (0,)
 
 
 def _load_calibration_blend():
