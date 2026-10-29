@@ -23,9 +23,11 @@ def add_distillation_args(parser):
                        help='Restrict teacher and student distributions to token ids below this '
                        'value, renormalizing over them (131072 keeps the Apertus 1.5 text '
                        'vocabulary). Defaults to the tokenizer vocabulary size.')
-    group.add_argument('--distill-prob-dtype', type=str, default='fp16',
-                       choices=['fp16', 'fp32'],
-                       help='Storage dtype of cached teacher probabilities.')
+    group.add_argument('--distill-prob-dtype', type=str, default='fp32',
+                       choices=['fp32', 'fp16'],
+                       help='Storage dtype of cached teacher probabilities. fp32 matches the '
+                       'Megatron-LM-Distill format; fp16 makes top-256 files about 17%% '
+                       'smaller with at most 0.05%% relative error.')
 
     # Writer.
     group.add_argument('--distill-cache-num-samples', type=int, default=None,
