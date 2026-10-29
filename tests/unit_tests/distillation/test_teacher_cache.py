@@ -16,18 +16,19 @@ from megatron.training.distillation.cache_format import (
     FORMAT_NAME,
     FORMAT_VERSION,
     FileView,
+    ShardReader,
+    ShardWriter,
     check_manifest_compatible,
-    encode_file,
+    compress_chunk,
+    encode_chunk,
     file_path,
-    load_file,
     load_manifest,
     load_progress,
     sample_distinct,
-    save_file,
     write_manifest,
     write_progress,
 )
-from megatron.training.distillation.cache_writer import AsyncFileWriter, FileBatchSampler
+from megatron.training.distillation.cache_writer import AsyncShardWriter, FileBatchSampler
 from megatron.training.distillation.scoring import teacher_rows
 
 
@@ -45,18 +46,31 @@ def _batch(seqs=3, seq_length=16, slots=4, seed=0):
     return tokens, labels, loss_mask, position_ids, assistant_mask, ids, probs
 
 
+def _write_shard(path, chunks, compress_level=1, prob_dtype='fp32'):
+    writer = ShardWriter(path, {'file_id': 7, 'first_sequence': 70})
+    for chunk in chunks:
+        tokens, labels, loss_mask, position_ids, assistant_mask, ids, probs = chunk
+        payload = encode_chunk(tokens, labels, loss_mask, position_ids, assistant_mask, ids, probs,
+                               prob_dtype)
+        writer.add(compress_chunk(payload, compress_level), tokens.shape[0], 0 if ids is None else ids.shape[0])
+    writer.close()
+
+
 @pytest.mark.parametrize('compress_level', [0, 1])
 @pytest.mark.parametrize('prob_dtype', ['fp16', 'fp32'])
-def test_file_roundtrip(tmp_path, compress_level, prob_dtype):
-    tokens, labels, loss_mask, position_ids, assistant_mask, ids, probs = _batch()
-    payload = encode_file(tokens, labels, loss_mask, position_ids, assistant_mask, ids, probs,
-                          prob_dtype)
+def test_shard_roundtrip(tmp_path, compress_level, prob_dtype):
+    chunks = [_batch(seed=0), _batch(seed=1)]
     path = file_path(str(tmp_path), 12345)
-    save_file(path, payload, compress_level)
-    assert path.endswith(os.path.join('files', '000001', '0000012345.pt.gz'))
-    assert not [name for name in os.listdir(os.path.dirname(path)) if name.endswith('.tmp')]
+    _write_shard(path, chunks, compress_level, prob_dtype)
+    assert path.endswith(os.path.join('files', '00012', '00012345.zip'))
+    assert os.listdir(os.path.dirname(path)) == ['00012345.zip']  # No temporary files left.
 
-    batch = FileView(load_file(path)).sequences(1, 3)
+    with ShardReader(path) as shard:
+        assert shard.num_chunks == 2
+        assert shard.index['file_id'] == 7 and shard.index['first_sequence'] == 70
+        assert [c['rows'] for c in shard.index['chunks']] == [c[5].shape[0] for c in chunks]
+        batch = FileView(shard.chunk(1)).sequences(1, 3)  # Random access to the second chunk.
+    tokens, labels, loss_mask, position_ids, assistant_mask, ids, probs = chunks[1]
     assert torch.equal(batch['tokens'], tokens[1:3])
     assert torch.equal(batch['labels'], labels[1:3])
     assert torch.equal(batch['loss_mask'], loss_mask[1:3])
@@ -76,22 +90,23 @@ def test_file_roundtrip(tmp_path, compress_level, prob_dtype):
     assert torch.equal(batch['teacher_probs'].reshape(-1, slots), dense_probs[window])
 
 
-def test_tokens_only_file(tmp_path):
+def test_tokens_only_chunk(tmp_path):
     tokens, labels, loss_mask, position_ids, _, ids, probs = _batch()
-    payload = encode_file(tokens, labels, loss_mask, position_ids, None, None, None, 'fp16')
-    assert 'teacher_ids' not in payload and 'teacher_probs' not in payload
     path = file_path(str(tmp_path), 0)
-    save_file(path, payload, 1)
-    batch = FileView(load_file(path)).sequences(0, 3)
+    _write_shard(path, [(tokens, labels, loss_mask, position_ids, None, None, None)])
+    with ShardReader(path) as shard:
+        payload = shard.chunk(0)
+    assert 'teacher_ids' not in payload and 'teacher_probs' not in payload
+    batch = FileView(payload).sequences(0, 3)
     assert torch.equal(batch['tokens'], tokens) and 'teacher_ids' not in batch
     with pytest.raises(ValueError):
-        encode_file(tokens, labels, loss_mask, position_ids, None, ids, None, 'fp16')
+        encode_chunk(tokens, labels, loss_mask, position_ids, None, ids, None, 'fp16')
 
 
 def test_encode_rejects_row_mismatch():
     tokens, labels, loss_mask, position_ids, _, ids, probs = _batch()
     with pytest.raises(ValueError):
-        encode_file(tokens, labels, loss_mask, position_ids, None, ids[1:], probs[1:], 'fp32')
+        encode_chunk(tokens, labels, loss_mask, position_ids, None, ids[1:], probs[1:], 'fp32')
 
 
 def test_manifest_and_progress(tmp_path):
@@ -136,14 +151,15 @@ def test_sample_distinct():
     torch.testing.assert_close(estimate, probs[0], atol=0.01, rtol=0)
 
 
+@pytest.mark.parametrize('num_files', [7, 8])
 @pytest.mark.parametrize('dp_size', [1, 2, 4])
-def test_file_batch_sampler(dp_size):
-    seqs_per_file, micro_batch_size, num_files = 6, 2, 8
+def test_file_batch_sampler(dp_size, num_files):
+    seqs_per_file, micro_batch_size = 6, 2
     seen = {}
     for rank in range(dp_size):
         sampler = FileBatchSampler(0, num_files, seqs_per_file, micro_batch_size, rank, dp_size)
         batches = list(sampler)
-        assert len(batches) == len(sampler) == num_files // dp_size * 3
+        assert len(batches) == len(sampler) == len(range(rank, num_files, dp_size)) * 3
         # Each file arrives as consecutive micro-batches of contiguous samples.
         for i in range(0, len(batches), 3):
             samples = sum(batches[i:i + 3], [])
@@ -158,25 +174,36 @@ def test_file_batch_sampler(dp_size):
     assert next(iter(resumed)) == [24, 25]
     with pytest.raises(AssertionError):
         FileBatchSampler(0, num_files, seqs_per_file, 4, 0, 1)
+    # A rank past the last shard has nothing to do.
+    assert list(FileBatchSampler(4, 5, seqs_per_file, micro_batch_size, 3, 4)) == []
 
 
-def test_async_writer(tmp_path):
+def test_async_shard_writer(tmp_path):
     tokens, labels, loss_mask, position_ids, _, ids, probs = _batch()
-    payload = encode_file(tokens, labels, loss_mask, position_ids, None, ids, probs, 'fp16')
-    writer = AsyncFileWriter(str(tmp_path), num_threads=2, compress_level=1)
-    for step in range(5):
-        writer.submit(step, 4 * step + 1, payload)
-    assert writer.close() == 5
-    for step in range(5):
-        assert os.path.exists(file_path(str(tmp_path), 4 * step + 1))
+    payload = encode_chunk(tokens, labels, loss_mask, position_ids, None, ids, probs, 'fp32')
+    writer = AsyncShardWriter(str(tmp_path), num_threads=2, compress_level=1, max_pending=2)
+    for step in range(3):
+        writer.begin(step, 4 * step + 1, {'file_id': 4 * step + 1})
+        for _ in range(5):
+            writer.add(payload, tokens.shape[0], ids.shape[0])
+        writer.end()
+    writer.skip(3)  # A rank without a shard in the last round.
+    assert writer.close() == 4
+    for step in range(3):
+        with ShardReader(file_path(str(tmp_path), 4 * step + 1)) as shard:
+            assert shard.num_chunks == 5
+            assert torch.equal(shard.chunk(4)['teacher_probs'], payload['teacher_probs'])
 
 
-def test_async_writer_raises_on_failure(tmp_path):
+def test_async_shard_writer_raises_on_failure(tmp_path):
     (tmp_path / 'files').write_text('a file where the writer needs a directory')
     tokens, labels, loss_mask, position_ids, _, ids, probs = _batch()
-    payload = encode_file(tokens, labels, loss_mask, position_ids, None, ids, probs, 'fp16')
-    writer = AsyncFileWriter(str(tmp_path), num_threads=1, compress_level=0)
-    writer.submit(0, 0, payload)
+    payload = encode_chunk(tokens, labels, loss_mask, position_ids, None, ids, probs, 'fp32')
+    writer = AsyncShardWriter(str(tmp_path), num_threads=1, compress_level=0, max_pending=1)
+    writer.begin(0, 0, {})
+    for _ in range(4):  # More chunks than the queue holds: the failed shard must not block.
+        writer.add(payload, tokens.shape[0], ids.shape[0])
+    writer.end()
     with pytest.raises(OSError):
         writer.close()
 

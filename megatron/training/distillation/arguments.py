@@ -31,25 +31,32 @@ def add_distillation_args(parser):
 
     # Writer.
     group.add_argument('--distill-cache-num-samples', type=int, default=None,
-                       help='Number of sequences to score, rounded up to whole rounds of '
-                       'seqs-per-file x data-parallel-size sequences. It fixes the data '
+                       help='Number of sequences to score, rounded up to whole shards. It '
+                       'fixes the data '
                        'order, so set it to the largest cache you may want: a run can stop '
                        'early and resume later, but cannot grow a finished cache.')
-    group.add_argument('--distill-seqs-per-file', type=int, default=32,
-                       help='Sequences per cache file; a multiple of the micro batch size. '
-                       'Larger files mean fewer files on the file system.')
+    group.add_argument('--distill-seqs-per-file', type=int, default=1024,
+                       help='Sequences per shard file, a multiple of --distill-seqs-per-chunk. '
+                       'Shards are large on purpose, to keep the number of files low.')
+    group.add_argument('--distill-seqs-per-chunk', type=int, default=32,
+                       help='Sequences per independently compressed chunk inside a shard, a '
+                       'multiple of the micro batch size. A reader loads one chunk at a time.')
     group.add_argument('--distill-logits-chunk', type=int, default=4096,
                        help='Positions per output-layer chunk when scoring, which bounds the '
                        'memory used for logits.')
     group.add_argument('--distill-writer-threads', type=int, default=8,
-                       help='Background threads compressing and writing cache files per rank.')
+                       help='Background threads compressing chunks per rank.')
     group.add_argument('--distill-compress-level', type=int, default=1,
-                       help='gzip compression level of cache files (0 disables compression).')
+                       help='gzip compression level of chunks (0 stores them uncompressed).')
     group.add_argument('--distill-sample-seed', type=int, default=1234,
                        help='Base seed for sample mode. Each file uses seed + file id, so the '
                        'draws do not depend on the number of GPUs.')
-    group.add_argument('--distill-progress-interval', type=int, default=20,
-                       help='Steps between progress synchronizations of the writer.')
+    group.add_argument('--distill-progress-interval', type=int, default=1,
+                       help='Shards per rank between progress records and log lines.')
+    group.add_argument('--distill-exit-duration-in-mins', type=float, default=None,
+                       help='Stop at a shard boundary when the next shard would end after this '
+                       'many minutes, so a job ends before its time limit without losing a '
+                       'half-written shard. A rerun resumes after it.')
     group.add_argument('--distill-self-check', action='store_true',
                        help='On the first step, recompute a few rows with the full output '
                        'layer and check them against the chunked scoring.')

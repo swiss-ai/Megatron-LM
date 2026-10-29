@@ -1,20 +1,21 @@
-"""Data order and background writing of cache files."""
+"""Data order and background writing of cache shards."""
 
+import queue
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Dict, Iterator, List
 
 import torch
 
-from .cache_format import file_path, save_file
+from .cache_format import ShardWriter, compress_chunk, file_path
 
 
 class FileBatchSampler:
-    """Micro-batches that give each data-parallel rank whole files.
+    """Micro-batches that give each data-parallel rank whole shards.
 
-    File ``f`` holds samples ``f * seqs_per_file ... (f + 1) * seqs_per_file - 1`` of
-    the dataset order, so file contents do not depend on the number of GPUs. Rank
-    ``r`` scores files ``start_file + r, start_file + r + dp_size, ...``, each in
+    Shard ``f`` holds samples ``f * seqs_per_file ... (f + 1) * seqs_per_file - 1`` of
+    the dataset order, so shard contents do not depend on the number of GPUs. Rank
+    ``r`` scores shards ``start_file + r, start_file + r + dp_size, ...``, each in
     ``seqs_per_file / micro_batch_size`` micro-batches.
     """
 
@@ -24,7 +25,7 @@ class FileBatchSampler:
             f'seqs per file ({seqs_per_file}) must be a multiple of the micro batch size '
             f'({micro_batch_size})'
         )
-        assert start_file % dp_size == 0 and num_files % dp_size == 0
+        assert start_file % dp_size == 0
         self.files = range(start_file + dp_rank, num_files, dp_size)
         self.seqs_per_file = seqs_per_file
         self.micro_batch_size = micro_batch_size
@@ -39,50 +40,98 @@ class FileBatchSampler:
         return len(self.files) * (self.seqs_per_file // self.micro_batch_size)
 
 
-class AsyncFileWriter:
-    """Compresses and writes cache files on a thread pool.
+class AsyncShardWriter:
+    """Writes shards in the background.
 
-    ``submit`` blocks once ``max_pending`` files are queued, which bounds host
-    memory. Write errors are raised on the next ``submit`` or ``completed_steps``.
+    Chunks are compressed on a thread pool and appended to their shard, in order,
+    by a single assembler thread; a shard becomes visible only once complete.
+    ``max_pending`` bounds the chunks held in memory. Errors are raised on the
+    next call after the shard that failed.
+
+    Usage per shard: ``begin(step, file_id, index)``, ``add(...)`` per chunk, ``end()``.
     """
 
     def __init__(self, cache_dir: str, num_threads: int, compress_level: int, max_pending: int = 0):
         self.cache_dir = cache_dir
         self.compress_level = compress_level
-        self.pool = ThreadPoolExecutor(max_workers=num_threads)
-        self.slots = threading.BoundedSemaphore(max_pending or 2 * num_threads)
+        self.max_pending = max_pending or 2 * num_threads
+        self.compressors = ThreadPoolExecutor(max_workers=num_threads)
+        self.assembler = ThreadPoolExecutor(max_workers=1)
+        self.compressing = threading.BoundedSemaphore(num_threads)
+        self.chunks = None
         self.pending: Dict[int, Future] = {}
         self.done_steps = set()
         self.contiguous_steps = 0
 
-    def submit(self, step: int, file_id: int, payload: Dict[str, torch.Tensor]) -> None:
-        """Queue ``payload`` as file ``file_id``; ``step`` is this rank's local step index."""
+    def begin(self, step: int, file_id: int, index: dict) -> None:
+        """Start shard ``file_id``; ``step`` is this rank's local shard counter."""
+        assert self.chunks is None, 'end() the previous shard first'
         self._collect()
-        self.slots.acquire()
+        self.chunks = queue.Queue(maxsize=self.max_pending)
+        self.pending[step] = self.assembler.submit(
+            self._assemble, file_path(self.cache_dir, file_id), index, self.chunks
+        )
+
+    def add(self, payload: Dict[str, torch.Tensor], num_seqs: int, rows: int) -> None:
+        """Queue the next chunk of the current shard."""
+        self.compressing.acquire()
         try:
-            future = self.pool.submit(
-                save_file, file_path(self.cache_dir, file_id), payload, self.compress_level
-            )
+            future = self.compressors.submit(compress_chunk, payload, self.compress_level)
         except BaseException:
-            self.slots.release()
+            self.compressing.release()
             raise
-        future.add_done_callback(lambda _: self.slots.release())
-        self.pending[step] = future
+        future.add_done_callback(lambda _: self.compressing.release())
+        self.chunks.put((future, num_seqs, rows))
+
+    def end(self) -> None:
+        """Close the current shard; it is written once its chunks are compressed."""
+        self.chunks.put(None)
+        self.chunks = None
+
+    def skip(self, step: int) -> None:
+        """Count a step without a shard (the short last round) as done."""
+        self.done_steps.add(step)
+        self._advance()
 
     def completed_steps(self) -> int:
-        """Number of leading local steps whose files are on disk."""
+        """Number of leading local shards that are on disk."""
         self._collect()
         return self.contiguous_steps
 
     def close(self) -> int:
-        """Wait for every queued file and return the number of completed steps."""
+        """Wait for every shard and return the number of completed local shards."""
         for step, future in list(self.pending.items()):
             future.result()
             self.done_steps.add(step)
             del self.pending[step]
         self._advance()
-        self.pool.shutdown(wait=True)
+        self.compressors.shutdown(wait=True)
+        self.assembler.shutdown(wait=True)
         return self.contiguous_steps
+
+    @staticmethod
+    def _assemble(path: str, index: dict, chunks: queue.Queue) -> None:
+        error, shard = None, None
+        try:
+            shard = ShardWriter(path, index)
+        except BaseException as e:
+            error = e
+        while True:
+            item = chunks.get()
+            if item is None:
+                break
+            if error is not None:
+                continue  # Keep draining so the producer never blocks on a full queue.
+            future, num_seqs, rows = item
+            try:
+                shard.add(future.result(), num_seqs, rows)
+            except BaseException as e:
+                error = e
+        if error is not None:
+            if shard is not None:
+                shard.abort()
+            raise error
+        shard.close()
 
     def _collect(self) -> None:
         finished: List[int] = [step for step, future in self.pending.items() if future.done()]

@@ -5,10 +5,10 @@ flags as the teacher's training run (blend, SFT packing, masks), and stores at
 every position with loss either the teacher's top-k tokens or a set of sampled
 tokens. See megatron/training/distillation/cache_format.py for the layout.
 
-File ``f`` holds sequences ``f * seqs_per_file ...`` of the data order, independent
-of the number of GPUs; data-parallel ranks take turns writing whole files.
-``progress.json`` records the completed files, and a rerun with the same
-arguments resumes after them, on any number of GPUs.
+Shard ``f`` holds sequences ``f * seqs_per_file ...`` of the data order, independent
+of the number of GPUs; data-parallel ranks take turns writing whole shards, each a
+large zip of compressed chunks. ``progress.json`` records the completed shards,
+and a rerun with the same arguments resumes after them, on any number of GPUs.
 """
 
 import hashlib
@@ -32,13 +32,13 @@ from megatron.training.distillation.cache_format import (
     FORMAT_NAME,
     FORMAT_VERSION,
     check_manifest_compatible,
-    encode_file,
+    encode_chunk,
     load_manifest,
     load_progress,
     write_manifest,
     write_progress,
 )
-from megatron.training.distillation.cache_writer import AsyncFileWriter, FileBatchSampler
+from megatron.training.distillation.cache_writer import AsyncShardWriter, FileBatchSampler
 from megatron.training.distillation.scoring import teacher_rows
 from megatron.training.initialize import initialize_megatron
 from megatron.training.training import build_train_valid_test_datasets
@@ -70,8 +70,11 @@ def _check_args(args):
         'as in the Apertus 1.5 training runs'
     )
     assert args.mtp_num_layers is None, 'multi-token prediction is not supported'
-    assert args.distill_seqs_per_file % args.micro_batch_size == 0, (
-        '--distill-seqs-per-file must be a multiple of --micro-batch-size'
+    assert args.distill_seqs_per_file % args.distill_seqs_per_chunk == 0, (
+        '--distill-seqs-per-file must be a multiple of --distill-seqs-per-chunk'
+    )
+    assert args.distill_seqs_per_chunk % args.micro_batch_size == 0, (
+        '--distill-seqs-per-chunk must be a multiple of --micro-batch-size'
     )
 
 
@@ -103,6 +106,7 @@ def _manifest(args, vocab_limit, slots, num_files):
         'slots': slots,
         'seq_length': args.seq_length,
         'seqs_per_file': args.distill_seqs_per_file,
+        'seqs_per_chunk': args.distill_seqs_per_chunk,
         'vocab_limit': vocab_limit,
         'prob_dtype': args.distill_prob_dtype,
         'seed': args.seed,
@@ -181,7 +185,18 @@ def _self_check(gpt, hidden_rows, ids, probs, vocab_limit, mode):
     assert ok, 'chunked teacher scoring disagrees with the output layer'
 
 
+def _time_to_stop(args, job_started, shard_seconds):
+    """True on every rank when the next shard would end after the exit duration."""
+    if args.distill_exit_duration_in_mins is None:
+        return False
+    projected = time.time() - job_started + 1.2 * shard_seconds
+    stop = torch.tensor([int(projected > 60 * args.distill_exit_duration_in_mins)], device='cuda')
+    torch.distributed.all_reduce(stop, op=torch.distributed.ReduceOp.MAX)
+    return bool(stop.item())
+
+
 def main():
+    job_started = time.time()
     initialize_megatron(
         extra_args_provider=add_distillation_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True, 'exit_on_missing_checkpoint': True},
@@ -200,8 +215,10 @@ def main():
     slots = distill_slots(args)
     mode = args.distill_cache_mode
     seqs_per_file = args.distill_seqs_per_file
-    micro_batches = seqs_per_file // args.micro_batch_size
-    num_files = math.ceil(args.distill_cache_num_samples / (seqs_per_file * dp_size)) * dp_size
+    seqs_per_chunk = args.distill_seqs_per_chunk
+    chunks_per_file = seqs_per_file // seqs_per_chunk
+    micro_batches = seqs_per_chunk // args.micro_batch_size
+    num_files = math.ceil(args.distill_cache_num_samples / seqs_per_file)
 
     # Manifest and resume point.
     manifest = _manifest(args, vocab_limit, slots, num_files)
@@ -210,7 +227,7 @@ def main():
     torch.distributed.barrier()
     start_file = (load_progress(args.distill_cache_dir) // dp_size) * dp_size
     if start_file >= num_files:
-        print_rank_0(f'> cache already complete: {num_files} files')
+        print_rank_0(f'> cache already complete: {num_files} shards')
         return
 
     # Teacher. Keep the decoder's final norm, but run the output layer in chunks
@@ -228,7 +245,7 @@ def main():
                   if gpt.share_embeddings_and_output_weights else gpt.output_layer.weight)
         bias = getattr(gpt.output_layer, 'bias', None)
 
-    # Data: the same datasets as training. The sampler hands each rank whole files
+    # Data: the same datasets as training. The sampler hands each rank whole shards
     # and skips the ones already cached.
     train_ds, _, _ = build_train_valid_test_datasets(
         pretrain_gpt.train_valid_test_datasets_provider, (num_files * seqs_per_file, 0, 0)
@@ -242,67 +259,92 @@ def main():
             persistent_workers=args.num_workers > 0,
         ))
 
-    writer = (AsyncFileWriter(args.distill_cache_dir, args.distill_writer_threads,
-                              args.distill_compress_level) if is_writer else None)
+    writer = (AsyncShardWriter(args.distill_cache_dir, args.distill_writer_threads,
+                               args.distill_compress_level) if is_writer else None)
     generator = (torch.Generator(device=torch.device('cuda', torch.cuda.current_device()))
                  if mode == 'sample' else None)
-    files_per_rank = (num_files - start_file) // dp_size
+    # The last round may have fewer shards than ranks; the others skip it but still
+    # take part in the collectives at every shard boundary.
+    rounds = math.ceil((num_files - start_file) / dp_size)
     print_rank_0(
-        f'> writing files {start_file}..{num_files - 1}, {files_per_rank} per rank: mode={mode}, '
-        f'slots={slots}, vocab_limit={vocab_limit}, {seqs_per_file} x {args.seq_length} tokens '
-        f'per file in micro-batches of {args.micro_batch_size}'
+        f'> writing shards {start_file}..{num_files - 1} in {rounds} rounds of {dp_size}: '
+        f'mode={mode}, slots={slots}, vocab_limit={vocab_limit}, {seqs_per_file} x '
+        f'{args.seq_length} tokens per shard in chunks of {seqs_per_chunk} and micro-batches of '
+        f'{args.micro_batch_size}'
     )
 
     started = time.time()
     positions = loss_rows = 0
     with torch.inference_mode():
-        for local_file in range(files_per_rank):
+        for local_file in range(rounds):
+            shard_seconds = (time.time() - started) / local_file if local_file else 0.0
+            if _time_to_stop(args, job_started, shard_seconds):
+                print_rank_0(f'> stopping after {local_file} rounds to finish within '
+                             f'{args.distill_exit_duration_in_mins:g} min; rerun to continue')
+                break
             file_id = start_file + local_file * dp_size + dp_rank
-            if generator is not None:
-                generator.manual_seed(args.distill_sample_seed + file_id)
-            parts = []
-            for micro_batch in range(micro_batches):
-                (tokens, labels, loss_mask, _, position_ids, assistant_mask), packed_seq_params = (
-                    pretrain_gpt.get_batch(data_iterator)
-                )
-                rows = loss_mask.reshape(-1) > 0
-                ids = probs = None
-                if score:
-                    hidden = gpt(tokens, position_ids, None, packed_seq_params=packed_seq_params)
-                    hidden_rows = hidden.reshape(-1, hidden.shape[-1])[rows]
-                    del hidden
-                    ids, probs = teacher_rows(hidden_rows, weight, bias, vocab_limit, mode, slots,
-                                              args.distill_logits_chunk, generator)
-                    if args.distill_self_check and local_file == 0 and micro_batch == 0:
-                        _self_check(gpt, hidden_rows, ids, probs, vocab_limit, mode)
-                    del hidden_rows
-                positions += rows.numel()
-                loss_rows += int(rows.sum())
+            if file_id >= num_files:
                 if writer is not None:
-                    shape = (args.micro_batch_size, args.seq_length)
-                    parts.append([
-                        tokens.view(shape).cpu(), labels.view(shape).cpu(),
-                        loss_mask.view(shape).cpu(), position_ids.view(shape).cpu(),
-                        None if assistant_mask is None else assistant_mask.view(shape).cpu(),
-                        None if ids is None else ids.cpu(), None if probs is None else probs.cpu(),
-                    ])
-                del ids, probs
-            if writer is not None:
-                columns = [None if part[0] is None else torch.cat(part) for part in zip(*parts)]
-                writer.submit(local_file, file_id, encode_file(*columns, args.distill_prob_dtype))
+                    writer.skip(local_file)
+            else:
+                if writer is not None:
+                    writer.begin(local_file, file_id, {
+                        'file_id': file_id, 'first_sequence': file_id * seqs_per_file,
+                        'seqs_per_chunk': seqs_per_chunk,
+                    })
+                for chunk in range(chunks_per_file):
+                    if generator is not None:
+                        generator.manual_seed(
+                            args.distill_sample_seed + file_id * chunks_per_file + chunk
+                        )
+                    parts = []
+                    for micro_batch in range(micro_batches):
+                        (tokens, labels, loss_mask, _, position_ids, assistant_mask), packed = (
+                            pretrain_gpt.get_batch(data_iterator)
+                        )
+                        rows = loss_mask.reshape(-1) > 0
+                        ids = probs = None
+                        if score:
+                            hidden = gpt(tokens, position_ids, None, packed_seq_params=packed)
+                            hidden_rows = hidden.reshape(-1, hidden.shape[-1])[rows]
+                            del hidden
+                            ids, probs = teacher_rows(hidden_rows, weight, bias, vocab_limit, mode,
+                                                      slots, args.distill_logits_chunk, generator)
+                            if args.distill_self_check and local_file == chunk == micro_batch == 0:
+                                _self_check(gpt, hidden_rows, ids, probs, vocab_limit, mode)
+                            del hidden_rows
+                        positions += rows.numel()
+                        loss_rows += int(rows.sum())
+                        if writer is not None:
+                            shape = (args.micro_batch_size, args.seq_length)
+                            parts.append([
+                                tokens.view(shape).cpu(), labels.view(shape).cpu(),
+                                loss_mask.view(shape).cpu(), position_ids.view(shape).cpu(),
+                                None if assistant_mask is None else assistant_mask.view(shape).cpu(),
+                                None if ids is None else ids.cpu(),
+                                None if probs is None else probs.cpu(),
+                            ])
+                        del ids, probs
+                    if writer is not None:
+                        columns = [None if c[0] is None else torch.cat(c) for c in zip(*parts)]
+                        payload = encode_chunk(*columns, args.distill_prob_dtype)
+                        chunk_rows = payload['teacher_ids'].shape[0] if 'teacher_ids' in payload else 0
+                        writer.add(payload, seqs_per_chunk, chunk_rows)
+                if writer is not None:
+                    writer.end()
 
             done = local_file + 1
-            if done % args.distill_progress_interval == 0 and done < files_per_rank:
+            if done % args.distill_progress_interval == 0 and done < rounds:
                 completed = _sync_progress(args, writer, start_file, dp_size, num_files)
                 elapsed = time.time() - started
                 print_rank_0(
-                    f'> {done}/{files_per_rank} files per rank: {completed}/{num_files} complete, '
+                    f'> {done}/{rounds} rounds: {completed}/{num_files} shards complete, '
                     f'{positions * dp_size / elapsed:,.0f} tokens/s, {loss_rows / positions:.1%} '
-                    f'of positions with loss, ETA {elapsed / done * (files_per_rank - done) / 60:.1f} min'
+                    f'of positions with loss, ETA {elapsed / done * (rounds - done) / 60:.1f} min'
                 )
 
     completed = _sync_progress(args, writer, start_file, dp_size, num_files, final=True)
-    print_rank_0(f'> done: {completed}/{num_files} files complete in {(time.time() - started) / 60:.1f} min')
+    print_rank_0(f'> done: {completed}/{num_files} shards complete in {(time.time() - started) / 60:.1f} min')
     torch.distributed.barrier()
 
 

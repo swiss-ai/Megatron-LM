@@ -35,9 +35,13 @@ python examples/apertus_distillation/verify_teacher_cache.py /path/to/cache --fi
   runs whose settings differ.
 - **Size:** `TARGET_TOKENS` fixes the data order. To grow a cache later, start it
   with the largest size and stop early.
-- **Layout:** file `f` holds sequences `f * seqs_per_file ...` of the data order,
-  whatever the number of GPUs; `--distill-seqs-per-file` sets the file size
-  independently of `--micro-batch-size`.
+- **Layout:** few, large shard files. Shard `f` holds sequences
+  `f * seqs_per_file ...` of the data order, whatever the number of GPUs. It is
+  an uncompressed zip of gzipped chunks of `--distill-seqs-per-chunk` sequences
+  plus an `index.json`, so readers load one chunk at a time. The launcher uses
+  8,192 sequences per shard: about 2,900 files of ~37 GB for a 197B-token cache.
+- **Time limit:** `--distill-exit-duration-in-mins` stops at a shard boundary
+  before the job's time limit, so large shards cost no lost work.
 - **Check:** `--distill-self-check` compares the chunked scoring with the model's
   own output layer on the first micro-batch.
 

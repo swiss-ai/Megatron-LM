@@ -24,8 +24,10 @@ CACHE_DIR=${CACHE_DIR:?set CACHE_DIR to the cache directory}
 TARGET_TOKENS=${TARGET_TOKENS:-197000000000}
 MODE=${MODE:-topk}                  # topk, sample or tokens
 SLOTS=${SLOTS:-256}                 # top-k size, or draws per position in sample mode
-SEQS_PER_FILE=${SEQS_PER_FILE:-64}  # sequences per cache file
+SEQS_PER_FILE=${SEQS_PER_FILE:-8192}  # sequences per shard (~37 GB at fp32 top-256; ~2.9k shards for 197B)
+SEQS_PER_CHUNK=${SEQS_PER_CHUNK:-32}   # sequences per compressed chunk inside a shard
 SEED=${SEED:-41}                    # data order; 41 is the teacher's stage-3 seed
+EXIT_MINUTES=${EXIT_MINUTES:-700}    # stop at a shard boundary before the 12 h limit
 AUTO_REQUEUE=${AUTO_REQUEUE:-false}
 
 WORKSPACE=${WORKSPACE:-/iopsstor/scratch/cscs/$USER/apertus_distillation}
@@ -59,7 +61,8 @@ run_writer "$(teacher_args "$LOAD_DIR") --seed $SEED \
   --data-path $DATA_PATH --data-cache-path $DATASET_CACHE_DIR \
   --distill-cache-dir $CACHE_DIR --distill-cache-num-samples $NUM_SAMPLES \
   --distill-cache-mode $MODE --distill-topk $SLOTS --distill-samples $SLOTS \
-  --distill-seqs-per-file $SEQS_PER_FILE --distill-self-check"
+  --distill-seqs-per-file $SEQS_PER_FILE --distill-seqs-per-chunk $SEQS_PER_CHUNK \
+  --distill-exit-duration-in-mins $EXIT_MINUTES --distill-self-check"
 
 if [ "$AUTO_REQUEUE" = true ] && python3 - "$CACHE_DIR" <<'EOF'
 import json, sys

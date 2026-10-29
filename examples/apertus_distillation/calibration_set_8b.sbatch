@@ -51,14 +51,15 @@ fi
 
 LOAD_DIR=$CACHE_DIR/.teacher-load
 link_teacher "$LOAD_DIR"
-# Up to 64 sequences per file, a multiple of the micro batch size.
-SEQS_PER_FILE=$((NUM_SEQUENCES / SLURM_NPROCS))
-SEQS_PER_FILE=$(( SEQS_PER_FILE > 64 ? 64 : SEQS_PER_FILE ))
-SEQS_PER_FILE=$(( SEQS_PER_FILE < MBS ? MBS : (SEQS_PER_FILE / MBS) * MBS ))
-echo "[$(date)] $NUM_SEQUENCES calibration sequences, mode=$MODE, $SEQS_PER_FILE per file -> $CACHE_DIR"
+# One shard per rank, in chunks of 32 sequences.
+SEQS_PER_CHUNK=32
+SEQS_PER_FILE=$(( NUM_SEQUENCES / SLURM_NPROCS / SEQS_PER_CHUNK * SEQS_PER_CHUNK ))
+SEQS_PER_FILE=$(( SEQS_PER_FILE < SEQS_PER_CHUNK ? SEQS_PER_CHUNK : SEQS_PER_FILE ))
+echo "[$(date)] $NUM_SEQUENCES calibration sequences, mode=$MODE, $SEQS_PER_FILE per shard -> $CACHE_DIR"
 run_writer "$(teacher_args "$LOAD_DIR") --seed $SEED \
   --data-args-path $BLEND --data-cache-path $DATASET_CACHE_DIR \
   --distill-cache-dir $CACHE_DIR --distill-cache-num-samples $NUM_SEQUENCES \
   --distill-cache-mode $MODE --distill-topk 256 \
-  --distill-seqs-per-file $SEQS_PER_FILE --distill-self-check"
+  --distill-seqs-per-file $SEQS_PER_FILE --distill-seqs-per-chunk $SEQS_PER_CHUNK \
+  --distill-self-check"
 echo "[$(date)] done"

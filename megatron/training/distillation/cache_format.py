@@ -3,21 +3,28 @@
 A cache directory holds:
 
 * ``manifest.json``: format, layout and the settings that produced the cache.
-* ``progress.json``: number of leading files that are completely written.
-* ``files/<file_id // 10000>/<file_id>.pt.gz``: one file per writer micro-batch.
+* ``progress.json``: number of leading shard files that are completely written.
+* ``files/<file_id // 1000>/<file_id>.zip``: large shard files.
 
-File ``f`` holds the sequences ``f * seqs_per_file ... (f + 1) * seqs_per_file - 1``
-of the data pipeline's order. It is a gzipped ``torch.save`` of a dict with:
+Shard ``f`` holds the sequences ``f * seqs_per_file ... (f + 1) * seqs_per_file - 1``
+of the data pipeline's order. It is an uncompressed zip archive (readable with
+``unzip -l``) of independently gzipped chunks, so a reader can load one chunk
+without decompressing the whole shard:
 
-* ``tokens``, ``labels``, ``position_ids``: ``[seqs_per_file, seq_length]`` int32
-* ``loss_mask``: ``[seqs_per_file, seq_length]`` float32, exactly as the data
+* ``00000.pt.gz``, ``00001.pt.gz``, ...: ``seqs_per_chunk`` sequences each.
+* ``index.json``: shard id, first sequence, and per chunk its sequences and rows.
+
+A chunk is a gzipped ``torch.save`` of a dict with:
+
+* ``tokens``, ``labels``, ``position_ids``: ``[seqs_per_chunk, seq_length]`` int32
+* ``loss_mask``: ``[seqs_per_chunk, seq_length]`` float32, exactly as the data
   pipeline produced it
-* ``assistant_mask``: optional ``[seqs_per_file, seq_length]`` bool
+* ``assistant_mask``: optional ``[seqs_per_chunk, seq_length]`` bool
 * ``teacher_ids``: ``[rows, slots]`` int32 (absent in tokens mode)
-* ``teacher_probs``: ``[rows, slots]`` float16 or float32 (absent in tokens mode)
+* ``teacher_probs``: ``[rows, slots]`` float32 or float16 (absent in tokens mode)
 
 Teacher rows are stored only where ``loss_mask > 0``, in row-major order of
-``(sequence, position)``; the reader re-expands them. Positions that carry no
+``(sequence, position)``; ``FileView`` re-expands them. Positions that carry no
 loss never reach the loss, so storing them would only cost space.
 
 In topk mode a row holds the teacher's most likely tokens and their
@@ -26,33 +33,41 @@ count / draws, padded with zero probability. Tokens mode stores the data only.
 """
 
 import gzip
+import io
 import json
 import os
 import time
-from typing import Dict, Optional
+import zipfile
+from typing import Dict, Iterator, List, Optional
 
 import torch
 
 FORMAT_NAME = 'apertus-distill-cache'
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 MANIFEST_NAME = 'manifest.json'
 PROGRESS_NAME = 'progress.json'
-FILES_PER_DIR = 10000
+INDEX_NAME = 'index.json'
+FILES_PER_DIR = 1000
 
 # Manifest keys that must match when a writer resumes into an existing cache.
 IDENTITY_KEYS = (
-    'format', 'version', 'mode', 'slots', 'seq_length', 'seqs_per_file', 'vocab_limit',
-    'prob_dtype', 'seed', 'sample_seed', 'data', 'tokenizer', 'teacher', 'num_files',
+    'format', 'version', 'mode', 'slots', 'seq_length', 'seqs_per_file', 'seqs_per_chunk',
+    'vocab_limit', 'prob_dtype', 'seed', 'sample_seed', 'data', 'tokenizer', 'teacher',
+    'num_files',
 )
 
 PROB_DTYPES = {'fp16': torch.float16, 'fp32': torch.float32}
 
 
 def file_path(cache_dir: str, file_id: int) -> str:
-    """Path of cache file ``file_id``; files are spread over subdirectories."""
+    """Path of shard ``file_id``; shards are spread over subdirectories."""
     return os.path.join(
-        cache_dir, 'files', f'{file_id // FILES_PER_DIR:06d}', f'{file_id:010d}.pt.gz'
+        cache_dir, 'files', f'{file_id // FILES_PER_DIR:05d}', f'{file_id:08d}.zip'
     )
+
+
+def chunk_name(chunk: int) -> str:
+    return f'{chunk:05d}.pt.gz'
 
 
 def _write_json_atomic(path: str, payload: dict) -> None:
@@ -98,7 +113,7 @@ def check_manifest_compatible(existing: dict, new: dict) -> None:
 
 
 def write_progress(cache_dir: str, completed_files: int, data_parallel_size: int) -> None:
-    """Record that files ``0 .. completed_files - 1`` are complete."""
+    """Record that shards ``0 .. completed_files - 1`` are complete."""
     _write_json_atomic(
         os.path.join(cache_dir, PROGRESS_NAME),
         {
@@ -110,7 +125,7 @@ def write_progress(cache_dir: str, completed_files: int, data_parallel_size: int
 
 
 def load_progress(cache_dir: str) -> int:
-    """Number of leading files that are completely written (0 for a new cache)."""
+    """Number of leading shards that are completely written (0 for a new cache)."""
     path = os.path.join(cache_dir, PROGRESS_NAME)
     if not os.path.exists(path):
         return 0
@@ -118,7 +133,7 @@ def load_progress(cache_dir: str) -> int:
         return int(json.load(f)['completed_files'])
 
 
-def encode_file(
+def encode_chunk(
     tokens: torch.Tensor,
     labels: torch.Tensor,
     loss_mask: torch.Tensor,
@@ -128,7 +143,7 @@ def encode_file(
     teacher_probs: Optional[torch.Tensor],
     prob_dtype: str,
 ) -> Dict[str, torch.Tensor]:
-    """Build the payload of one cache file from CPU or GPU tensors.
+    """Build the payload of one chunk from CPU or GPU tensors.
 
     ``tokens``, ``labels``, ``loss_mask``, ``position_ids`` and ``assistant_mask``
     are ``[seqs, seq_length]``; ``teacher_ids`` / ``teacher_probs`` are
@@ -157,34 +172,76 @@ def encode_file(
     return payload
 
 
-def save_file(path: str, payload: Dict[str, torch.Tensor], compress_level: int) -> None:
-    """Write a payload atomically: a temporary file, then a rename."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f'{path}.{os.getpid()}.{time.monotonic_ns()}.tmp'
-    try:
-        if compress_level > 0:
-            with gzip.open(tmp, 'wb', compresslevel=compress_level) as f:
-                torch.save(payload, f)
-        else:
-            with open(tmp, 'wb') as f:
-                torch.save(payload, f)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+def compress_chunk(payload: Dict[str, torch.Tensor], compress_level: int) -> bytes:
+    """Serialize and gzip one chunk payload."""
+    buffer = io.BytesIO()
+    torch.save(payload, buffer)
+    return gzip.compress(buffer.getvalue(), compresslevel=compress_level)
 
 
-def load_file(path: str) -> Dict[str, torch.Tensor]:
-    """Read a cache file (compressed or not)."""
-    with open(path, 'rb') as f:
-        magic = f.read(2)
-    opener = gzip.open if magic == b'\x1f\x8b' else open
-    with opener(path, 'rb') as f:
-        return torch.load(f, map_location='cpu', weights_only=True)
+def decompress_chunk(data: bytes) -> Dict[str, torch.Tensor]:
+    return torch.load(io.BytesIO(gzip.decompress(data)), map_location='cpu', weights_only=True)
+
+
+class ShardWriter:
+    """Writes one shard: chunks in order, then the index, then an atomic rename."""
+
+    def __init__(self, path: str, index: dict):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.path = path
+        self.tmp = f'{path}.{os.getpid()}.{time.monotonic_ns()}.tmp'
+        self.index = dict(index, chunks=[])
+        self.zip = zipfile.ZipFile(self.tmp, 'w', compression=zipfile.ZIP_STORED, allowZip64=True)
+
+    def add(self, data: bytes, num_seqs: int, rows: int) -> None:
+        chunk = len(self.index['chunks'])
+        self.zip.writestr(chunk_name(chunk), data)
+        self.index['chunks'].append({'num_seqs': num_seqs, 'rows': rows, 'bytes': len(data)})
+
+    def close(self) -> None:
+        self.zip.writestr(INDEX_NAME, json.dumps(self.index))
+        self.zip.close()
+        with open(self.tmp, 'rb+') as f:
+            os.fsync(f.fileno())
+        os.replace(self.tmp, self.path)
+
+    def abort(self) -> None:
+        self.zip.close()
+        if os.path.exists(self.tmp):
+            os.remove(self.tmp)
+
+
+class ShardReader:
+    """Random access to the chunks of one shard."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.zip = zipfile.ZipFile(path, 'r')
+        self.index = json.loads(self.zip.read(INDEX_NAME))
+
+    @property
+    def num_chunks(self) -> int:
+        return len(self.index['chunks'])
+
+    def chunk(self, chunk: int) -> Dict[str, torch.Tensor]:
+        return decompress_chunk(self.zip.read(chunk_name(chunk)))
+
+    def chunks(self) -> Iterator[Dict[str, torch.Tensor]]:
+        for chunk in range(self.num_chunks):
+            yield self.chunk(chunk)
+
+    def close(self) -> None:
+        self.zip.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 class FileView:
-    """Expands the compact teacher rows of one cache file, a few sequences at a time."""
+    """Expands the compact teacher rows of one chunk, a few sequences at a time."""
 
     def __init__(self, payload: Dict[str, torch.Tensor]):
         self.payload = payload
@@ -195,7 +252,7 @@ class FileView:
         torch.cumsum(counts, dim=0, out=self.row_offsets[1:])
         if self.has_teacher and int(self.row_offsets[-1]) != payload['teacher_ids'].shape[0]:
             raise ValueError(
-                f'cache file has {payload["teacher_ids"].shape[0]} teacher rows for '
+                f'chunk has {payload["teacher_ids"].shape[0]} teacher rows for '
                 f'{int(self.row_offsets[-1])} loss positions'
             )
 
@@ -204,9 +261,9 @@ class FileView:
         return self.payload['tokens'].shape[0]
 
     def sequences(self, start: int, end: int) -> Dict[str, torch.Tensor]:
-        """Dense tensors for sequences ``start .. end - 1``.
+        """Dense tensors for sequences ``start .. end - 1`` of the chunk.
 
-        Teacher tensors, when the file has them, are ``[n, seq_length, slots]``;
+        Teacher tensors, when the chunk has them, are ``[n, seq_length, slots]``;
         positions without loss get zero probability, so they contribute nothing to
         a distillation term.
         """
