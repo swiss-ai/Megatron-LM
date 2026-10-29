@@ -1,0 +1,54 @@
+"""Command-line arguments of the teacher-cache writer."""
+
+
+def add_distillation_args(parser):
+    """Add distillation arguments to a Megatron argument parser."""
+    group = parser.add_argument_group(title='distillation')
+
+    group.add_argument('--distill-cache-dir', type=str, default=None,
+                       help='Directory of the teacher cache written by get_teacher_logits.py.')
+    group.add_argument('--distill-cache-mode', type=str, default='topk',
+                       choices=['topk', 'sample'],
+                       help='topk: store the teacher\'s k most likely tokens and their '
+                       'probabilities. sample: draw --distill-samples tokens per position at '
+                       'T=1 and store each distinct token with its count / draws, which is an '
+                       'unbiased estimate of the full distribution.')
+    group.add_argument('--distill-topk', type=int, default=256,
+                       help='Tokens stored per position in topk mode.')
+    group.add_argument('--distill-samples', type=int, default=64,
+                       help='Draws per position in sample mode.')
+    group.add_argument('--distill-vocab-size', type=int, default=None,
+                       help='Restrict teacher and student distributions to token ids below this '
+                       'value, renormalizing over them (131072 keeps the Apertus 1.5 text '
+                       'vocabulary). Defaults to the tokenizer vocabulary size.')
+    group.add_argument('--distill-prob-dtype', type=str, default='fp16',
+                       choices=['fp16', 'fp32'],
+                       help='Storage dtype of cached teacher probabilities.')
+
+    # Writer.
+    group.add_argument('--distill-cache-num-samples', type=int, default=None,
+                       help='Number of sequences to score, rounded up to whole rounds of '
+                       'micro-batch-size x data-parallel-size sequences. It fixes the data '
+                       'order, so set it to the largest cache you may want: a run can stop '
+                       'early and resume later, but cannot grow a finished cache.')
+    group.add_argument('--distill-logits-chunk', type=int, default=4096,
+                       help='Positions per output-layer chunk when scoring, which bounds the '
+                       'memory used for logits.')
+    group.add_argument('--distill-writer-threads', type=int, default=8,
+                       help='Background threads compressing and writing cache files per rank.')
+    group.add_argument('--distill-compress-level', type=int, default=1,
+                       help='gzip compression level of cache files (0 disables compression).')
+    group.add_argument('--distill-sample-seed', type=int, default=1234,
+                       help='Base seed for sample mode. Each file uses seed + file id, so the '
+                       'draws do not depend on the number of GPUs.')
+    group.add_argument('--distill-progress-interval', type=int, default=20,
+                       help='Steps between progress synchronizations of the writer.')
+    group.add_argument('--distill-self-check', action='store_true',
+                       help='On the first step, recompute a few rows with the full output '
+                       'layer and check them against the chunked scoring.')
+    return parser
+
+
+def distill_slots(args):
+    """Number of (token, probability) slots stored per position."""
+    return args.distill_topk if args.distill_cache_mode == 'topk' else args.distill_samples
