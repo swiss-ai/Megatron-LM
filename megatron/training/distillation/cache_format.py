@@ -13,8 +13,8 @@ of the data pipeline's order. It is a gzipped ``torch.save`` of a dict with:
 * ``loss_mask``: ``[seqs_per_file, seq_length]`` float32, exactly as the data
   pipeline produced it
 * ``assistant_mask``: optional ``[seqs_per_file, seq_length]`` bool
-* ``teacher_ids``: ``[rows, slots]`` int32
-* ``teacher_probs``: ``[rows, slots]`` float16 or float32
+* ``teacher_ids``: ``[rows, slots]`` int32 (absent in tokens mode)
+* ``teacher_probs``: ``[rows, slots]`` float16 or float32 (absent in tokens mode)
 
 Teacher rows are stored only where ``loss_mask > 0``, in row-major order of
 ``(sequence, position)``; the reader re-expands them. Positions that carry no
@@ -22,7 +22,7 @@ loss never reach the loss, so storing them would only cost space.
 
 In topk mode a row holds the teacher's most likely tokens and their
 probabilities. In sample mode it holds the distinct tokens drawn and their
-count / draws, padded with zero probability.
+count / draws, padded with zero probability. Tokens mode stores the data only.
 """
 
 import gzip
@@ -124,30 +124,34 @@ def encode_file(
     loss_mask: torch.Tensor,
     position_ids: torch.Tensor,
     assistant_mask: Optional[torch.Tensor],
-    teacher_ids: torch.Tensor,
-    teacher_probs: torch.Tensor,
+    teacher_ids: Optional[torch.Tensor],
+    teacher_probs: Optional[torch.Tensor],
     prob_dtype: str,
 ) -> Dict[str, torch.Tensor]:
     """Build the payload of one cache file from CPU or GPU tensors.
 
     ``tokens``, ``labels``, ``loss_mask``, ``position_ids`` and ``assistant_mask``
     are ``[seqs, seq_length]``; ``teacher_ids`` / ``teacher_probs`` are
-    ``[rows, slots]`` with one row per position where ``loss_mask > 0``.
+    ``[rows, slots]`` with one row per position where ``loss_mask > 0``, or both
+    None in tokens mode.
     """
-    rows = int((loss_mask > 0).sum())
-    if teacher_ids.shape[0] != rows or teacher_probs.shape != teacher_ids.shape:
-        raise ValueError(
-            f'teacher rows {tuple(teacher_ids.shape)} / {tuple(teacher_probs.shape)} '
-            f'do not match {rows} loss positions'
-        )
     payload = {
         'tokens': tokens.to('cpu', torch.int32),
         'labels': labels.to('cpu', torch.int32),
         'loss_mask': loss_mask.to('cpu', torch.float32),
         'position_ids': position_ids.to('cpu', torch.int32),
-        'teacher_ids': teacher_ids.to('cpu', torch.int32),
-        'teacher_probs': teacher_probs.to('cpu', PROB_DTYPES[prob_dtype]),
     }
+    if (teacher_ids is None) != (teacher_probs is None):
+        raise ValueError('pass both teacher ids and probabilities, or neither')
+    if teacher_ids is not None:
+        rows = int((loss_mask > 0).sum())
+        if teacher_ids.shape[0] != rows or teacher_probs.shape != teacher_ids.shape:
+            raise ValueError(
+                f'teacher rows {tuple(teacher_ids.shape)} / {tuple(teacher_probs.shape)} '
+                f'do not match {rows} loss positions'
+            )
+        payload['teacher_ids'] = teacher_ids.to('cpu', torch.int32)
+        payload['teacher_probs'] = teacher_probs.to('cpu', PROB_DTYPES[prob_dtype])
     if assistant_mask is not None:
         payload['assistant_mask'] = assistant_mask.to('cpu', torch.bool)
     return payload
@@ -184,11 +188,12 @@ class FileView:
 
     def __init__(self, payload: Dict[str, torch.Tensor]):
         self.payload = payload
+        self.has_teacher = 'teacher_ids' in payload
         self.loss_rows = payload['loss_mask'] > 0
         counts = self.loss_rows.sum(dim=1)
         self.row_offsets = torch.zeros(counts.numel() + 1, dtype=torch.long)
         torch.cumsum(counts, dim=0, out=self.row_offsets[1:])
-        if int(self.row_offsets[-1]) != payload['teacher_ids'].shape[0]:
+        if self.has_teacher and int(self.row_offsets[-1]) != payload['teacher_ids'].shape[0]:
             raise ValueError(
                 f'cache file has {payload["teacher_ids"].shape[0]} teacher rows for '
                 f'{int(self.row_offsets[-1])} loss positions'
@@ -201,27 +206,29 @@ class FileView:
     def sequences(self, start: int, end: int) -> Dict[str, torch.Tensor]:
         """Dense tensors for sequences ``start .. end - 1``.
 
-        Teacher tensors are ``[n, seq_length, slots]``; positions without loss get
-        zero probability, so they contribute nothing to the distillation term.
+        Teacher tensors, when the file has them, are ``[n, seq_length, slots]``;
+        positions without loss get zero probability, so they contribute nothing to
+        a distillation term.
         """
         p = self.payload
         seq_length = p['tokens'].shape[1]
-        slots = p['teacher_ids'].shape[1]
         n = end - start
-        lo, hi = int(self.row_offsets[start]), int(self.row_offsets[end])
-        rows = self.loss_rows[start:end].reshape(-1)
-        teacher_ids = torch.zeros((n * seq_length, slots), dtype=torch.int32)
-        teacher_probs = torch.zeros((n * seq_length, slots), dtype=torch.float32)
-        teacher_ids[rows] = p['teacher_ids'][lo:hi]
-        teacher_probs[rows] = p['teacher_probs'][lo:hi].float()
         batch = {
             'tokens': p['tokens'][start:end].long(),
             'labels': p['labels'][start:end].long(),
             'loss_mask': p['loss_mask'][start:end].float(),
             'position_ids': p['position_ids'][start:end].long(),
-            'teacher_ids': teacher_ids.view(n, seq_length, slots),
-            'teacher_probs': teacher_probs.view(n, seq_length, slots),
         }
+        if self.has_teacher:
+            slots = p['teacher_ids'].shape[1]
+            lo, hi = int(self.row_offsets[start]), int(self.row_offsets[end])
+            rows = self.loss_rows[start:end].reshape(-1)
+            teacher_ids = torch.zeros((n * seq_length, slots), dtype=torch.int32)
+            teacher_probs = torch.zeros((n * seq_length, slots), dtype=torch.float32)
+            teacher_ids[rows] = p['teacher_ids'][lo:hi]
+            teacher_probs[rows] = p['teacher_probs'][lo:hi].float()
+            batch['teacher_ids'] = teacher_ids.view(n, seq_length, slots)
+            batch['teacher_probs'] = teacher_probs.view(n, seq_length, slots)
         if 'assistant_mask' in p:
             batch['assistant_mask'] = p['assistant_mask'][start:end].float()
         else:

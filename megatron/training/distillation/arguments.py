@@ -8,11 +8,13 @@ def add_distillation_args(parser):
     group.add_argument('--distill-cache-dir', type=str, default=None,
                        help='Directory of the teacher cache written by get_teacher_logits.py.')
     group.add_argument('--distill-cache-mode', type=str, default='topk',
-                       choices=['topk', 'sample'],
+                       choices=['topk', 'sample', 'tokens'],
                        help='topk: store the teacher\'s k most likely tokens and their '
                        'probabilities. sample: draw --distill-samples tokens per position at '
                        'T=1 and store each distinct token with its count / draws, which is an '
-                       'unbiased estimate of the full distribution.')
+                       'unbiased estimate of the full distribution. tokens: store the data '
+                       'only (tokens, labels, masks), without loading a teacher, e.g. for a '
+                       'pruning calibration set.')
     group.add_argument('--distill-topk', type=int, default=256,
                        help='Tokens stored per position in topk mode.')
     group.add_argument('--distill-samples', type=int, default=64,
@@ -28,9 +30,12 @@ def add_distillation_args(parser):
     # Writer.
     group.add_argument('--distill-cache-num-samples', type=int, default=None,
                        help='Number of sequences to score, rounded up to whole rounds of '
-                       'micro-batch-size x data-parallel-size sequences. It fixes the data '
+                       'seqs-per-file x data-parallel-size sequences. It fixes the data '
                        'order, so set it to the largest cache you may want: a run can stop '
                        'early and resume later, but cannot grow a finished cache.')
+    group.add_argument('--distill-seqs-per-file', type=int, default=32,
+                       help='Sequences per cache file; a multiple of the micro batch size. '
+                       'Larger files mean fewer files on the file system.')
     group.add_argument('--distill-logits-chunk', type=int, default=4096,
                        help='Positions per output-layer chunk when scoring, which bounds the '
                        'memory used for logits.')
@@ -51,4 +56,6 @@ def add_distillation_args(parser):
 
 def distill_slots(args):
     """Number of (token, probability) slots stored per position."""
-    return args.distill_topk if args.distill_cache_mode == 'topk' else args.distill_samples
+    return {'topk': args.distill_topk, 'sample': args.distill_samples, 'tokens': 0}[
+        args.distill_cache_mode
+    ]

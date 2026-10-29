@@ -1,12 +1,42 @@
-"""Background writing of cache files and cross-rank progress tracking."""
+"""Data order and background writing of cache files."""
 
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Dict, List
+from typing import Dict, Iterator, List
 
 import torch
 
 from .cache_format import file_path, save_file
+
+
+class FileBatchSampler:
+    """Micro-batches that give each data-parallel rank whole files.
+
+    File ``f`` holds samples ``f * seqs_per_file ... (f + 1) * seqs_per_file - 1`` of
+    the dataset order, so file contents do not depend on the number of GPUs. Rank
+    ``r`` scores files ``start_file + r, start_file + r + dp_size, ...``, each in
+    ``seqs_per_file / micro_batch_size`` micro-batches.
+    """
+
+    def __init__(self, start_file: int, num_files: int, seqs_per_file: int,
+                 micro_batch_size: int, dp_rank: int, dp_size: int):
+        assert seqs_per_file % micro_batch_size == 0, (
+            f'seqs per file ({seqs_per_file}) must be a multiple of the micro batch size '
+            f'({micro_batch_size})'
+        )
+        assert start_file % dp_size == 0 and num_files % dp_size == 0
+        self.files = range(start_file + dp_rank, num_files, dp_size)
+        self.seqs_per_file = seqs_per_file
+        self.micro_batch_size = micro_batch_size
+
+    def __iter__(self) -> Iterator[List[int]]:
+        for file_id in self.files:
+            first = file_id * self.seqs_per_file
+            for offset in range(0, self.seqs_per_file, self.micro_batch_size):
+                yield list(range(first + offset, first + offset + self.micro_batch_size))
+
+    def __len__(self) -> int:
+        return len(self.files) * (self.seqs_per_file // self.micro_batch_size)
 
 
 class AsyncFileWriter:

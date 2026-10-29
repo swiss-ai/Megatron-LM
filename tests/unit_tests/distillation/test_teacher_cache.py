@@ -1,10 +1,12 @@
-"""CPU tests for the teacher-cache format, writer and scoring.
+"""CPU tests for the teacher-cache format, writer, scoring and calibration blend.
 
 Run with ``pytest --noconftest tests/unit_tests/distillation`` (no GPU or test
 data needed).
 """
 
+import importlib.util
 import os
+import struct
 
 import pytest
 import torch
@@ -25,7 +27,7 @@ from megatron.training.distillation.cache_format import (
     write_manifest,
     write_progress,
 )
-from megatron.training.distillation.cache_writer import AsyncFileWriter
+from megatron.training.distillation.cache_writer import AsyncFileWriter, FileBatchSampler
 from megatron.training.distillation.scoring import teacher_rows
 
 
@@ -74,6 +76,18 @@ def test_file_roundtrip(tmp_path, compress_level, prob_dtype):
     assert torch.equal(batch['teacher_probs'].reshape(-1, slots), dense_probs[window])
 
 
+def test_tokens_only_file(tmp_path):
+    tokens, labels, loss_mask, position_ids, _, ids, probs = _batch()
+    payload = encode_file(tokens, labels, loss_mask, position_ids, None, None, None, 'fp16')
+    assert 'teacher_ids' not in payload and 'teacher_probs' not in payload
+    path = file_path(str(tmp_path), 0)
+    save_file(path, payload, 1)
+    batch = FileView(load_file(path)).sequences(0, 3)
+    assert torch.equal(batch['tokens'], tokens) and 'teacher_ids' not in batch
+    with pytest.raises(ValueError):
+        encode_file(tokens, labels, loss_mask, position_ids, None, ids, None, 'fp16')
+
+
 def test_encode_rejects_row_mismatch():
     tokens, labels, loss_mask, position_ids, _, ids, probs = _batch()
     with pytest.raises(ValueError):
@@ -120,6 +134,30 @@ def test_sample_distinct():
     many_ids, many_freqs = sample_distinct(rows, 32, torch.Generator().manual_seed(2))
     estimate = torch.zeros(50).index_add_(0, many_ids.reshape(-1), many_freqs.reshape(-1)) / 4000
     torch.testing.assert_close(estimate, probs[0], atol=0.01, rtol=0)
+
+
+@pytest.mark.parametrize('dp_size', [1, 2, 4])
+def test_file_batch_sampler(dp_size):
+    seqs_per_file, micro_batch_size, num_files = 6, 2, 8
+    seen = {}
+    for rank in range(dp_size):
+        sampler = FileBatchSampler(0, num_files, seqs_per_file, micro_batch_size, rank, dp_size)
+        batches = list(sampler)
+        assert len(batches) == len(sampler) == num_files // dp_size * 3
+        # Each file arrives as consecutive micro-batches of contiguous samples.
+        for i in range(0, len(batches), 3):
+            samples = sum(batches[i:i + 3], [])
+            file_id = samples[0] // seqs_per_file
+            assert samples == list(range(file_id * 6, file_id * 6 + 6))
+            assert file_id % dp_size == rank and file_id not in seen
+            seen[file_id] = rank
+    assert sorted(seen) == list(range(num_files))
+
+    # Resuming skips whole files, whatever the number of ranks.
+    resumed = FileBatchSampler(4, num_files, seqs_per_file, micro_batch_size, 0, 2)
+    assert next(iter(resumed)) == [24, 25]
+    with pytest.raises(AssertionError):
+        FileBatchSampler(0, num_files, seqs_per_file, 4, 0, 1)
 
 
 def test_async_writer(tmp_path):
@@ -176,3 +214,36 @@ def test_teacher_rows_sample(single_tp_rank):
 def test_teacher_rows_empty(single_tp_rank):
     ids, probs = teacher_rows(torch.zeros(0, 8), torch.randn(40, 8), None, 30, 'topk', 5, 4)
     assert ids.shape == (0, 5) and probs.shape == (0, 5)
+
+
+def _load_calibration_blend():
+    path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'examples',
+                        'apertus_distillation', 'calibration_blend.py')
+    spec = importlib.util.spec_from_file_location('calibration_blend', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _fake_dataset(prefix, tokens):
+    os.makedirs(os.path.dirname(prefix), exist_ok=True)
+    with open(prefix + '.idx', 'wb') as f:
+        f.write(b'MMIDIDX\x00\x00' + struct.pack('<Q', 1) + struct.pack('<B', 4))
+    with open(prefix + '.bin', 'wb') as f:
+        f.write(b'\x00' * 4 * tokens)
+
+
+def test_calibration_blend(tmp_path):
+    module = _load_calibration_blend()
+    _fake_dataset(str(tmp_path / 'text' / 'web'), 300)
+    _fake_dataset(str(tmp_path / 'text' / 'apertus_sft_filtered' / 'chat'), 100)
+    _fake_dataset(str(tmp_path / 'text' / 'bad' / 'broken'), 50)
+    _fake_dataset(str(tmp_path / 'image' / 'captions'), 10)
+    groups = [('text', 0.6, [str(tmp_path / 'text')]), ('image', 0.4, [str(tmp_path / 'image')])]
+    entries = dict((prefix, weight) for weight, prefix in
+                   module.blend(groups, exclude=['*/bad/*']))
+    assert entries == pytest.approx({
+        'pretrain:' + str(tmp_path / 'text' / 'web'): 0.45,
+        'sft:' + str(tmp_path / 'text' / 'apertus_sft_filtered' / 'chat'): 0.15,
+        'pretrain:' + str(tmp_path / 'image' / 'captions'): 0.4,
+    })
