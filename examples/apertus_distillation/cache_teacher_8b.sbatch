@@ -6,7 +6,9 @@
 #
 # TARGET_TOKENS fixes the data order: set it to the largest cache you may want. A
 # rerun with the same settings resumes after the completed files (progress.json),
-# on any number of nodes; AUTO_REQUEUE=true chains jobs until the cache is complete.
+# on any number of nodes. AUTO_REQUEUE=true submits the next job at the end of every
+# job that exits cleanly with new shards, until the cache is complete; a job that
+# fails or adds no shard is not resubmitted.
 # Check the result with examples/apertus_distillation/verify_teacher_cache.py.
 #SBATCH --job-name=apertus-1p5-8b-teacher-cache
 #SBATCH --account=infra01
@@ -38,10 +40,11 @@ DATASET_CACHE_DIR=${DATASET_CACHE_DIR:-$WORKSPACE/datasets/cache}
 TEXT_DATA_DIR=${TEXT_DATA_DIR:-/capstor/store/cscs/swissai/infra01/apertus_1p5/apertus_dataset/prepare-8b/text_stage_3}
 source "$MEGATRON_LM_DIR/examples/apertus_distillation/teacher_8b_args.sh"
 
-if [ "$AUTO_REQUEUE" = true ]; then
-    sbatch --dependency=singleton --job-name="$SLURM_JOB_NAME" --nodes="$SLURM_JOB_NUM_NODES" \
-        --export=ALL "$MEGATRON_LM_DIR/examples/apertus_distillation/cache_teacher_8b.sbatch"
-fi
+completed_shards() {
+    python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["completed_files"])' \
+        "$CACHE_DIR/progress.json" 2>/dev/null || echo 0
+}
+START=$(completed_shards)
 
 LOAD_DIR=$CACHE_DIR/.teacher-load
 link_teacher "$LOAD_DIR"
@@ -64,14 +67,17 @@ run_writer "$(teacher_args "$LOAD_DIR") --seed $SEED \
   --distill-seqs-per-file $SEQS_PER_FILE --distill-seqs-per-chunk $SEQS_PER_CHUNK \
   --distill-exit-duration-in-mins $EXIT_MINUTES --distill-self-check"
 
-if [ "$AUTO_REQUEUE" = true ] && python3 - "$CACHE_DIR" <<'EOF'
-import json, sys
-progress = json.load(open(sys.argv[1] + '/progress.json'))
-manifest = json.load(open(sys.argv[1] + '/manifest.json'))
-sys.exit(0 if progress['completed_files'] >= manifest['num_files'] else 1)
-EOF
-then
-    echo "[$(date)] cache complete, cancelling the queued follow-up job"
-    scancel --jobname "$SLURM_JOB_NAME" --state=PENDING
+DONE=$(completed_shards)
+TOTAL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["num_files"])' \
+    "$CACHE_DIR/manifest.json")
+echo "[$(date)] $DONE/$TOTAL shards complete"
+# Reached only if the writer exited cleanly (set -e).
+if [ "$AUTO_REQUEUE" = true ] && [ "$DONE" -lt "$TOTAL" ]; then
+    if [ "$DONE" -gt "$START" ]; then
+        sbatch --nodes="$SLURM_JOB_NUM_NODES" --export=ALL \
+            "$MEGATRON_LM_DIR/examples/apertus_distillation/cache_teacher_8b.sbatch"
+    else
+        echo "[$(date)] no new shards in this job, not resubmitting"
+    fi
 fi
 echo "[$(date)] done"

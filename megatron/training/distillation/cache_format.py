@@ -32,6 +32,8 @@ probabilities. In sample mode it holds the distinct tokens drawn and their
 count / draws, padded with zero probability. Tokens mode stores the data only.
 """
 
+import contextlib
+import glob
 import gzip
 import io
 import json
@@ -188,6 +190,11 @@ class ShardWriter:
 
     def __init__(self, path: str, index: dict):
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        # One process writes a shard at a time, so temporary files of this shard are
+        # left over from a killed attempt; each can be as large as a whole shard.
+        for stale in glob.glob(glob.escape(path) + '.*.tmp'):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(stale)
         self.path = path
         self.tmp = f'{path}.{os.getpid()}.{time.monotonic_ns()}.tmp'
         self.index = dict(index, chunks=[])

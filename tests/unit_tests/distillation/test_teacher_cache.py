@@ -90,6 +90,17 @@ def test_shard_roundtrip(tmp_path, compress_level, prob_dtype):
     assert torch.equal(batch['teacher_probs'].reshape(-1, slots), dense_probs[window])
 
 
+def test_shard_writer_removes_leftovers(tmp_path):
+    path = file_path(str(tmp_path), 3)
+    other = file_path(str(tmp_path), 4)
+    os.makedirs(os.path.dirname(path))
+    for leftover in (f'{path}.111.222.tmp', f'{other}.111.222.tmp'):
+        open(leftover, 'wb').close()
+    _write_shard(path, [_batch()])
+    # Only the leftover of the shard being written goes; other shards' files stay.
+    assert sorted(os.listdir(os.path.dirname(path))) == ['00000003.zip', '00000004.zip.111.222.tmp']
+
+
 def test_tokens_only_chunk(tmp_path):
     tokens, labels, loss_mask, position_ids, _, ids, probs = _batch()
     path = file_path(str(tmp_path), 0)
