@@ -13,6 +13,7 @@ and a rerun with the same arguments resumes after them, on any number of GPUs.
 without it continues the same data order.
 """
 
+import contextlib
 import hashlib
 import math
 import os
@@ -41,7 +42,11 @@ from megatron.training.distillation.cache_format import (
     write_progress,
 )
 from megatron.training.distillation.cache_reader import check_worker_tmpdir
-from megatron.training.distillation.cache_writer import AsyncShardWriter, FileBatchSampler
+from megatron.training.distillation.cache_writer import (
+    AsyncShardWriter,
+    FileBatchSampler,
+    collate_samples,
+)
 from megatron.training.distillation.scoring import teacher_rows
 from megatron.training.initialize import initialize_megatron
 from megatron.training.training import build_train_valid_test_datasets
@@ -213,6 +218,18 @@ def _time_to_stop(args, job_started, shard_seconds):
     return bool(stop.item())
 
 
+@contextlib.contextmanager
+def _abort_on_error(writer):
+    """Drop the open shard on an error: its assembler thread would wait for chunks
+    forever and keep the process, and the job, alive."""
+    try:
+        yield
+    except BaseException:
+        if writer is not None:
+            writer.abort()
+        raise
+
+
 def main():
     job_started = time.time()
     initialize_megatron(
@@ -276,7 +293,7 @@ def main():
                                    dp_rank, dp_size)
         data_iterator = iter(torch.utils.data.DataLoader(
             train_ds, batch_sampler=sampler, num_workers=args.num_workers, pin_memory=True,
-            persistent_workers=args.num_workers > 0,
+            persistent_workers=args.num_workers > 0, collate_fn=collate_samples,
         ))
 
     writer = (AsyncShardWriter(args.distill_cache_dir, args.distill_writer_threads,
@@ -296,7 +313,7 @@ def main():
 
     started = time.time()
     positions = loss_rows = 0
-    with torch.inference_mode():
+    with torch.inference_mode(), _abort_on_error(writer):
         for local_file in range(rounds):
             shard_seconds = (time.time() - started) / local_file if local_file else 0.0
             if _time_to_stop(args, job_started, shard_seconds):

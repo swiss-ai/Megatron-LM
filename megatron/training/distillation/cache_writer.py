@@ -1,5 +1,6 @@
 """Data order and background writing of cache shards."""
 
+import functools
 import queue
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -40,6 +41,20 @@ class FileBatchSampler:
         return len(self.files) * (self.seqs_per_file // self.micro_batch_size)
 
 
+def collate_samples(samples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """``default_collate`` after casting each field to one dtype across the micro-batch.
+
+    The datasets of a blend can disagree: ``assistant_mask`` is int64 from ``GPTDataset``
+    and bool from the SFT dataset, and a worker stacks into the first sample's dtype.
+    """
+    for key, value in samples[0].items():
+        if isinstance(value, torch.Tensor):
+            dtype = functools.reduce(torch.promote_types, (s[key].dtype for s in samples))
+            for sample in samples:
+                sample[key] = sample[key].to(dtype)
+    return torch.utils.data.default_collate(samples)
+
+
 class AsyncShardWriter:
     """Writes shards in the background.
 
@@ -49,6 +64,8 @@ class AsyncShardWriter:
     next call after the shard that failed.
 
     Usage per shard: ``begin(step, file_id, index)``, ``add(...)`` per chunk, ``end()``.
+    ``abort()`` after an error drops the open shard, so that no thread is left waiting
+    for its chunks and the process can exit.
     """
 
     def __init__(self, cache_dir: str, num_threads: int, compress_level: int, max_pending: int = 0):
@@ -87,6 +104,17 @@ class AsyncShardWriter:
         """Close the current shard; it is written once its chunks are compressed."""
         self.chunks.put(None)
         self.chunks = None
+
+    def abort(self) -> None:
+        """Drop the open shard after an error; see the class docstring."""
+        self.compressors.shutdown(wait=False, cancel_futures=True)
+        if self.chunks is not None:
+            failed = Future()
+            failed.set_exception(RuntimeError('shard aborted'))
+            self.chunks.put((failed, 0, 0))
+            self.chunks.put(None)
+            self.chunks = None
+        self.assembler.shutdown(wait=False)
 
     def skip(self, step: int) -> None:
         """Count a step without a shard (the short last round) as done."""

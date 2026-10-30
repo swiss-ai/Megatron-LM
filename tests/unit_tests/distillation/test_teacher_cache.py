@@ -28,7 +28,11 @@ from megatron.training.distillation.cache_format import (
     write_manifest,
     write_progress,
 )
-from megatron.training.distillation.cache_writer import AsyncShardWriter, FileBatchSampler
+from megatron.training.distillation.cache_writer import (
+    AsyncShardWriter,
+    FileBatchSampler,
+    collate_samples,
+)
 from megatron.training.distillation.scoring import teacher_rows
 
 
@@ -245,6 +249,42 @@ def test_async_shard_writer_raises_on_failure(tmp_path):
     writer.end()
     with pytest.raises(OSError):
         writer.close()
+
+
+def test_async_shard_writer_abort(tmp_path):
+    batch = _batch()
+    tokens, ids = batch[0], batch[5]
+    payload = encode_chunk(*batch, 'fp32')
+    writer = AsyncShardWriter(str(tmp_path), num_threads=1, compress_level=0, max_pending=1)
+    writer.begin(0, 0, {})
+    writer.add(payload, tokens.shape[0], ids.shape[0])
+    writer.abort()  # An error before end(): no thread may keep waiting for chunks.
+    assert writer.pending[0].exception(timeout=30) is not None
+    assert not [p for p in tmp_path.rglob('*') if p.is_file()]  # No shard, no temporary file.
+
+
+class _MixedDtypes(torch.utils.data.Dataset):
+    """GPTDataset gives an int64 assistant_mask, the SFT dataset a bool one."""
+
+    def __len__(self):
+        return 2
+
+    def __getitem__(self, i):
+        mask = torch.tensor([0, 1, 1, 0])
+        return {'tokens': torch.arange(4) + 4 * i, 'assistant_mask': mask.bool() if i == 0 else 0 * mask}
+
+
+def test_collate_samples_mixed_dtypes():
+    loader = torch.utils.data.DataLoader(_MixedDtypes(), batch_size=2, num_workers=1)
+    # A worker stacks into the first sample's dtype, bool (TypeError or RuntimeError).
+    with pytest.raises((TypeError, RuntimeError), match='desired output type Bool'):
+        next(iter(loader))
+    loader = torch.utils.data.DataLoader(_MixedDtypes(), batch_size=2, num_workers=1,
+                                         collate_fn=collate_samples)
+    batch = next(iter(loader))
+    assert batch['assistant_mask'].dtype == torch.long
+    assert batch['assistant_mask'].tolist() == [[0, 1, 1, 0], [0, 0, 0, 0]]
+    assert batch['tokens'].tolist() == [[0, 1, 2, 3], [4, 5, 6, 7]]
 
 
 @pytest.fixture

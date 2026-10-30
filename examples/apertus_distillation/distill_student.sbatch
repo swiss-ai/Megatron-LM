@@ -112,7 +112,7 @@ export PYTHONPATH=$MEGATRON_LM_DIR
 export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 srun --cpus-per-task "$SLURM_CPUS_PER_TASK" --mpi=pmix --environment="$CONTAINER_ENV" \
-    --network=disable_rdzv_get -lu bash -c "
+    --network=disable_rdzv_get --kill-on-bad-exit=1 -lu bash -c "
     source '$VENV/bin/activate' || exit 1
     cd '$MEGATRON_LM_DIR'
     RANK=\$SLURM_PROCID LOCAL_RANK=\$SLURM_LOCALID python3 pretrain_gpt_distill.py $ARGS
