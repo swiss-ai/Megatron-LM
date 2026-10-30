@@ -26,8 +26,8 @@ from .cache_format import FileView, ShardReader, file_path, load_manifest, load_
 class CacheSequences(torch.utils.data.Dataset):
     """Sequences of the completed shards of a cache, indexed by ``(start, end)``.
 
-    A range must lie within one chunk. Each process keeps its last shard open and
-    its last chunk decompressed.
+    A range must lie within one chunk. Each process, forked workers included, keeps
+    its own last shard open and its last chunk decompressed.
     """
 
     def __init__(self, cache_dir: str):
@@ -39,12 +39,17 @@ class CacheSequences(torch.utils.data.Dataset):
         self.num_sequences = load_progress(cache_dir) * self.seqs_per_file
         self._shard: Optional[ShardReader] = None
         self._view: Optional[Tuple[Tuple[int, int], FileView]] = None
+        self._pid = os.getpid()
 
     def __getstate__(self):
         # Workers open their own files.
         return dict(self.__dict__, _shard=None, _view=None)
 
     def __getitem__(self, span: Tuple[int, int]) -> Dict[str, torch.Tensor]:
+        if self._pid != os.getpid():
+            # A forked worker: the inherited shard shares its read position with the
+            # parent and the other workers, so their reads would corrupt each other.
+            self._shard, self._view, self._pid = None, None, os.getpid()
         start, end = span
         assert 0 <= start < end <= self.num_sequences, (
             f'sequences {start}..{end - 1} are not in the {self.num_sequences} completed '

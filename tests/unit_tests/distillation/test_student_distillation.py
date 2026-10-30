@@ -224,3 +224,29 @@ def test_cache_iterator_checks_tmpdir(tmp_path, monkeypatch):
     build_cache_iterator(cache, range(1), 4, 2, 0, 1, 0)
     with pytest.raises(AssertionError, match='TMPDIR'):
         build_cache_iterator(cache, range(1), 4, 2, 0, 1, 2)
+
+
+class _ReadInWorker(torch.utils.data.Dataset):
+    """Reads sequences 2..3 in a DataLoader worker; says if it opened its own shard."""
+
+    def __init__(self, cache):
+        self.cache, self.inherited = cache, cache._shard
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, index):
+        tokens = self.cache[(2, 4)]['tokens'][:, 0]
+        return tokens, self.cache._shard is not self.inherited
+
+
+def test_cache_sequences_reopen_shard_in_forked_worker(tmp_path):
+    # A worker forked after the main process opened a shard must not read through it:
+    # the file's read position is shared, so concurrent reads would corrupt each other.
+    _write_cache(tmp_path)
+    cache = CacheSequences(str(tmp_path))
+    cache[(0, 2)]
+    loader = torch.utils.data.DataLoader(_ReadInWorker(cache), batch_size=None, num_workers=1,
+                                         multiprocessing_context='fork')
+    tokens, reopened = next(iter(loader))
+    assert tokens.tolist() == [2, 3] and reopened
