@@ -26,8 +26,9 @@ WORKSPACE=${WORKSPACE:-/iopsstor/scratch/cscs/$USER/apertus_distillation}
 SRC=$WORKSPACE/Megatron-LM-8B
 HERE=$SRC/examples/apertus_distillation
 CONTAINER_ENV=${CONTAINER_ENV:-/capstor/store/cscs/swissai/infra01/containers/ngc_25-12-alps2.toml}
-RUN=$WORKSPACE/distill_cache_smoke/preflight
-mkdir -p "$RUN"
+RUN=$CACHE_ROOT/preflight
+export DATASET_CACHE_DIR=$CACHE_ROOT/dataset-index
+mkdir -p "$RUN" "$DATASET_CACHE_DIR"
 step() { echo; echo "===== $(date +%T) $*"; }
 in_container() {
     srun --ntasks=1 --nodes=1 --network=disable_rdzv_get --environment="$CONTAINER_ENV" bash -c "

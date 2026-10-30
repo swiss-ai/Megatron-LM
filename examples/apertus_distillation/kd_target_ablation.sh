@@ -28,6 +28,9 @@ STUDENT_NODES=${STUDENT_NODES:-8}
 SHARD_TOKENS=$((8192 * 8192))      # sequences per shard x tokens per sequence
 TRAIN_SHARDS=${TRAIN_SHARDS:-447}  # 447 shards = 7,152 steps of 512 x 8,192 tokens
 export BLEND=${BLEND:-$CACHE_ROOT/blend.txt}  # one data order for both caches
+OUTPUTS=$(dirname "$CACHE_ROOT")              # checkpoints, logs and index stay beside the caches
+export DATASET_CACHE_DIR=$OUTPUTS/dataset-index
+export SBATCH_OUTPUT=$OUTPUTS/logs/%x-%j.out SBATCH_ERROR=$OUTPUTS/logs/%x-%j.err
 
 TOPK=$CACHE_ROOT/stagep-top256
 SAMPLE=$CACHE_ROOT/stagep-sample64
@@ -52,7 +55,8 @@ echo "64-sample cache: ${sample_job:+job }${sample_job:-complete} -> $SAMPLE"
 # rerun of the cache job.
 student() {
     local run=$1 cache_dir=$2 kd_weight=$3 tail=$4
-    RUN=kd-ablation-$SIZE-$run SIZE=$SIZE CACHE_DIR=$cache_dir VALID_CACHE_DIR=$SAMPLE \
+    RUN=kd-ablation-$SIZE-$run RUN_DIR=$OUTPUTS/students/kd-ablation-$SIZE-$run \
+        SIZE=$SIZE CACHE_DIR=$cache_dir VALID_CACHE_DIR=$SAMPLE \
         KD_WEIGHT=$kd_weight TAIL=$tail TRAIN_TOKENS=$((TRAIN_SHARDS * SHARD_TOKENS)) \
         sbatch --parsable --nodes="$STUDENT_NODES" ${sample_job:+--dependency=afterok:$sample_job} \
         "$HERE/distill_student.sbatch"
