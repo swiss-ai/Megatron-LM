@@ -113,19 +113,23 @@ def _top_ids(ids, probs):
 
 def compare_chunks(manifest, a, b, same_mode=True, block=128):
     """Data must be identical; teacher distributions are compared by total variation,
-    entropies and label log-probabilities by their largest difference."""
+    entropies and label log-probabilities by their mean and largest differences."""
     for key in DATA_KEYS:
         assert torch.equal(a[key], b[key]), f'{key} differs'
     rows = int((a['loss_mask'] > 0).sum())
     result = {'rows': rows, 'top1_agree': rows, 'tv_sum': 0.0, 'tv_max': 0.0, 'exact': rows,
-              'entropy_diff': 0.0, 'label_diff': 0.0}
+              'entropy_sum': 0.0, 'entropy_diff': 0.0, 'label_rows': 0, 'label_sum': 0.0,
+              'label_diff': 0.0}
     if manifest['mode'] == 'tokens' or rows == 0:
         return result
-    result['entropy_diff'] = (a['teacher_entropy'] - b['teacher_entropy']).abs().max().item()
+    entropy_diff = (a['teacher_entropy'] - b['teacher_entropy']).abs()
+    result.update(entropy_sum=entropy_diff.sum().item(), entropy_diff=entropy_diff.max().item())
     finite = torch.isfinite(a['teacher_label_logprob'])
     assert torch.equal(finite, torch.isfinite(b['teacher_label_logprob'])), 'non-text rows differ'
-    result['label_diff'] = (a['teacher_label_logprob'][finite]
-                            - b['teacher_label_logprob'][finite]).abs().max().item() if finite.any() else 0.0
+    if finite.any():
+        label_diff = (a['teacher_label_logprob'][finite] - b['teacher_label_logprob'][finite]).abs()
+        result.update(label_rows=int(finite.sum()), label_sum=label_diff.sum().item(),
+                      label_diff=label_diff.max().item())
     if not same_mode:
         return result
     ids_a, ids_b = a['teacher_ids'].long(), b['teacher_ids'].long()
@@ -153,9 +157,14 @@ def main():
     parser.add_argument('--min-top1-agreement', type=float, default=0.95)
     parser.add_argument('--max-mean-tv', type=float, default=0.02,
                         help='Largest allowed mean total-variation distance per position.')
-    parser.add_argument('--max-field-diff', type=float, default=0.1,
-                        help='Largest allowed difference of an entropy or label log-probability '
-                        '(nats).')
+    parser.add_argument('--max-mean-field-diff', type=float, default=0.05,
+                        help='Largest allowed mean difference of the entropies or of the label '
+                        'log-probabilities (nats).')
+    parser.add_argument('--max-field-diff', type=float, default=None,
+                        help='Largest allowed difference at any position (nats), for caches whose '
+                        'rows should agree: a resume, or a top-k and a sample cache of one layout. '
+                        'Not checked by default: in another parallel layout, bf16 rounding moves '
+                        'the uncertain positions.')
     parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
 
@@ -222,7 +231,8 @@ def main():
         shared = [f for f in file_ids if f < load_progress(args.compare)]
         assert shared, 'the caches share no completed files'
         agg = {'rows': 0, 'top1_agree': 0, 'tv_sum': 0.0, 'tv_max': 0.0, 'exact': 0,
-               'entropy_diff': 0.0, 'label_diff': 0.0}
+               'entropy_sum': 0.0, 'entropy_diff': 0.0, 'label_rows': 0, 'label_sum': 0.0,
+               'label_diff': 0.0}
         for file_id in shared:
             with ShardReader(file_path(args.cache_dir, file_id)) as a, \
                     ShardReader(file_path(args.compare, file_id)) as b:
@@ -236,8 +246,9 @@ def main():
                                     else agg[key] + result[key])
         n = max(agg['rows'], 1)
         top1, mean_tv = agg['top1_agree'] / n, agg['tv_sum'] / n
-        fields = (f'max entropy difference {agg["entropy_diff"]:.2e}, max label log-prob '
-                  f'difference {agg["label_diff"]:.2e}')
+        mean_entropy, mean_label = agg['entropy_sum'] / n, agg['label_sum'] / max(agg['label_rows'], 1)
+        fields = (f'entropy difference mean {mean_entropy:.2e} max {agg["entropy_diff"]:.2e}, '
+                  f'label log-prob difference mean {mean_label:.2e} max {agg["label_diff"]:.2e}')
         if same_mode:
             print(f'  compare with {args.compare}: {len(shared)} shards, data identical, '
                   f'{agg["exact"] / n:.1%} rows bit-identical, top-1 agreement {top1:.2%}, '
@@ -247,7 +258,11 @@ def main():
                   f'identical, {fields}')
         if top1 < args.min_top1_agreement or mean_tv > args.max_mean_tv:
             sys.exit('FAIL compare: teacher distributions differ more than allowed')
-        if max(agg['entropy_diff'], agg['label_diff']) > args.max_field_diff:
+        if max(mean_entropy, mean_label) > args.max_mean_field_diff:
+            sys.exit('FAIL compare: entropies or label log-probabilities differ more than allowed '
+                     'on average')
+        if (args.max_field_diff is not None
+                and max(agg['entropy_diff'], agg['label_diff']) > args.max_field_diff):
             sys.exit('FAIL compare: entropies or label log-probabilities differ more than allowed')
     print('OK')
 
