@@ -13,8 +13,10 @@
 # loss on the labels, top-1 confidence and accuracy. The students start once both
 # caches are complete.
 #
-#   CACHE_ROOT=/iopsstor/scratch/cscs/$USER/apertus_distillation/caches \
-#     bash examples/apertus_distillation/kd_target_ablation.sh
+# The top-256 cache is the Stage P cache of launch_stage_p.sh. Run this once its first 448
+# shards exist: it adds the sampled cache, or reuses it if complete, and the students.
+#
+#   CACHE_ROOT=/path/to/distill bash examples/apertus_distillation/kd_target_ablation.sh
 #
 # Size: ~17 TB for the top-256 prefix at fp32, ~1 TB for the sampled one.
 set -euo pipefail
@@ -25,17 +27,25 @@ CACHE_NODES=${CACHE_NODES:-32}
 STUDENT_NODES=${STUDENT_NODES:-8}
 SHARD_TOKENS=$((8192 * 8192))      # sequences per shard x tokens per sequence
 TRAIN_SHARDS=${TRAIN_SHARDS:-447}  # 447 shards = 7,152 steps of 512 x 8,192 tokens
+export BLEND=${BLEND:-$CACHE_ROOT/blend.txt}  # one data order for both caches
 
 TOPK=$CACHE_ROOT/stagep-top256
 SAMPLE=$CACHE_ROOT/stagep-sample64
 STOP_TOKENS=$(((TRAIN_SHARDS + 1) * SHARD_TOKENS))
-cache() {
-    CACHE_DIR=$1 MODE=$2 SLOTS=$3 STOP_TOKENS=$STOP_TOKENS \
-        sbatch --parsable --nodes="$CACHE_NODES" "$HERE/cache_teacher_8b.sbatch"
+completed() {
+    python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["completed_files"])' \
+        "$1/progress.json" 2>/dev/null || echo 0
 }
-topk_job=$(cache "$TOPK" topk 256)
-sample_job=$(cache "$SAMPLE" sample 64)
-echo "caches: top-256 job $topk_job -> $TOPK; 64 samples job $sample_job -> $SAMPLE"
+if [ "$(completed "$TOPK")" -le "$TRAIN_SHARDS" ]; then
+    echo "$TOPK has $(completed "$TOPK") of the $((TRAIN_SHARDS + 1)) shards needed" >&2
+    exit 1
+fi
+sample_job=
+if [ "$(completed "$SAMPLE")" -le "$TRAIN_SHARDS" ]; then
+    sample_job=$(CACHE_DIR=$SAMPLE MODE=sample SLOTS=64 STOP_TOKENS=$STOP_TOKENS \
+        sbatch --parsable --nodes="$CACHE_NODES" "$HERE/cache_teacher_8b.sbatch")
+fi
+echo "64-sample cache: ${sample_job:+job }${sample_job:-complete} -> $SAMPLE"
 
 # One job writes each prefix (~4 h on 32 nodes). A student that starts on an incomplete
 # cache stops at once and reports how many sequences are missing; resubmit it after a
@@ -44,7 +54,7 @@ student() {
     local run=$1 cache_dir=$2 kd_weight=$3 tail=$4
     RUN=kd-ablation-$SIZE-$run SIZE=$SIZE CACHE_DIR=$cache_dir VALID_CACHE_DIR=$SAMPLE \
         KD_WEIGHT=$kd_weight TAIL=$tail TRAIN_TOKENS=$((TRAIN_SHARDS * SHARD_TOKENS)) \
-        sbatch --parsable --nodes="$STUDENT_NODES" --dependency=afterok:$topk_job:$sample_job \
+        sbatch --parsable --nodes="$STUDENT_NODES" ${sample_job:+--dependency=afterok:$sample_job} \
         "$HERE/distill_student.sbatch"
 }
 for spec in "ce $SAMPLE 0 false" "top256 $TOPK 0.9 false" "tail $TOPK 0.9 true" \

@@ -44,6 +44,7 @@ from megatron.training.distillation.cache_format import (
 from megatron.training.distillation.cache_reader import check_worker_tmpdir
 from megatron.training.distillation.cache_writer import (
     AsyncShardWriter,
+    HeldOutSequences,
     FileBatchSampler,
     collate_samples,
 )
@@ -61,6 +62,7 @@ DATA_IDENTITY_ARGS = (
     'ap_sft_pack_samples', 'ap_sft_packing_strategy', 'ap_sft_equalize_sample_loss',
     'ap_sft_long_ctx_loss', 'ap_sft_truncate_right', 'ap_sft_load_loss_mask',
     'pretraining_packing_strategy', 'max_docs_per_bin', 'max_docs_per_bin_sft',
+    'distill_heldout_blend', 'distill_heldout_after',
 )
 
 
@@ -84,6 +86,12 @@ def _check_args(args):
     assert args.distill_seqs_per_chunk % args.micro_batch_size == 0, (
         '--distill-seqs-per-chunk must be a multiple of --micro-batch-size'
     )
+    assert (args.distill_heldout_blend is None) == (args.distill_heldout_after is None), (
+        '--distill-heldout-blend and --distill-heldout-after go together'
+    )
+    assert args.distill_heldout_blend is None or args.data_args_path, (
+        '--distill-heldout-blend needs the main blend in --data-args-path'
+    )
 
 
 def _git_commit():
@@ -99,11 +107,24 @@ def _git_commit():
 def _data_identity(args):
     data = {key: getattr(args, key, None) for key in DATA_IDENTITY_ARGS}
     # A blend file can change under the same path; record what it contained.
-    for key in ('data_args_path', 'per_split_data_args_path'):
+    for key in ('data_args_path', 'per_split_data_args_path', 'distill_heldout_blend'):
         if data[key]:
             with open(data[key], 'rb') as f:
                 data[key + '_sha256'] = hashlib.sha256(f.read()).hexdigest()
     return data
+
+
+def _heldout_weights(args, datasets):
+    """The weights of the held-out blend, in the order of the main blend's datasets."""
+    with open(args.data_args_path) as f:
+        prefixes = f.read().split()[1::2]
+    with open(args.distill_heldout_blend) as f:
+        words = f.read().split()
+    weights = dict(zip(words[1::2], map(float, words[0::2])))
+    assert set(weights) <= set(prefixes), 'the held-out blend has datasets of its own'
+    assert all(prefix.endswith(str(dataset.dataset_path))
+               for prefix, dataset in zip(prefixes, datasets)), 'datasets are out of order'
+    return [weights.get(prefix, 0.0) for prefix in prefixes]
 
 
 def _manifest(args, vocab_limit, slots, num_files):
@@ -284,10 +305,16 @@ def main():
     # Data: the same datasets as training. The sampler hands each rank whole shards
     # and skips the ones already cached.
     train_ds, _, _ = build_train_valid_test_datasets(
-        pretrain_gpt.train_valid_test_datasets_provider, (num_files * seqs_per_file, 0, 0)
+        pretrain_gpt.train_valid_test_datasets_provider,
+        (args.distill_heldout_after or num_files * seqs_per_file, 0, 0),
     )
     data_iterator = None
     if train_ds is not None:
+        if args.distill_heldout_blend:
+            train_ds = HeldOutSequences(
+                train_ds, args.distill_heldout_after,
+                _heldout_weights(args, train_ds.datasets), num_files * seqs_per_file, args.seed,
+            )
         check_worker_tmpdir(args.num_workers)
         sampler = FileBatchSampler(start_file, end_file, seqs_per_file, args.micro_batch_size,
                                    dp_rank, dp_size)

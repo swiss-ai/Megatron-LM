@@ -4,6 +4,8 @@ Each group (e.g. text, vision, audio) gets a fixed share of the blend; inside a
 group, datasets are weighted by their token counts, as Megatron does for an
 unweighted blend. SFT prefixes (paths containing ``apertus_sft``) are tagged
 ``sft:`` and the rest ``pretrain:``, as in the Apertus 1.5 stage-3 launcher.
+A file linked twice gets one entry with both weights: every dataset of a blend
+shuffles with the same seed, so two links would serve the same sequences twice.
 The output file is meant for ``--data-args-path``.
 
 Usage:
@@ -50,6 +52,15 @@ def prefixes(paths, exclude):
     )
 
 
+def merge_links(entries):
+    """One entry per file, with the weights of all its links."""
+    merged = {}
+    for weight, prefix in entries:
+        path = os.path.realpath(prefix.split(':', 1)[1] + '.bin')
+        merged[path] = (merged[path][0] + weight, merged[path][1]) if path in merged else (weight, prefix)
+    return list(merged.values())
+
+
 def blend(groups, exclude):
     """Return ``[(weight, tagged_prefix), ...]`` with group shares summing to 1."""
     total_share = sum(share for _, share, _ in groups)
@@ -65,7 +76,7 @@ def blend(groups, exclude):
             entries.append((share / total_share * count / group_tokens, tag + prefix))
         print(f'{name}: {len(found)} datasets, {group_tokens / 1e9:.2f}B tokens, '
               f'share {share / total_share:.1%}', file=sys.stderr)
-    return entries
+    return merge_links(entries)
 
 
 def main():

@@ -4,8 +4,9 @@ import functools
 import queue
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Dict, Iterator, List
+from typing import Dict, Iterator, List, Sequence
 
+import numpy
 import torch
 
 from .cache_format import ShardWriter, compress_chunk, file_path
@@ -39,6 +40,43 @@ class FileBatchSampler:
 
     def __len__(self) -> int:
         return len(self.files) * (self.seqs_per_file // self.micro_batch_size)
+
+
+class HeldOutSequences(torch.utils.data.Dataset):
+    """Sequences of a blend's datasets that the blend's first ``used`` sequences don't reach.
+
+    A blend reads each dataset in that dataset's own shuffled order, and a dataset's
+    sequences are disjoint windows of its tokens. So its first ``used`` sequences are the
+    first sequences of every dataset, and reading on from there gives a set that shares
+    no tokens with them. ``weights`` share out ``size`` sequences over the datasets, in
+    the order of ``blended.datasets``; ``seed`` shuffles them.
+    """
+
+    def __init__(self, blended, used: int, weights: Sequence[float], size: int, seed: int):
+        self.datasets = blended.datasets
+        assert len(weights) == len(self.datasets)
+        blended[0]  # Maps the blend's index if another rank built it.
+        assert used <= len(blended), f'the blend has {len(blended)} sequences, not {used}'
+        first = numpy.bincount(blended.dataset_index[:used], minlength=len(self.datasets))
+        quota = size * numpy.asarray(weights, dtype=numpy.float64) / sum(weights)
+        counts = numpy.floor(quota).astype(numpy.int64)
+        counts[numpy.argsort(counts - quota, kind='stable')[:size - counts.sum()]] += 1
+        pairs = []
+        for dataset_id in numpy.flatnonzero(counts).tolist():
+            begin, end = int(first[dataset_id]), int(first[dataset_id] + counts[dataset_id])
+            assert end <= len(self.datasets[dataset_id]), (
+                f'dataset {dataset_id} has {len(self.datasets[dataset_id])} sequences: too few '
+                f'for {counts[dataset_id]} held out after {begin} used'
+            )
+            pairs.extend((dataset_id, sample_id) for sample_id in range(begin, end))
+        self.index = numpy.array(pairs)[numpy.random.RandomState(seed).permutation(size)]
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        dataset_id, sample_id = int(self.index[idx][0]), int(self.index[idx][1])
+        return {'dataset_id': dataset_id, **self.datasets[dataset_id][sample_id]}
 
 
 def collate_samples(samples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:

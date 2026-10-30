@@ -8,6 +8,10 @@ TEACHER_STEP=${TEACHER_STEP:-478000}
 TOKENIZER=${TOKENIZER:-/capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok_instruct}
 SEQ_LEN=${SEQ_LEN:-8192}
 MBS=${MBS:-8}
+# The Stage P cache: 24,051,712 sequences (197B tokens), whole shards of 8,192 sequences and
+# of 1,024, so a preflight with small shards reads the same data order. This number sizes
+# every dataset of the blend, so a held-out set must use the same one.
+TARGET_TOKENS=${TARGET_TOKENS:-197031624704}
 
 # Megatron finds checkpoints by step; link the teacher under that name in $1.
 link_teacher() {

@@ -30,14 +30,21 @@ everything it needs from the cache. The layout is documented in
 ## Running
 
 ```bash
-CACHE_DIR=/path/to/cache TARGET_TOKENS=197000000000 \
-  sbatch --nodes=32 examples/apertus_distillation/cache_teacher_8b.sbatch
+export CACHE_ROOT=/path/to/caches
+bash examples/apertus_distillation/stage_p_blends.sh       # freeze distill/ and pruning/ blends
+python3 examples/apertus_distillation/check_stage_p.py blends --root $CACHE_ROOT
+sbatch examples/apertus_distillation/preflight_stage_p.sbatch   # also writes the pruning set
+bash examples/apertus_distillation/launch_stage_p.sh       # start or resume the cache
 python examples/apertus_distillation/verify_teacher_cache.py /path/to/cache --files 50
 ```
 
-- **Resume:** rerun with the same settings, on any number of nodes; the writer
-  continues after the files recorded in `progress.json`. The manifest refuses
-  runs whose settings differ.
+- **Resume:** run `launch_stage_p.sh` again, on any number of nodes; the writer
+  continues after the files recorded in `progress.json` and drops half-written
+  ones. The manifest refuses runs whose settings differ, and the script refuses
+  while a job of the cache is in the queue.
+- **Separate sets:** the pruning set uses its own blend and folder. It reads the
+  sequences of each dataset after those the cache reaches, so the two share no
+  sequences.
 - **Size:** `TARGET_TOKENS` fixes the data order. To grow a cache later, start it
   with the largest size and stop early.
 - **Layout:** few, large shard files. Shard `f` holds sequences

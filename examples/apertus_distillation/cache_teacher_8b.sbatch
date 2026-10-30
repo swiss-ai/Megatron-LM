@@ -1,8 +1,8 @@
 #!/bin/bash
-# Write a teacher cache from the Apertus 1.5 8B stage-3 checkpoint over the stage-3
-# data mix, blended by size as in the teacher's own cooldown.
+# Write a teacher cache from the Apertus 1.5 8B stage-3 checkpoint over the frozen blend
+# of stage_p_blends.sh. launch_stage_p.sh runs this with the settings of the Stage P cache.
 #
-#   CACHE_DIR=/path/to/cache TARGET_TOKENS=197000000000 sbatch --nodes=32 cache_teacher_8b.sbatch
+#   BLEND=/path/to/blend.txt CACHE_DIR=/path/to/cache sbatch --nodes=32 cache_teacher_8b.sbatch
 #
 # TARGET_TOKENS fixes the data order: set it to the largest cache you may want. A
 # rerun with the same settings resumes after the completed files (progress.json),
@@ -10,7 +10,7 @@
 # an ablation; a later run without it continues the same order. AUTO_REQUEUE=true
 # submits the next job at the end of every job that exits cleanly with new shards,
 # until the cache (or its STOP_TOKENS prefix) is complete; a job that fails or adds
-# no shard is not resubmitted.
+# no shard is not resubmitted, and running the same command again continues the cache.
 # Check the result with examples/apertus_distillation/verify_teacher_cache.py.
 #SBATCH --job-name=apertus-1p5-8b-teacher-cache
 #SBATCH --account=infra01
@@ -25,7 +25,7 @@
 set -euo pipefail
 
 CACHE_DIR=${CACHE_DIR:?set CACHE_DIR to the cache directory}
-TARGET_TOKENS=${TARGET_TOKENS:-197000000000}
+BLEND=${BLEND:?set BLEND to the blend file of the data mix}
 STOP_TOKENS=${STOP_TOKENS:-}        # optional: write only the shards covering these first tokens
 MODE=${MODE:-topk}                  # topk, sample or tokens
 SLOTS=${SLOTS:-256}                 # top-k size, or draws per position in sample mode
@@ -40,7 +40,6 @@ MEGATRON_LM_DIR=${MEGATRON_LM_DIR:-$WORKSPACE/Megatron-LM-8B}
 VENV=${VENV:-$WORKSPACE/.venv-stage3}
 CONTAINER_ENV=${CONTAINER_ENV:-/capstor/store/cscs/swissai/infra01/containers/ngc_25-12-alps2.toml}
 DATASET_CACHE_DIR=${DATASET_CACHE_DIR:-$WORKSPACE/datasets/cache}
-TEXT_DATA_DIR=${TEXT_DATA_DIR:-/capstor/store/cscs/swissai/infra01/apertus_1p5/apertus_dataset/prepare-8b/text_stage_3}
 source "$MEGATRON_LM_DIR/examples/apertus_distillation/teacher_8b_args.sh"
 
 completed_shards() {
@@ -52,15 +51,6 @@ START=$(completed_shards)
 LOAD_DIR=$CACHE_DIR/.teacher-load
 link_teacher "$LOAD_DIR"
 
-# The stage-3 blend: every prefix, no weights, SFT prefixes tagged, one corrupt shard excluded.
-DATA_PATH=$(find -L "$TEXT_DATA_DIR" \
-    /capstor/store/cscs/swissai/infra01/audio-datasets/Apertus1p5_cooldown_tokenized \
-    /capstor/store/cscs/swissai/infra01/vision-datasets/Apertus1p5_cooldown_tokenized/8B \
-    -name '*.bin' | while read -r f; do
-        [[ "$(readlink -f "$f")" == */swiss-caselaw-preprocessed/dump-1/00019_tokens.bin ]] || echo "$f"
-    done | sed 's/\.bin$//' | sort | \
-    awk '{ if ($0 ~ /apertus_sft/) print "sft:" $0; else print "pretrain:" $0 }' | tr '\n' ' ')
-
 NUM_SAMPLES=$((TARGET_TOKENS / SEQ_LEN))
 STOP_ARGS=
 if [ -n "$STOP_TOKENS" ]; then
@@ -69,9 +59,9 @@ if [ -n "$STOP_TOKENS" ]; then
 fi
 echo "[$(date)] $SLURM_NPROCS ranks, $NUM_SAMPLES sequences, mode=$MODE slots=$SLOTS $STOP_ARGS -> $CACHE_DIR"
 run_writer "$(teacher_args "$LOAD_DIR") --seed $SEED $STOP_ARGS \
-  --data-path $DATA_PATH --data-cache-path $DATASET_CACHE_DIR \
+  --data-args-path $BLEND --data-cache-path $DATASET_CACHE_DIR \
   --distill-cache-dir $CACHE_DIR --distill-cache-num-samples $NUM_SAMPLES \
-  --distill-cache-mode $MODE --distill-topk $SLOTS --distill-samples $SLOTS \
+  --distill-cache-mode $MODE --distill-topk $SLOTS --distill-samples $SLOTS --distill-prob-dtype fp32 \
   --distill-seqs-per-file $SEQS_PER_FILE --distill-seqs-per-chunk $SEQS_PER_CHUNK \
   --distill-exit-duration-in-mins $EXIT_MINUTES --distill-self-check"
 

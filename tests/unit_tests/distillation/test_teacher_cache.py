@@ -8,6 +8,7 @@ import importlib.util
 import os
 import struct
 
+import numpy
 import pytest
 import torch
 
@@ -30,6 +31,7 @@ from megatron.training.distillation.cache_format import (
 )
 from megatron.training.distillation.cache_writer import (
     AsyncShardWriter,
+    HeldOutSequences,
     FileBatchSampler,
     collate_samples,
 )
@@ -372,3 +374,64 @@ def test_calibration_blend(tmp_path):
         'sft:' + str(tmp_path / 'text' / 'apertus_sft_filtered' / 'chat'): 0.15,
         'pretrain:' + str(tmp_path / 'image' / 'captions'): 0.4,
     })
+
+
+def test_calibration_blend_merges_links(tmp_path):
+    # Two links to one file would serve the same sequences twice.
+    module = _load_calibration_blend()
+    _fake_dataset(str(tmp_path / 'math' / 'a' / 'pages'), 100)
+    _fake_dataset(str(tmp_path / 'math' / 'b' / 'other'), 100)
+    (tmp_path / 'math' / 'c').mkdir()
+    for suffix in ('.bin', '.idx'):
+        os.symlink(tmp_path / 'math' / 'a' / ('pages' + suffix),
+                   tmp_path / 'math' / 'c' / ('pages' + suffix))
+    entries = module.blend([('math', 1.0, [str(tmp_path / 'math')])], exclude=[])
+    assert dict((prefix, weight) for weight, prefix in entries) == pytest.approx({
+        'pretrain:' + str(tmp_path / 'math' / 'b' / 'other'): 1 / 3,
+        'pretrain:' + str(tmp_path / 'math' / 'a' / 'pages'): 2 / 3,
+    })
+
+
+class _FakeBlend:
+    """Two datasets read in order, as a BlendedDataset reads them."""
+
+    def __init__(self, sizes, order):
+        self.datasets = [[{'tokens': torch.tensor([d, s])} for s in range(n)]
+                         for d, n in enumerate(sizes)]
+        self.dataset_index = numpy.array(order, dtype=numpy.int16)
+
+    def __getitem__(self, idx):
+        return {}
+
+    def __len__(self):
+        return len(self.dataset_index)
+
+
+def test_held_out_sequences():
+    blend = _FakeBlend([10, 20, 5], [0, 1, 1, 0, 1, 1])  # Reaches 2, 4 and 0 sequences.
+    held_out = HeldOutSequences(blend, 6, [0.5, 0.25, 0.25], size=8, seed=1)
+    samples = [held_out[i] for i in range(len(held_out))]
+    assert len(held_out) == 8
+    seen = sorted(tuple(sample['tokens'].tolist()) for sample in samples)
+    # The next sequences of each dataset, in the shares of the weights.
+    assert seen == [(0, 2), (0, 3), (0, 4), (0, 5), (1, 4), (1, 5), (2, 0), (2, 1)]
+    assert all(sample['dataset_id'] == sample['tokens'][0] for sample in samples)
+    assert [tuple(held_out[i]['tokens'].tolist()) for i in range(8)] != seen  # Shuffled.
+
+
+def test_held_out_sequences_count_only_the_used_prefix():
+    blend = _FakeBlend([10, 10], [0, 0, 1, 1, 1, 1])
+    held_out = HeldOutSequences(blend, 3, [1.0, 0.0], size=2, seed=1)
+    assert sorted(held_out[i]['tokens'][1].item() for i in range(2)) == [2, 3]
+
+
+def test_held_out_sequences_round_to_the_size():
+    blend = _FakeBlend([100, 100, 100], [0])
+    held_out = HeldOutSequences(blend, 1, [1 / 3, 1 / 3, 1 / 3], size=10, seed=1)
+    assert len(held_out) == 10
+
+
+def test_held_out_sequences_refuse_to_run_out():
+    blend = _FakeBlend([4, 100], [0, 0, 0])
+    with pytest.raises(AssertionError, match='held out'):
+        HeldOutSequences(blend, 3, [1.0, 0.0], size=2, seed=1)

@@ -40,6 +40,14 @@ def add_distillation_args(parser):
                        help='Write only shards 0 .. N-1 of the cache in this run. The data order '
                        'still covers --distill-cache-num-samples, so a later run without this '
                        'flag continues where this one stopped.')
+    group.add_argument('--distill-heldout-blend', type=str, default=None,
+                       help='Blend file with the weights of a held-out set, e.g. the pruning '
+                       'calibration set. The writer builds the datasets of --data-args-path and '
+                       'reads the sequences after the first --distill-heldout-after ones of '
+                       'that blend, so the set shares no tokens with a cache of that blend.')
+    group.add_argument('--distill-heldout-after', type=int, default=None,
+                       help='Sequences of the --data-args-path blend to stay clear of: the '
+                       'sequences of the training cache.')
     group.add_argument('--distill-seqs-per-file', type=int, default=1024,
                        help='Sequences per shard file, a multiple of --distill-seqs-per-chunk. '
                        'Shards are large on purpose, to keep the number of files low.')
