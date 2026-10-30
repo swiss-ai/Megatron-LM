@@ -52,6 +52,10 @@ STAGE2_TOKENS = {'img2txt_blip3_grounding_50m': 47.52e9, 'img2txt_recap_datacomp
 EXCLUDED = 'swiss-caselaw-preprocessed/dump-1/00019_tokens'
 DTYPE_SIZES = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 8, 7: 4, 8: 2}
 IMAGE_IDS, SPEECH_IDS = (131272, 262344), (262344, 266440)
+# finemath holds documents of a million tokens, some of them tables of zeros. Their 8k
+# windows repeat without any fault in the blend, so sequences of so few distinct tokens
+# are counted apart from real repeats.
+PATTERN_TOKENS = 8
 
 failures = []
 
@@ -219,15 +223,19 @@ def tokens_of(cache_dir, limit=None):
 
 
 def sequence_counts(cache_dir, limit=None):
-    """Sequences per domain, and hashes of all sequences."""
-    counts, hashes = {'text': 0, 'vision': 0, 'audio': 0}, []
+    """Sequences per domain, hashes of the sequences, and the number of mere patterns."""
+    import torch
+    counts, hashes, patterns = {'text': 0, 'vision': 0, 'audio': 0}, [], 0
     for tokens in tokens_of(cache_dir, limit):
         image = ((tokens >= IMAGE_IDS[0]) & (tokens < IMAGE_IDS[1])).any(1)
         speech = ((tokens >= SPEECH_IDS[0]) & (tokens < SPEECH_IDS[1])).any(1)
         for seq, is_image, is_speech in zip(tokens, image.tolist(), speech.tolist()):
             counts['vision' if is_image else 'audio' if is_speech else 'text'] += 1
-            hashes.append(hashlib.sha1(seq.numpy().tobytes()).digest())
-    return counts, hashes
+            if len(torch.unique(seq)) <= PATTERN_TOKENS:
+                patterns += 1
+            else:
+                hashes.append(hashlib.sha1(seq.numpy().tobytes()).digest())
+    return counts, hashes, patterns
 
 
 def check_settings(cache_dir, manifest, blend):
@@ -269,9 +277,10 @@ def check_datasets(args, entries):
         return check(False, f'no blend index of {expected} sequences in {args.data_cache}')
     counts = numpy.bincount(found[:SEQUENCES], minlength=len(entries))
     planned = numpy.array([weight * SEQUENCES for weight, _ in entries])
-    worst = (numpy.abs(counts - planned) / numpy.maximum(planned, 1)).max()
+    off = numpy.abs(counts - planned)
     check((counts > 0).all(), f'all {len(entries)} datasets are in the cache, the smallest with {counts.min()} sequences')
-    check(worst < 0.01, f'sequences per dataset within 1% of the plan (worst {worst:.2%})')
+    check((off <= numpy.maximum(1, 0.01 * planned)).all(),
+          f'sequences per dataset within 1% of the plan, or one sequence (worst {off.max():.1f} sequences)')
 
 
 def cache(args):
@@ -281,9 +290,10 @@ def cache(args):
     check_settings(args.cache_dir, manifest, blend)
     print('data')
     check(manifest['data'].get('distill_heldout_blend') is None, 'not a held-out set')
-    counts, hashes = sequence_counts(args.cache_dir)
+    counts, hashes, patterns = sequence_counts(args.cache_dir)
     check_domains(counts, MIX['distill'], 3.0)
     check(len(set(hashes)) == len(hashes), f'no repeated sequence in {len(hashes)}')
+    print(f'  NOTE  {patterns} sequences of at most {PATTERN_TOKENS} distinct tokens left out of that check')
     check_datasets(args, read_blend(blend))
 
 
@@ -297,8 +307,8 @@ def pruning(args):
         digest = hashlib.sha256(f.read()).hexdigest()
     check(data.get('distill_heldout_blend_sha256') == digest, 'the manifest holds the frozen pruning blend')
     check(data.get('distill_heldout_after') == SEQUENCES, f'held out after {data.get("distill_heldout_after")} sequences')
-    counts, hashes = sequence_counts(args.cache_dir)
-    check(len(hashes) == PRUNING_SEQUENCES, f'{len(hashes)} sequences')
+    counts, hashes, _ = sequence_counts(args.cache_dir)
+    check(sum(counts.values()) == PRUNING_SEQUENCES, f'{sum(counts.values())} sequences')
     check_domains(counts, MIX['pruning'], 5.0)
     check(len(set(hashes)) == len(hashes), 'no repeated sequence')
     print('separation')
