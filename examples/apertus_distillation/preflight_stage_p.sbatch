@@ -55,7 +55,7 @@ if [ ! -f "$RUN/stopped" ]; then
         sleep 15
     done
     sleep 120
-    pkill -TERM -P "$writer" srun
+    pkill -TERM -u "$USER" -x srun || { echo "no srun to stop"; exit 1; }
     for _ in $(seq 36); do kill -0 "$writer" 2>/dev/null || break; sleep 5; done
     if kill -0 "$writer" 2>/dev/null; then echo "the writer did not stop within 3 min"; exit 1; fi
     wait "$writer" || true
