@@ -33,6 +33,8 @@ SEQS_PER_FILE=${SEQS_PER_FILE:-8192}  # sequences per shard (~37 GB at fp32 top-
 SEQS_PER_CHUNK=${SEQS_PER_CHUNK:-8}   # sequences per compressed chunk; students read whole chunks
 SEED=${SEED:-41}                    # data order; 41 is the teacher's stage-3 seed
 EXIT_MINUTES=${EXIT_MINUTES:-700}    # stop at a shard boundary before the 12 h limit
+# Over one round (~40 min): ranks with no shard in a short last round wait in a collective.
+TIMEOUT_MINUTES=${TIMEOUT_MINUTES:-120}
 AUTO_REQUEUE=${AUTO_REQUEUE:-false}
 
 WORKSPACE=${WORKSPACE:-/iopsstor/scratch/cscs/$USER/apertus_distillation}
@@ -63,7 +65,8 @@ run_writer "$(teacher_args "$LOAD_DIR") --seed $SEED $STOP_ARGS \
   --distill-cache-dir $CACHE_DIR --distill-cache-num-samples $NUM_SAMPLES \
   --distill-cache-mode $MODE --distill-topk $SLOTS --distill-samples $SLOTS --distill-prob-dtype fp32 \
   --distill-seqs-per-file $SEQS_PER_FILE --distill-seqs-per-chunk $SEQS_PER_CHUNK \
-  --distill-exit-duration-in-mins $EXIT_MINUTES --distill-self-check"
+  --distill-exit-duration-in-mins $EXIT_MINUTES --distill-self-check \
+  --distributed-timeout-minutes $TIMEOUT_MINUTES"
 
 DONE=$(completed_shards)
 TOTAL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["num_files"])' \
