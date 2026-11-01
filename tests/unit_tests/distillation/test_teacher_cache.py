@@ -34,6 +34,7 @@ from megatron.training.distillation.cache_writer import (
     HeldOutSequences,
     FileBatchSampler,
     collate_samples,
+    held_out_counts,
 )
 from megatron.training.distillation.scoring import teacher_rows
 
@@ -435,3 +436,49 @@ def test_held_out_sequences_refuse_to_run_out():
     blend = _FakeBlend([4, 100], [0, 0, 0])
     with pytest.raises(AssertionError, match='held out'):
         HeldOutSequences(blend, 3, [1.0, 0.0], size=2, seed=1)
+
+
+def test_held_out_counts_sum_to_the_size():
+    assert held_out_counts(10, [1 / 3, 1 / 3, 1 / 3]).tolist() == [4, 3, 3]
+    assert held_out_counts(5, [1.0, 0.0]).tolist() == [5, 0]
+
+
+def _sequences(dataset):
+    return {tuple(dataset[i]['tokens'].tolist()) for i in range(len(dataset))}
+
+
+def test_held_out_sequences_read_on_after_an_earlier_set():
+    blend = _FakeBlend([10, 20, 5], [0, 1, 1, 0, 1, 1])  # Reaches 2, 4 and 0 sequences.
+    earlier = HeldOutSequences(blend, 6, [0.5, 0.25, 0.25], size=8, seed=1)
+    skip = held_out_counts(8, [0.5, 0.25, 0.25])
+    later = HeldOutSequences(blend, 6, [1.0, 1.0, 0.0], size=6, seed=1, skip=skip)
+    assert sorted(_sequences(later)) == [(0, 6), (0, 7), (0, 8), (1, 6), (1, 7), (1, 8)]
+    assert not _sequences(earlier) & _sequences(later)
+
+
+def test_held_out_sequences_can_take_all_that_is_left():
+    blend = _FakeBlend([10, 20, 5], [0, 1, 1, 0, 1, 1])
+    used = [{(0, 0), (0, 1)}, {(1, 0), (1, 1), (1, 2), (1, 3)}, set()]
+    earlier = HeldOutSequences(blend, 6, [0.5, 0.25, 0.25], size=8, seed=1)
+    skip = held_out_counts(8, [0.5, 0.25, 0.25])
+    left = [10 - 2 - 4, 20 - 4 - 2, 5 - 0 - 2]  # Weights are the sequences left.
+    rest = HeldOutSequences(blend, 6, left, size=sum(left), seed=1, skip=skip)
+    everything = {(d, s) for d, n in enumerate([10, 20, 5]) for s in range(n)}
+    assert _sequences(rest) | _sequences(earlier) | set().union(*used) == everything
+    assert len(rest) + len(earlier) + 6 == len(everything)
+    assert not _sequences(rest) & (_sequences(earlier) | set().union(*used))
+
+
+def test_held_out_sequences_refuse_to_run_out_after_a_skip():
+    blend = _FakeBlend([10, 100], [0, 0, 0])
+    with pytest.raises(AssertionError, match='held out'):
+        HeldOutSequences(blend, 3, [1.0, 0.0], size=6, seed=1, skip=[2, 0])
+
+
+def test_held_out_sequences_keep_their_order():
+    # The pruning set was written with this order: a change would break the skip.
+    blend = _FakeBlend([10, 20, 5], [0, 1, 1, 0, 1, 1])
+    held_out = HeldOutSequences(blend, 6, [0.5, 0.25, 0.25], size=8, seed=1)
+    pairs = [(0, 2), (0, 3), (0, 4), (0, 5), (1, 4), (1, 5), (2, 0), (2, 1)]
+    expected = numpy.array(pairs)[numpy.random.RandomState(1).permutation(8)]
+    assert held_out.index.tolist() == expected.tolist()

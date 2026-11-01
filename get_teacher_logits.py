@@ -47,6 +47,7 @@ from megatron.training.distillation.cache_writer import (
     HeldOutSequences,
     FileBatchSampler,
     collate_samples,
+    held_out_counts,
 )
 from megatron.training.distillation.scoring import teacher_rows
 from megatron.training.initialize import initialize_megatron
@@ -92,6 +93,12 @@ def _check_args(args):
     assert args.distill_heldout_blend is None or args.data_args_path, (
         '--distill-heldout-blend needs the main blend in --data-args-path'
     )
+    assert (args.distill_heldout_skip_blend is None) == (args.distill_heldout_skip_size is None), (
+        '--distill-heldout-skip-blend and --distill-heldout-skip-size go together'
+    )
+    assert args.distill_heldout_skip_blend is None or args.distill_heldout_blend, (
+        '--distill-heldout-skip-blend needs --distill-heldout-blend'
+    )
 
 
 def _git_commit():
@@ -106,19 +113,23 @@ def _git_commit():
 
 def _data_identity(args):
     data = {key: getattr(args, key, None) for key in DATA_IDENTITY_ARGS}
+    if args.distill_heldout_skip_blend:  # Only then, so other caches keep comparing equal.
+        data['distill_heldout_skip_blend'] = args.distill_heldout_skip_blend
+        data['distill_heldout_skip_size'] = args.distill_heldout_skip_size
     # A blend file can change under the same path; record what it contained.
-    for key in ('data_args_path', 'per_split_data_args_path', 'distill_heldout_blend'):
-        if data[key]:
+    for key in ('data_args_path', 'per_split_data_args_path', 'distill_heldout_blend',
+                'distill_heldout_skip_blend'):
+        if data.get(key):
             with open(data[key], 'rb') as f:
                 data[key + '_sha256'] = hashlib.sha256(f.read()).hexdigest()
     return data
 
 
-def _heldout_weights(args, datasets):
-    """The weights of the held-out blend, in the order of the main blend's datasets."""
+def _heldout_weights(args, datasets, blend):
+    """The weights of a held-out blend, in the order of the main blend's datasets."""
     with open(args.data_args_path) as f:
         prefixes = f.read().split()[1::2]
-    with open(args.distill_heldout_blend) as f:
+    with open(blend) as f:
         words = f.read().split()
     weights = dict(zip(words[1::2], map(float, words[0::2])))
     assert set(weights) <= set(prefixes), 'the held-out blend has datasets of its own'
@@ -311,9 +322,16 @@ def main():
     data_iterator = None
     if train_ds is not None:
         if args.distill_heldout_blend:
+            skip = None
+            if args.distill_heldout_skip_blend:
+                skip = held_out_counts(
+                    args.distill_heldout_skip_size,
+                    _heldout_weights(args, train_ds.datasets, args.distill_heldout_skip_blend),
+                )
             train_ds = HeldOutSequences(
                 train_ds, args.distill_heldout_after,
-                _heldout_weights(args, train_ds.datasets), num_files * seqs_per_file, args.seed,
+                _heldout_weights(args, train_ds.datasets, args.distill_heldout_blend),
+                num_files * seqs_per_file, args.seed, skip=skip,
             )
         check_worker_tmpdir(args.num_workers)
         sampler = FileBatchSampler(start_file, end_file, seqs_per_file, args.micro_batch_size,

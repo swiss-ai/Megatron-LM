@@ -36,6 +36,7 @@ EXIT_MINUTES=${EXIT_MINUTES:-700}    # stop at a shard boundary before the 12 h 
 # Over one round (~40 min): ranks with no shard in a short last round wait in a collective.
 TIMEOUT_MINUTES=${TIMEOUT_MINUTES:-120}
 AUTO_REQUEUE=${AUTO_REQUEUE:-false}
+HELD_OUT=${HELD_OUT:-}               # writer arguments of a cache that reads on after another
 
 WORKSPACE=${WORKSPACE:-/iopsstor/scratch/cscs/$USER/apertus_distillation}
 MEGATRON_LM_DIR=${MEGATRON_LM_DIR:-$WORKSPACE/Megatron-LM-8B}
@@ -60,7 +61,7 @@ if [ -n "$STOP_TOKENS" ]; then
     STOP_ARGS="--distill-cache-stop-files $STOP_FILES"
 fi
 echo "[$(date)] $SLURM_NPROCS ranks, $NUM_SAMPLES sequences, mode=$MODE slots=$SLOTS $STOP_ARGS -> $CACHE_DIR"
-run_writer "$(teacher_args "$LOAD_DIR") --seed $SEED $STOP_ARGS \
+run_writer "$(teacher_args "$LOAD_DIR") --seed $SEED $STOP_ARGS $HELD_OUT \
   --data-args-path $BLEND --data-cache-path $DATASET_CACHE_DIR \
   --distill-cache-dir $CACHE_DIR --distill-cache-num-samples $NUM_SAMPLES \
   --distill-cache-mode $MODE --distill-topk $SLOTS --distill-samples $SLOTS --distill-prob-dtype fp32 \

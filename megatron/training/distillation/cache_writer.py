@@ -4,7 +4,7 @@ import functools
 import queue
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Dict, Iterator, List, Sequence
+from typing import Dict, Iterator, List, Optional, Sequence
 
 import numpy
 import torch
@@ -42,6 +42,14 @@ class FileBatchSampler:
         return len(self.files) * (self.seqs_per_file // self.micro_batch_size)
 
 
+def held_out_counts(size: int, weights: Sequence[float]) -> numpy.ndarray:
+    """Sequences of each dataset in a held-out set of ``size``, by largest remainder."""
+    quota = size * numpy.asarray(weights, dtype=numpy.float64) / sum(weights)
+    counts = numpy.floor(quota).astype(numpy.int64)
+    counts[numpy.argsort(counts - quota, kind='stable')[:size - counts.sum()]] += 1
+    return counts
+
+
 class HeldOutSequences(torch.utils.data.Dataset):
     """Sequences of a blend's datasets that the blend's first ``used`` sequences don't reach.
 
@@ -49,18 +57,21 @@ class HeldOutSequences(torch.utils.data.Dataset):
     sequences are disjoint windows of its tokens. So its first ``used`` sequences are the
     first sequences of every dataset, and reading on from there gives a set that shares
     no tokens with them. ``weights`` share out ``size`` sequences over the datasets, in
-    the order of ``blended.datasets``; ``seed`` shuffles them.
+    the order of ``blended.datasets``; ``seed`` shuffles them. ``skip`` gives the sequences
+    of each dataset to pass over first: the ``held_out_counts`` of an earlier held-out set,
+    so that this set shares no tokens with that one either.
     """
 
-    def __init__(self, blended, used: int, weights: Sequence[float], size: int, seed: int):
+    def __init__(self, blended, used: int, weights: Sequence[float], size: int, seed: int,
+                 skip: Optional[Sequence[int]] = None):
         self.datasets = blended.datasets
         assert len(weights) == len(self.datasets)
         blended[0]  # Maps the blend's index if another rank built it.
         assert used <= len(blended), f'the blend has {len(blended)} sequences, not {used}'
         first = numpy.bincount(blended.dataset_index[:used], minlength=len(self.datasets))
-        quota = size * numpy.asarray(weights, dtype=numpy.float64) / sum(weights)
-        counts = numpy.floor(quota).astype(numpy.int64)
-        counts[numpy.argsort(counts - quota, kind='stable')[:size - counts.sum()]] += 1
+        if skip is not None:
+            first = first + numpy.asarray(skip)
+        counts = held_out_counts(size, weights)
         pairs = []
         for dataset_id in numpy.flatnonzero(counts).tolist():
             begin, end = int(first[dataset_id]), int(first[dataset_id] + counts[dataset_id])
@@ -68,8 +79,9 @@ class HeldOutSequences(torch.utils.data.Dataset):
                 f'dataset {dataset_id} has {len(self.datasets[dataset_id])} sequences: too few '
                 f'for {counts[dataset_id]} held out after {begin} used'
             )
-            pairs.extend((dataset_id, sample_id) for sample_id in range(begin, end))
-        self.index = numpy.array(pairs)[numpy.random.RandomState(seed).permutation(size)]
+            pairs.append(numpy.stack([numpy.full(end - begin, dataset_id),
+                                      numpy.arange(begin, end)], axis=1))
+        self.index = numpy.concatenate(pairs)[numpy.random.RandomState(seed).permutation(size)]
 
     def __len__(self) -> int:
         return len(self.index)

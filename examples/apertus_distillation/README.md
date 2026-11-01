@@ -47,6 +47,10 @@ python examples/apertus_distillation/verify_teacher_cache.py /path/to/cache --fi
   sequences.
 - **Size:** `TARGET_TOKENS` fixes the data order. To grow a cache later, start it
   with the largest size and stop early.
+- **The rest of Stage 3:** Stage P reads every dataset for under one pass, and a
+  finished cache can't grow. `preflight_stage3_rest.sbatch` freezes what Stage P and
+  the pruning set leave, and `launch_stage3_rest.sh` starts or resumes a separate
+  cache of it on `preemptable`, where Slurm requeues the job after a preemption.
 - **Layout:** few, large shard files. Shard `f` holds sequences
   `f * seqs_per_file ...` of the data order, whatever the number of GPUs. It is
   an uncompressed zip of gzipped chunks of `--distill-seqs-per-chunk` sequences

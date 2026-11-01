@@ -48,6 +48,11 @@ def add_distillation_args(parser):
     group.add_argument('--distill-heldout-after', type=int, default=None,
                        help='Sequences of the --data-args-path blend to stay clear of: the '
                        'sequences of the training cache.')
+    group.add_argument('--distill-heldout-skip-blend', type=str, default=None,
+                       help='Blend file of an earlier held-out set to read on after as well, '
+                       'e.g. the pruning calibration set, so the two share no tokens.')
+    group.add_argument('--distill-heldout-skip-size', type=int, default=None,
+                       help='Sequences of the set of --distill-heldout-skip-blend.')
     group.add_argument('--distill-seqs-per-file', type=int, default=1024,
                        help='Sequences per shard file, a multiple of --distill-seqs-per-chunk. '
                        'Shards are large on purpose, to keep the number of files low.')

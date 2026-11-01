@@ -10,6 +10,10 @@
     pruning  after the calibration set: the same, and no sequence shared with a cache.
     same     after the first shards of the real run: same data and teacher targets as the
              preflight cache, whatever the number of GPUs.
+    rest     before the rest of Stage 3: its frozen blend holds exactly the sequences that
+             Stage P and the pruning set leave. Needs numpy and torch.
+    rest-cache  after a writer run on the rest: settings, data mix, and no sequence shared
+             with the pruning set or with the Stage P cache.
 
 Every check prints PASS or FAIL, and the script exits with an error if any failed.
 
@@ -37,6 +41,7 @@ TARGET_TOKENS = 197031624704
 SEQ_LEN = 8192
 SEQUENCES = TARGET_TOKENS // SEQ_LEN
 PRUNING_SEQUENCES = 1024
+REST_SHARDS = 3013  # whole shards of 8,192 sequences in what Stage P and the pruning set leave
 SPACE_NEEDED = 130e12  # bytes, ~110 TB of top-256 and a margin
 
 # data_mix.md, sections 3 and 4: tokens (or shares) by teacher stage and domain.
@@ -264,18 +269,23 @@ def check_domains(counts, planned, tolerance):
         check(abs(share - target) < tolerance, f'{domain}: {share:.1f}% of {total} sequences (plan {target:.1f}%)')
 
 
+def sequences_per_dataset(data_cache, entries):
+    """Sequences of each dataset in the whole cache, from the blend's own index."""
+    import numpy
+    expected = sum(math.ceil(SEQUENCES * weight) for weight, _ in entries)
+    for path in glob.glob(os.path.join(data_cache, '*dataset_index.npy')):
+        index = numpy.load(path, mmap_mode='r')
+        if index.shape[0] == expected:
+            return numpy.bincount(index[:SEQUENCES], minlength=len(entries))
+    return None
+
+
 def check_datasets(args, entries):
     """The blend's own index: sequences per dataset over the whole cache."""
     import numpy
-    expected = sum(math.ceil(SEQUENCES * weight) for weight, _ in entries)
-    found = None
-    for path in glob.glob(os.path.join(args.data_cache, '*dataset_index.npy')):
-        index = numpy.load(path, mmap_mode='r')
-        if index.shape[0] == expected:
-            found = index
-    if found is None:
-        return check(False, f'no blend index of {expected} sequences in {args.data_cache}')
-    counts = numpy.bincount(found[:SEQUENCES], minlength=len(entries))
+    counts = sequences_per_dataset(args.data_cache, entries)
+    if counts is None:
+        return check(False, f'no blend index in {args.data_cache}')
     planned = numpy.array([weight * SEQUENCES for weight, _ in entries])
     off = numpy.abs(counts - planned)
     check((counts > 0).all(), f'all {len(entries)} datasets are in the cache, the smallest with {counts.min()} sequences')
@@ -337,17 +347,88 @@ def same(args):
     check(exact / rows > 0.999, f'{exact / rows:.2%} of {rows} teacher rows are bit-identical')
 
 
+def dataset_lengths(data_cache):
+    """Sequences of every dataset, from the indices Megatron built for Stage P."""
+    import numpy
+    lengths = {}
+    for path in glob.glob(os.path.join(data_cache, '*-train-description.txt')):
+        with open(path) as f:
+            description = json.load(f)
+        if 'dataset_path' in description:
+            assert description['dataset_path'] not in lengths, f'two indices of {path}'
+            sample_index = numpy.load(path.replace('description.txt', 'sample_index.npy'), mmap_mode='r')
+            lengths[description['dataset_path']] = sample_index.shape[0] - 1
+    return lengths
+
+
+def rest_of_stage3(root, data_cache):
+    """Sequences of each Stage 3 dataset after Stage P and the pruning set, by blend entry."""
+    from megatron.training.distillation.cache_writer import held_out_counts
+    entries = read_blend(os.path.join(root, 'distill', 'blend.txt'))
+    weights = {prefix: weight for weight, prefix in read_blend(os.path.join(root, 'pruning', 'blend.txt'))}
+    used = sequences_per_dataset(data_cache, entries)
+    held_out = held_out_counts(PRUNING_SEQUENCES, [weights.get(prefix, 0.0) for _, prefix in entries])
+    lengths = dataset_lengths(data_cache)
+    return {prefix: lengths[plain(prefix)] - int(reached) - int(passed)
+            for (_, prefix), reached, passed in zip(entries, used, held_out)
+            if place(prefix)[0] == 'stage 3'}
+
+
+def rest(args):
+    entries = read_blend(os.path.join(args.root, 'distill-rest', 'blend.txt'))
+    left = rest_of_stage3(args.root, args.data_cache)
+    print('the rest of Stage 3')
+    check({prefix: int(weight) for weight, prefix in entries} == left,
+          f'the frozen blend holds what is left of all {len(left)} Stage 3 datasets')
+    check(min(left.values()) >= 0, f'no dataset is read past its end (fewest left {min(left.values())})')
+    check(all(place(prefix)[0] == 'stage 3' for _, prefix in entries), 'no other stage')
+    total = sum(left.values())
+    check(total // 8192 == REST_SHARDS, f'{total} sequences: {REST_SHARDS} whole shards, {total % 8192} over')
+    for (_, domain), value in sorted(shares(entries).items()):
+        print(f'  NOTE  {domain}: {value * SEQ_LEN / 1e9:.2f}B tokens, {value / total:.1%}')
+
+
+def rest_cache(args):
+    from megatron.training.distillation.cache_format import load_manifest
+    manifest = load_manifest(args.cache_dir)
+    check_settings(args.cache_dir, manifest, os.path.join(args.root, 'distill', 'blend.txt'))
+    print('data')
+    data = manifest['data']
+    for key, name in (('distill_heldout_blend', 'distill-rest'), ('distill_heldout_skip_blend', 'pruning')):
+        with open(os.path.join(args.root, name, 'blend.txt'), 'rb') as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        check(data.get(key + '_sha256') == digest, f'the manifest holds the frozen {name} blend')
+    check(data.get('distill_heldout_after') == SEQUENCES, f'held out after {data.get("distill_heldout_after")} sequences')
+    check(data.get('distill_heldout_skip_size') == PRUNING_SEQUENCES,
+          f'and after the {data.get("distill_heldout_skip_size")} of the pruning set')
+    check(manifest['num_samples'] == REST_SHARDS * 8192, f'{manifest["num_samples"]} sequences in all')
+    counts, hashes, patterns = sequence_counts(args.cache_dir)
+    check_domains(counts, shares(read_blend(os.path.join(args.root, 'distill-rest', 'blend.txt'))), 4.0)
+    check(len(set(hashes)) == len(hashes), f'no repeated sequence in {len(hashes)}')
+    print(f'  NOTE  {patterns} sequences of at most {PATTERN_TOKENS} distinct tokens left out of that check')
+    print('separation')
+    pruning_set = os.path.join(args.root, 'pruning', 'calibration-top256')
+    stage_p = os.path.join(args.root, 'distill', 'stagep-top256')
+    for other, limit in ((pruning_set, None), (stage_p, args.stage_p_sequences)):
+        known = set(sequence_counts(other, limit)[1])
+        check(not known & set(hashes), f'no sequence shared with the {len(known)} checked of {other}')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('step', choices=['blends', 'cache', 'pruning', 'same'])
+    parser.add_argument('step', choices=['blends', 'cache', 'pruning', 'same', 'rest', 'rest-cache'])
     parser.add_argument('cache_dir', nargs='?', help='The cache to check.')
     parser.add_argument('--root', default=DEFAULT_ROOT)
     parser.add_argument('--against', help='pruning, same: the other cache.')
     parser.add_argument('--inventory', default=os.path.join(REPO, '..', 'stage3', 'dataset-inventory-2026-10-28.csv'))
     parser.add_argument('--data-cache', default=None, help='Default: dataset-index under --root.')
+    parser.add_argument('--stage-p-sequences', type=int, default=16384,
+                        help='rest-cache: first sequences of the Stage P cache to compare with.')
     args = parser.parse_args()
     args.data_cache = args.data_cache or os.path.join(args.root, 'dataset-index')
-    {'blends': blends, 'cache': cache, 'pruning': pruning, 'same': same}[args.step](args)
+    steps = {'blends': blends, 'cache': cache, 'pruning': pruning, 'same': same, 'rest': rest,
+             'rest-cache': rest_cache}
+    steps[args.step](args)
     print(f'{len(failures)} checks failed: {failures}' if failures else 'ALL CHECKS PASSED')
     sys.exit(1 if failures else 0)
 
